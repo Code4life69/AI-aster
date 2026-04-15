@@ -115,5 +115,4 @@ CLI apply:
 
 ## Current status
 
-Browser mode is the intended free path. API mode still exists behind configuration, but the normal workflow is browser-first and will open ChatGPT in your browser if needed.
-By default, approved applied changes are committed and pushed to the configured GitHub remote automatically.
+Browser mode is the intended free path. API mode still exists behind configuration, but the normal workflow is browser-first and will open ChatGPT in your browser if needed. By default, approved applied changes are committed and pushed to the configured GitHub remote automatically.
