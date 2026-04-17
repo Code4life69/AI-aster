@@ -305,6 +305,16 @@ class BrowserChatGPTTransport:
                 time.sleep(1.5)
                 continue
 
+            if send_attempt > 0 and self._reply_started(before_lines, lines, target, ui_state=ui_state):
+                self._log("reply_started_before_send_retry", {"send_attempts": send_attempt})
+                self._activity(
+                    "browser_reply_started",
+                    "ChatGPT has started responding.",
+                    "Aster detected reply content before attempting another resend.",
+                    status="success",
+                )
+                return
+
             if self._needs_send_retry(lines, prompt):
                 self._log(
                     "send_retry_needed",
@@ -372,7 +382,7 @@ class BrowserChatGPTTransport:
                     },
                 )
                 return False
-            if self._score_reply_candidate(candidate) < 20.0:
+            if self._score_reply_candidate(candidate) < 20.0 and not self._looks_like_substantive_reply_candidate(candidate):
                 self._log(
                     "reply_detection_suppressed",
                     {
@@ -1116,6 +1126,34 @@ class BrowserChatGPTTransport:
         if start != -1 and end != -1 and end > start:
             return text[start : end + 1].strip()
         return text
+
+    @classmethod
+    def _looks_like_substantive_reply_candidate(cls, text: str) -> bool:
+        cleaned = text.strip()
+        if len(cleaned) < 80:
+            return False
+        lowered = _normalize(cleaned)
+        if cls._segment_looks_like_prompt_echo(cleaned):
+            return False
+        if any(noise in lowered for noise in BROWSER_REPLY_NOISE):
+            return False
+        if any(hint in lowered for hint in INPUT_TOO_LARGE_HINTS):
+            return False
+        code_tokens = (
+            "def ",
+            "class ",
+            "import ",
+            "from ",
+            "return ",
+            "self.",
+            " tk.",
+            "tk.",
+            "{\"",
+            '"summary"',
+            "operations",
+            "```",
+        )
+        return cleaned.count("\n") >= 2 and any(token in cleaned for token in code_tokens)
 
     @classmethod
     def _score_reply_candidate(cls, text: str) -> float:

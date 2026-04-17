@@ -84,6 +84,34 @@ def test_reply_detection_accepts_reply_when_composer_is_not_waiting_to_send() ->
     assert started is True
 
 
+def test_reply_detection_accepts_code_like_reply_when_send_button_is_gone() -> None:
+    transport = BrowserChatGPTTransport()
+    transport._executor = _FakeExecutor(
+        "def build_ui(self) -> None:\n"
+        "    frame = tk.Frame(self.root)\n"
+        "    frame.pack(fill='both', expand=True)\n"
+        "    self.display = tk.Entry(frame)\n"
+        "    self.display.grid(row=0, column=0, columnspan=4)\n"
+    )
+    transport._capture = object()
+    transport._ocr = object()
+    transport._logger = None
+
+    started = transport._reply_started(
+        before_lines=[],
+        after_lines=[],
+        target=object(),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": True,
+        },
+    )
+
+    assert started is True
+
+
 def test_score_reply_candidate_prefers_patch_json_over_page_greeting() -> None:
     greeting = "Good to see you, Justin.\nCompany knowledge"
     patch = '{"summary":"ok","notes":[],"operations":[{"type":"EDIT FILE","path":"app.py","reason":"fix","content":"print(1)"}]}'
