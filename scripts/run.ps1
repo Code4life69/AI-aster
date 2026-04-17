@@ -6,8 +6,10 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 $PythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$PythonwExe = Join-Path $ProjectRoot ".venv\Scripts\pythonw.exe"
 $ExistingUi = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.ExecutablePath -eq $PythonExe -and $_.CommandLine -match 'run_assistant\.py"\s+ui|run_assistant\.py\s+ui'
+    (($_.ExecutablePath -eq $PythonExe) -or ($_.ExecutablePath -eq $PythonwExe)) -and
+    $_.CommandLine -match 'run_assistant\.py"\s+ui|run_assistant\.py\s+ui'
 } | Select-Object -First 1
 if ($ExistingUi) {
     Write-Host "Aster UI is already running."
@@ -93,11 +95,15 @@ if ($SyncExit -ne 0) {
 if ($Console) {
     & $PythonExe .\run_assistant.py ui 1>> $StdoutLog 2>> $StderrLog
 } else {
-    Start-Process `
-        -FilePath $PythonExe `
-        -ArgumentList ".\run_assistant.py","ui" `
-        -WorkingDirectory $ProjectRoot `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $StdoutLog `
-        -RedirectStandardError $StderrLog | Out-Null
+    $UiExe = if (Test-Path $PythonwExe) { $PythonwExe } else { $PythonExe }
+    $StartArgs = @{
+        FilePath = $UiExe
+        ArgumentList = @(".\run_assistant.py", "ui")
+        WorkingDirectory = $ProjectRoot
+    }
+    if ($UiExe -eq $PythonExe) {
+        $StartArgs["RedirectStandardOutput"] = $StdoutLog
+        $StartArgs["RedirectStandardError"] = $StderrLog
+    }
+    Start-Process @StartArgs | Out-Null
 }
