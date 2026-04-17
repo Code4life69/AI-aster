@@ -8,7 +8,7 @@ Set-Location $ProjectRoot
 $PythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $PythonwExe = Join-Path $ProjectRoot ".venv\Scripts\pythonw.exe"
 $ExistingUi = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    (($_.ExecutablePath -eq $PythonExe) -or ($_.ExecutablePath -eq $PythonwExe)) -and
+    $_.Name -like "python*.exe" -and
     $_.CommandLine -match 'run_assistant\.py"\s+ui|run_assistant\.py\s+ui'
 } | Select-Object -First 1
 if ($ExistingUi) {
