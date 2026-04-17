@@ -4,7 +4,10 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
-.aster/
+.aster/*
+!.aster/audit.log.jsonl
+!.aster/last_launch_stdout.log
+!.aster/last_launch_stderr.log
 *.egg-info/
 assistant_app/
 data/

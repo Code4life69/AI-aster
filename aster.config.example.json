@@ -32,11 +32,13 @@
   "auto_apply": false,
   "git_integration": true,
   "auto_commit_and_push": true,
+  "push_runtime_logs_after_plan": true,
   "auto_commit_message_prefix": "Aster update",
   "git_remote_name": "origin",
   "sync_with_remote": true,
   "dry_run": true,
   "approval_required_for_destructive": true,
+  "approval_required_for_commands": true,
   "history_limit": 8,
   "log_dir": ".aster"
 }

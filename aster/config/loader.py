@@ -30,6 +30,9 @@ def load_config(project_root: Path, config_path: Path | None = None) -> AsterCon
         auto_apply=bool(data.get("auto_apply", config.auto_apply)),
         git_integration=bool(data.get("git_integration", config.git_integration)),
         auto_commit_and_push=bool(data.get("auto_commit_and_push", config.auto_commit_and_push)),
+        push_runtime_logs_after_plan=bool(
+            data.get("push_runtime_logs_after_plan", config.push_runtime_logs_after_plan)
+        ),
         auto_commit_message_prefix=str(
             data.get("auto_commit_message_prefix", config.auto_commit_message_prefix)
         ),
@@ -38,6 +41,9 @@ def load_config(project_root: Path, config_path: Path | None = None) -> AsterCon
         dry_run=bool(data.get("dry_run", config.dry_run)),
         approval_required_for_destructive=bool(
             data.get("approval_required_for_destructive", config.approval_required_for_destructive)
+        ),
+        approval_required_for_commands=bool(
+            data.get("approval_required_for_commands", config.approval_required_for_commands)
         ),
         history_limit=int(data.get("history_limit", config.history_limit)),
         log_dir=root / str(data.get("log_dir", ".aster")),

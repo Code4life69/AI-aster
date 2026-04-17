@@ -32,3 +32,25 @@ def test_context_collector_ignores_nested_cache_and_aster_dirs(tmp_path: Path) -
     assert ".aster/audit.log.jsonl" not in context.file_tree
     assert "__pycache__" not in context.file_tree
     assert "pkg/module.py" in context.file_tree
+
+
+def test_context_collector_prefers_source_over_logs_for_feature_work(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("print('feature')", encoding="utf-8")
+    (tmp_path / "error.log").write_text("traceback", encoding="utf-8")
+
+    collector = ContextCollector(ignore_patterns=[], max_file_bytes=10_000, max_total_prompt_bytes=200)
+    context = collector.collect(tmp_path, "build a new feature")
+
+    paths = [item.path for item in context.relevant_files]
+    assert paths[0] == "app.py"
+
+
+def test_context_collector_prefers_logs_for_debug_work(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("print('feature')", encoding="utf-8")
+    (tmp_path / "error.log").write_text("traceback", encoding="utf-8")
+
+    collector = ContextCollector(ignore_patterns=[], max_file_bytes=10_000, max_total_prompt_bytes=200)
+    context = collector.collect(tmp_path, "debug the crash and trace the error")
+
+    paths = [item.path for item in context.relevant_files]
+    assert paths[0] == "error.log"

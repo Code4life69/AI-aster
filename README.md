@@ -12,7 +12,7 @@ Aster is a local desktop coding orchestrator. You describe the change in plain E
 - Previews diffs before applying changes locally.
 - Creates backups before edits and can create a git checkpoint.
 - Stores session history for iterative follow-up requests.
-- Can sync with GitHub so the local repo stays current before planning and auto-commit plus auto-push after approved applies.
+- Can sync with GitHub so the local repo stays current before planning, pushes tracked runtime logs after planning runs, and pushes approved code changes plus logs after apply runs.
 
 ## Architecture
 
@@ -44,7 +44,9 @@ aster/
 If your project is connected to GitHub, Aster can:
 
 - `git fetch` and `git pull --ff-only` before building context.
+- `git add -A`, `git commit`, and `git push` after planning runs so tracked runtime logs are published.
 - `git add -A`, `git commit`, and `git push` after approved changes are applied.
+- publish `.aster/audit.log.jsonl`, `.aster/last_launch_stdout.log`, and `.aster/last_launch_stderr.log` to GitHub so remote diagnostics stay current.
 - initialize a local repo and set the remote if needed.
 
 Default remote URL for this project:
@@ -73,6 +75,12 @@ Copy-Item .\aster.config.example.json .\aster.config.json
 .\.venv\Scripts\python.exe .\run_assistant.py connect-github --url https://github.com/Code4life69/AI-aster.git
 ```
 
+4. Run the startup preflight:
+
+```powershell
+.\.venv\Scripts\python.exe .\run_assistant.py doctor --project-root .
+```
+
 ## Run
 
 Desktop UI:
@@ -86,6 +94,7 @@ Double-click launch:
 - `Start Aster.vbs`: opens Aster with no console window.
 - `Start Aster.cmd`: launches through PowerShell and auto-bootstraps the virtual environment if needed.
 - `Start Aster Console.cmd`: same launcher, but keeps the console visible for troubleshooting.
+- The launcher now runs a preflight check before opening the UI, writes its result into `.aster/last_launch_stdout.log`, and then triggers a runtime Git sync so launch logs are pushed too.
 - The UI now shows the patch preview, raw model response, and a live tail of `.aster` logs on the right side.
 
 CLI planning only:
@@ -105,8 +114,11 @@ CLI apply:
 - Secret-like values are redacted before prompts are sent.
 - Paths outside the project root are rejected.
 - Delete, move, and rename operations are flagged for confirmation.
+- Command and dependency operations are validated before apply and require explicit review.
+- Command execution uses argv-based allowlisted commands instead of shell execution.
 - Backups are created before edits.
 - Prompts, plans, and actions are logged under `.aster/`.
+- The tracked `.aster` logs are committed and pushed so GitHub reflects the latest runtime state after each run.
 
 ## Tests
 
@@ -116,4 +128,4 @@ CLI apply:
 
 ## Current status
 
-Browser mode is the intended free path. API mode still exists behind configuration, but the normal workflow is browser-first and will open ChatGPT in your browser if needed. By default, approved applied changes are committed and pushed to the configured GitHub remote automatically.
+Browser mode is the intended free path. API mode still exists behind configuration, but the normal workflow is browser-first and will open ChatGPT in your browser if needed. By default, Aster now commits and pushes tracked runtime logs after planning and launcher runs, commits and pushes approved code changes after apply runs, and keeps the current branch name instead of renaming it to `main`.

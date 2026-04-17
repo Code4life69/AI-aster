@@ -50,6 +50,8 @@ SOURCE_SUFFIXES = {
     ".ps1",
 }
 LOG_HINTS = ("error", "trace", "stack", "stderr", "stdout", "log")
+DEBUG_GOAL_HINTS = ("fail", "fails", "failure", "error", "trace", "crash", "debug", "exception", "bug", "broken")
+FEATURE_GOAL_HINTS = ("build", "create", "add", "implement", "feature", "refactor", "rename", "move", "edit", "update")
 
 
 @dataclass(slots=True)
@@ -123,7 +125,10 @@ class ContextCollector:
         name = path.name.lower()
         suffix = path.suffix.lower()
         score = 0
-        words = {word for word in user_goal.lower().replace("-", " ").split() if len(word) > 2}
+        goal_text = user_goal.lower()
+        words = {word for word in goal_text.replace("-", " ").split() if len(word) > 2}
+        debug_goal = any(hint in goal_text for hint in DEBUG_GOAL_HINTS)
+        feature_goal = any(hint in goal_text for hint in FEATURE_GOAL_HINTS)
         rel_text = path.as_posix().lower()
         if name in MANIFEST_FILES:
             score += 120
@@ -131,10 +136,12 @@ class ContextCollector:
             score += 40
         if suffix in SOURCE_SUFFIXES:
             score += 60
+            if feature_goal:
+                score += 30
         if any(hint in name for hint in LOG_HINTS):
-            score += 55
+            score += 70 if debug_goal else 8
         if "test" in rel_text:
-            score += 20
+            score += 30 if feature_goal else 20
         score += sum(25 for word in words if word in rel_text)
         return score
 

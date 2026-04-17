@@ -39,3 +39,14 @@ def test_has_changes_detects_clean_and_dirty_repo(tmp_path: Path) -> None:
 
     (tmp_path / "new.txt").write_text("x", encoding="utf-8")
     assert sync.has_changes() is True
+
+
+def test_ensure_branch_does_not_rename_current_branch(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "checkout", "-b", "feature/demo")
+    sync = GitSync(tmp_path)
+
+    message = sync.ensure_branch("main")
+
+    assert "Git branch preserved" in message
+    assert sync.current_branch() == "feature/demo"

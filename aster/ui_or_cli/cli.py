@@ -5,7 +5,7 @@ from pathlib import Path
 
 from aster.config import load_config
 from aster.orchestrator import AsterOrchestrator
-from aster.ui_or_cli.desktop_app import DesktopApp
+from aster.preflight import run_doctor
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -14,6 +14,14 @@ def main(argv: list[str] | None = None) -> int:
 
     ui = sub.add_parser("ui", help="Launch the desktop UI")
     ui.set_defaults(command="ui")
+
+    doctor = sub.add_parser("doctor", help="Run startup and runtime preflight checks")
+    doctor.add_argument("--project-root", default=".")
+    doctor.add_argument("--json", action="store_true", help="Print the report as JSON")
+
+    sync_runtime = sub.add_parser("sync-runtime", help="Commit and push tracked runtime logs and local changes")
+    sync_runtime.add_argument("--project-root", default=".")
+    sync_runtime.add_argument("--message", default="Aster runtime sync")
 
     connect = sub.add_parser("connect-github", help="Initialize git and set the GitHub remote")
     connect.add_argument("--project-root", default=".")
@@ -33,7 +41,27 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     command = args.command or "ui"
     if command == "ui":
+        from aster.ui_or_cli.desktop_app import DesktopApp
+
         DesktopApp().run()
+        return 0
+
+    if command == "doctor":
+        report = run_doctor(Path(args.project_root))
+        if args.json:
+            print(report.to_json())
+        else:
+            for check in report.checks:
+                label = check.status.upper().ljust(7)
+                print(f"{label} {check.name}: {check.detail}")
+        return 0 if report.ok else 1
+
+    if command == "sync-runtime":
+        project_root = Path(args.project_root).resolve()
+        config = load_config(project_root)
+        orchestrator = AsterOrchestrator(config)
+        for item in orchestrator._sync_repo_state(args.message):
+            print(item)
         return 0
 
     project_root = Path(args.project_root).resolve()

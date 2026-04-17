@@ -1,12 +1,44 @@
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from aster.audit_logger import AuditLogger
 from aster.response_parser import ParsedPlan, PatchOperation
+
+
+ALLOWED_RUN_COMMANDS = {
+    "git": {
+        "status",
+        "diff",
+        "rev-parse",
+        "branch",
+        "log",
+    },
+    "pytest": None,
+    "pytest.exe": None,
+    "ruff": {"check"},
+    "ruff.exe": {"check"},
+    "mypy": None,
+    "mypy.exe": None,
+}
+DISALLOWED_EXECUTABLES = {
+    "bash",
+    "bash.exe",
+    "cmd",
+    "cmd.exe",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "pwsh.exe",
+    "sh",
+    "sh.exe",
+}
+SHELL_META_TOKENS = {"&&", "||", ";", "|", ">", ">>", "<", "2>", "1>", "&"}
 
 
 class PatchApplier:
@@ -72,23 +104,79 @@ class PatchApplier:
                 path.unlink()
             return f"Deleted {op.path}"
         if op.type == "INSTALL DEPENDENCIES":
-            return self._run_commands(op.packages)
+            return self._install_dependencies(op.packages)
         if op.type == "RUN COMMANDS":
             return self._run_commands(op.commands)
         if op.type == "NEED THESE FILES FIRST":
             return f"Needs more files: {op.path}"
         raise ValueError(f"Unsupported operation type: {op.type}")
 
+    def _install_dependencies(self, packages: list[str]) -> str:
+        cleaned = [package.strip() for package in packages if package.strip()]
+        if not cleaned:
+            raise ValueError("INSTALL DEPENDENCIES requires at least one package")
+        completed = subprocess.run(
+            [sys.executable, "-m", "pip", "install", *cleaned],
+            cwd=self.project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return self._format_completed_process("python -m pip install", completed)
+
     def _run_commands(self, commands: list[str]) -> str:
         results = []
         for command in commands:
+            argv = self._parse_command(command)
             completed = subprocess.run(
-                command,
+                argv,
                 cwd=self.project_root,
-                shell=True,
                 check=False,
                 capture_output=True,
                 text=True,
             )
-            results.append(f"{command} -> {completed.returncode}")
+            results.append(self._format_completed_process(" ".join(argv), completed))
         return "\n".join(results)
+
+    def _parse_command(self, command: str) -> list[str]:
+        raw = command.strip()
+        if not raw:
+            raise ValueError("RUN COMMANDS contains an empty command")
+        if any(token in raw for token in SHELL_META_TOKENS):
+            raise ValueError(f"Shell operators are not allowed in command operations: {command}")
+        argv = shlex.split(raw, posix=False)
+        if not argv:
+            raise ValueError(f"Unable to parse command: {command}")
+        executable = Path(argv[0].strip('"')).name.lower()
+        if executable in DISALLOWED_EXECUTABLES:
+            raise ValueError(f"Interactive shells are not allowed in command operations: {command}")
+        if executable in {"python", "python.exe", "py"}:
+            return self._validate_python_command(argv, original=command)
+        allowed_subcommands = ALLOWED_RUN_COMMANDS.get(executable)
+        if allowed_subcommands is None and executable not in ALLOWED_RUN_COMMANDS:
+            raise ValueError(f"Command executable is not allowed: {command}")
+        if allowed_subcommands is not None:
+            if len(argv) < 2:
+                raise ValueError(f"Command requires an allowed subcommand: {command}")
+            if argv[1] not in allowed_subcommands:
+                raise ValueError(f"Command subcommand is not allowed: {command}")
+        return argv
+
+    @staticmethod
+    def _validate_python_command(argv: list[str], *, original: str) -> list[str]:
+        if len(argv) < 3 or argv[1] != "-m":
+            raise ValueError(f"Python command is restricted to approved module execution: {original}")
+        module = argv[2]
+        if module not in {"pytest", "unittest", "ruff", "mypy"}:
+            raise ValueError(f"Python module is not allowed for command execution: {original}")
+        if module == "ruff" and len(argv) >= 4 and argv[3] != "check":
+            raise ValueError(f"ruff is restricted to the check subcommand: {original}")
+        return argv
+
+    @staticmethod
+    def _format_completed_process(command_label: str, completed: subprocess.CompletedProcess[str]) -> str:
+        output = (completed.stdout or completed.stderr or "").strip()
+        preview = output[:240]
+        if preview:
+            return f"{command_label} -> {completed.returncode}: {preview}"
+        return f"{command_label} -> {completed.returncode}"

@@ -39,7 +39,11 @@ class AsterOrchestrator:
         )
         self.prompt_builder = PromptBuilder()
         self.parser = ResponseParser()
-        self.guard = SafetyGuard(config.project_root, config.approval_required_for_destructive)
+        self.guard = SafetyGuard(
+            config.project_root,
+            config.approval_required_for_destructive,
+            config.approval_required_for_commands,
+        )
         self.applier = PatchApplier(config.project_root, self.logger, git_integration=config.git_integration)
         self.git = GitSync(config.project_root, remote_name=config.git_remote_name)
         self.api_transport = OpenAIResponsesTransport(config.preferred_model, config.openai_api_key_env)
@@ -82,40 +86,13 @@ class AsterOrchestrator:
             "Building the structured ChatGPT request.",
             "The browser prompt has to be deterministic so Aster can parse file operations back out.",
         )
-        prompt_package = self.prompt_builder.build(
+        raw, _prompt_package = self._generate_with_prompt_retries(
             goal,
             context,
             history,
-            mode=resolved_mode,
-            max_chars=self.config.max_total_prompt_bytes,
+            resolved_mode,
+            sync_log=sync_log,
         )
-        if resolved_mode == "browser":
-            self._activity(
-                "prompt_compact",
-                f"Built a browser-sized prompt of about {prompt_package.approx_chars} characters.",
-                "Browser mode has a lower input limit than the API, so Aster trims context before sending it.",
-                details={
-                    "included_files": len(prompt_package.included_files),
-                    "omitted_files": len(prompt_package.omitted_files),
-                    "approx_chars": prompt_package.approx_chars,
-                    "compacted": prompt_package.compacted,
-                },
-            )
-        self.logger.log(
-            "prompt_sent",
-            {
-                "mode": resolved_mode,
-                "goal": goal,
-                "sync_log": sync_log,
-                **self._summarize_prompt_package(prompt_package),
-            },
-        )
-        self._activity(
-            "transport_generate",
-            f"Sending the request through {resolved_mode} mode.",
-            "This is where Aster asks ChatGPT for exact file operations.",
-        )
-        raw = self._generate(resolved_mode, prompt_package.messages)
         self._activity(
             "response_parse",
             "Parsing ChatGPT's response into a patch plan.",
@@ -148,17 +125,26 @@ class AsterOrchestrator:
             status="success",
             details={"operations": len(plan.operations), "warnings": len(warnings)},
         )
+        runtime_sync_log: list[str] = []
+        if self.config.git_integration and self.config.auto_commit_and_push and self.config.push_runtime_logs_after_plan:
+            self._activity(
+                "git_runtime_sync",
+                "Committing and pushing the latest runtime logs to GitHub.",
+                "This keeps the remote repo updated with the newest audit and launch logs after each planning run.",
+            )
+            runtime_sync_log = self._sync_repo_state("sync runtime logs after plan")
         return OrchestrationResult(
             context=context,
             plan=plan,
             preview=preview,
             warnings=warnings,
             raw_response=raw,
-            sync_log=sync_log,
+            sync_log=sync_log + runtime_sync_log,
         )
 
     def apply(self, plan: ParsedPlan, selected_indices: list[int] | None = None, dry_run: bool | None = None) -> list[str]:
         effective_dry_run = self.config.dry_run if dry_run is None else dry_run
+        selected_operations = self._selected_operations(plan, selected_indices)
         self._activity(
             "apply_start",
             "Applying the selected patch operations.",
@@ -168,16 +154,16 @@ class AsterOrchestrator:
         results = self.applier.apply(plan, selected_indices=selected_indices, dry_run=effective_dry_run)
         if not effective_dry_run and self.config.git_integration and self.config.auto_commit_and_push:
             commit_message = self._build_commit_message(plan)
+            details = {"commit_message": commit_message, "operations": len(selected_operations)}
+            if any(op.command_like or op.destructive for op in selected_operations):
+                details["warning"] = "Selected operations include commands or destructive file changes."
             self._activity(
                 "git_commit_push",
                 "Committing and pushing the applied changes to GitHub.",
-                "This keeps the remote repo updated after a successful local apply.",
-                details={"commit_message": commit_message},
+                "This keeps the remote repo and tracked logs updated after every approved apply run.",
+                details=details,
             )
-            results.append(self.git.ensure_branch("main"))
-            results.extend(self.git.commit_all_if_needed(commit_message))
-            if self.config.sync_with_remote:
-                results.extend(self.git.sync_push())
+            results.extend(self._sync_repo_state(commit_message))
         self._activity(
             "apply_done",
             "Apply run finished.",
@@ -234,13 +220,12 @@ class AsterOrchestrator:
                 "Aster only accepts exact file operations and will reprompt once if ChatGPT replies vaguely.",
                 status="warning",
             )
-            prompt_package = self.prompt_builder.build_retry(
+            retried_raw, prompt_package = self._generate_with_prompt_retries(
                 goal,
                 context,
                 history,
-                raw,
-                mode=mode,
-                max_chars=self.config.max_total_prompt_bytes,
+                mode,
+                prior_text=raw,
             )
             self.logger.log(
                 "prompt_retry",
@@ -250,13 +235,140 @@ class AsterOrchestrator:
                     **self._summarize_prompt_package(prompt_package),
                 },
             )
-            retried_raw = self._generate(mode, prompt_package.messages)
             return self.parser.parse(retried_raw)
 
     def _build_commit_message(self, plan: ParsedPlan) -> str:
         summary = " ".join(plan.summary.split()).strip()
         summary = summary[:72] if summary else "apply patch plan"
         return f"{self.config.auto_commit_message_prefix}: {summary}"
+
+    def _sync_repo_state(self, commit_message: str) -> list[str]:
+        results = self.git.commit_all_if_needed(commit_message)
+        if self.config.sync_with_remote:
+            results.extend(self.git.sync_push())
+        return results
+
+    def _generate_with_prompt_retries(
+        self,
+        goal: str,
+        context: CollectedContext,
+        history,
+        mode: str,
+        *,
+        sync_log: list[str] | None = None,
+        prior_text: str | None = None,
+    ):
+        budgets = self._prompt_budgets(mode)
+        for attempt_index, budget in enumerate(budgets, start=1):
+            prompt_package = self._build_prompt_package(
+                goal,
+                context,
+                history,
+                mode=mode,
+                max_chars=budget,
+                prior_text=prior_text,
+            )
+            if mode == "browser":
+                self._activity(
+                    "prompt_compact",
+                    f"Built a browser-sized prompt of about {prompt_package.approx_chars} characters.",
+                    "Browser mode has a lower input limit than the API, so Aster trims context before sending it.",
+                    details={
+                        "attempt_index": attempt_index,
+                        "included_files": len(prompt_package.included_files),
+                        "omitted_files": len(prompt_package.omitted_files),
+                        "approx_chars": prompt_package.approx_chars,
+                        "compacted": prompt_package.compacted,
+                        "budget": budget,
+                    },
+                )
+            self.logger.log(
+                "prompt_sent",
+                {
+                    "mode": mode,
+                    "goal": goal,
+                    "sync_log": sync_log or [],
+                    "attempt_index": attempt_index,
+                    "retry_prompt": prior_text is not None,
+                    **self._summarize_prompt_package(prompt_package),
+                },
+            )
+            self._activity(
+                "transport_generate",
+                f"Sending the request through {mode} mode.",
+                "This is where Aster asks ChatGPT for exact file operations.",
+                details={"attempt_index": attempt_index},
+            )
+            try:
+                return self._generate(mode, prompt_package.messages), prompt_package
+            except RuntimeError as exc:
+                if mode != "browser" or not self._is_prompt_too_large_error(exc) or attempt_index >= len(budgets):
+                    raise
+                next_budget = budgets[attempt_index]
+                self._activity(
+                    "browser_prompt_retry",
+                    "ChatGPT rejected the browser prompt as too large, so Aster is rebuilding a smaller request.",
+                    "Aster can often recover automatically by omitting more context before resending the browser request.",
+                    status="warning",
+                    details={"attempt_index": attempt_index + 1, "next_budget": next_budget},
+                )
+                self.logger.log(
+                    "browser_prompt_resize_retry",
+                    {
+                        "failed_budget": budget,
+                        "next_budget": next_budget,
+                        "attempt_index": attempt_index,
+                    },
+                )
+        raise RuntimeError("Unable to generate a prompt for the selected mode.")
+
+    def _build_prompt_package(
+        self,
+        goal: str,
+        context: CollectedContext,
+        history,
+        *,
+        mode: str,
+        max_chars: int,
+        prior_text: str | None = None,
+    ):
+        if prior_text is None:
+            return self.prompt_builder.build(
+                goal,
+                context,
+                history,
+                mode=mode,
+                max_chars=max_chars,
+            )
+        return self.prompt_builder.build_retry(
+            goal,
+            context,
+            history,
+            prior_text,
+            mode=mode,
+            max_chars=max_chars,
+        )
+
+    def _prompt_budgets(self, mode: str) -> list[int]:
+        if mode != "browser":
+            return [self.config.max_total_prompt_bytes]
+        base = min(int(self.config.max_total_prompt_bytes), 30_000)
+        budgets: list[int] = []
+        for candidate in (base, int(base * 0.78), int(base * 0.6), int(base * 0.42), 8_000):
+            budget = max(8_000, candidate)
+            if budget not in budgets:
+                budgets.append(budget)
+        return budgets
+
+    @staticmethod
+    def _is_prompt_too_large_error(exc: RuntimeError) -> bool:
+        lowered = str(exc).lower()
+        return "too large" in lowered or "message too long" in lowered
+
+    @staticmethod
+    def _selected_operations(plan: ParsedPlan, selected_indices: list[int] | None) -> list:
+        indices = selected_indices or list(range(1, len(plan.operations) + 1))
+        return [plan.operations[index - 1] for index in indices]
 
     def _activity(
         self,

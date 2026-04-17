@@ -73,9 +73,11 @@ class GitSync:
         if not self.is_repo():
             return "Git branch skipped: repository is not initialized locally."
         current = self.current_branch()
+        if not current:
+            return "Git branch skipped: no active branch yet."
         if current == branch:
             return f"Git branch ready: {branch}"
-        return self._run(["git", "branch", "-M", branch])
+        return f"Git branch preserved: current branch is {current}; requested branch was {branch}."
 
     def _run(self, command: list[str]) -> str:
         completed = self._completed(command)

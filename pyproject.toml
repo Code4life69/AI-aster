@@ -9,7 +9,10 @@ description = "Aster local desktop coding orchestrator with OpenAI API and brows
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-  "requests>=2.32,<3"
+  "requests>=2.32,<3",
+  "pyautogui>=0.9.54,<1",
+  "pywinauto>=0.6.9,<1",
+  "pyperclip>=1.9,<2"
 ]
 
 [project.scripts]

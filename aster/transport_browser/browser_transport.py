@@ -10,9 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pyautogui
-from pywinauto import Desktop
-
 from aster.audit_logger import AuditLogger
 
 
@@ -63,6 +60,9 @@ PROMPT_ECHO_MARKERS = (
     "your message",
 )
 
+pyautogui = None
+Desktop = None
+
 
 @dataclass(slots=True)
 class BrowserResult:
@@ -109,6 +109,7 @@ class BrowserChatGPTTransport:
         )
         try:
             ActionExecutor, ScreenCaptureService, ocr_class = self._load_runtime_classes()
+            _load_gui_dependencies()
         except Exception as exc:
             sibling = Path("C:/Screen Reader")
             if sibling.exists() and str(sibling) not in sys.path:
@@ -116,6 +117,7 @@ class BrowserChatGPTTransport:
                 self._log("runtime_added_sibling_path", {"path": str(sibling)})
             try:
                 ActionExecutor, ScreenCaptureService, ocr_class = self._load_runtime_classes()
+                _load_gui_dependencies()
             except Exception as nested_exc:
                 self._log(
                     "runtime_init_failed",
@@ -1236,3 +1238,15 @@ class BrowserChatGPTTransport:
 
 def _normalize(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def _load_gui_dependencies():
+    global pyautogui, Desktop
+    if pyautogui is not None and Desktop is not None:
+        return pyautogui, Desktop
+    import pyautogui as pyautogui_module
+    from pywinauto import Desktop as desktop_cls
+
+    pyautogui = pyautogui_module
+    Desktop = desktop_cls
+    return pyautogui, Desktop

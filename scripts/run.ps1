@@ -20,11 +20,30 @@ if (-not (Test-Path $PythonExe)) {
         throw "Bootstrap failed. Check the PowerShell output and try again."
     }
 }
-$PythonwExe = Join-Path $ProjectRoot ".venv\Scripts\pythonw.exe"
+$RequiredModules = @(
+    "requests",
+    "pyautogui",
+    "pywinauto",
+    "pyperclip",
+    "screen_reader.automation",
+    "screen_reader.capture",
+    "screen_reader.ocr"
+)
 
-$RequiredModules = @("requests")
+$DependencyCheckScript = @'
+import importlib.util
+import sys
+from pathlib import Path
 
-$MissingModules = & $PythonExe -c "import importlib.util, sys; missing = [name for name in sys.argv[1:] if importlib.util.find_spec(name) is None]; print('|'.join(missing))" @RequiredModules
+sibling = Path(r"C:/Screen Reader")
+if sibling.exists() and str(sibling) not in sys.path:
+    sys.path.insert(0, str(sibling))
+
+missing = [name for name in sys.argv[1:] if importlib.util.find_spec(name) is None]
+print("|".join(missing))
+'@
+
+$MissingModules = $DependencyCheckScript | & $PythonExe - @RequiredModules
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to verify runtime dependencies."
 }
@@ -37,12 +56,32 @@ if ($MissingModules) {
     }
 }
 
+$DoctorOutput = & $PythonExe .\run_assistant.py doctor --project-root . 2>&1
+$DoctorExit = $LASTEXITCODE
+if ($DoctorOutput) {
+    Add-Content -Path $StdoutLog -Value (($DoctorOutput | Out-String).TrimEnd()) -Encoding utf8
+}
+if ($DoctorExit -ne 0) {
+    throw "Startup preflight failed. Review .aster\\last_launch_stdout.log for details."
+}
+
+$SyncOutput = & $PythonExe .\run_assistant.py sync-runtime --project-root . --message "Aster runtime sync: launcher start" 2>&1
+$SyncExit = $LASTEXITCODE
+if ($SyncOutput) {
+    Add-Content -Path $StdoutLog -Value (($SyncOutput | Out-String).TrimEnd()) -Encoding utf8
+}
+if ($SyncExit -ne 0) {
+    Add-Content -Path $StderrLog -Value "Runtime sync returned exit code $SyncExit." -Encoding utf8
+}
+
 if ($Console) {
     & $PythonExe .\run_assistant.py ui 1>> $StdoutLog 2>> $StderrLog
 } else {
-    if (-not (Test-Path $PythonwExe)) {
-        Start-Process -FilePath $PythonExe -ArgumentList ".\run_assistant.py","ui" -WorkingDirectory $ProjectRoot | Out-Null
-    } else {
-        Start-Process -FilePath $PythonwExe -ArgumentList ".\run_assistant.py","ui" -WorkingDirectory $ProjectRoot | Out-Null
-    }
+    Start-Process `
+        -FilePath $PythonExe `
+        -ArgumentList ".\run_assistant.py","ui" `
+        -WorkingDirectory $ProjectRoot `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $StdoutLog `
+        -RedirectStandardError $StderrLog | Out-Null
 }
