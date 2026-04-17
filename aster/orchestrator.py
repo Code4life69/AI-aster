@@ -43,21 +43,111 @@ class AsterOrchestrator:
         self.applier = PatchApplier(config.project_root, self.logger, git_integration=config.git_integration)
         self.git = GitSync(config.project_root, remote_name=config.git_remote_name)
         self.api_transport = OpenAIResponsesTransport(config.preferred_model, config.openai_api_key_env)
-        self.browser_transport = BrowserChatGPTTransport()
+        self.browser_transport = BrowserChatGPTTransport(self.logger)
 
     def plan(self, goal: str, mode: str | None = None) -> OrchestrationResult:
         resolved_mode = mode or self.config.default_mode
+        self._activity(
+            "plan_start",
+            f"Starting a {resolved_mode} planning run.",
+            "Aster needs to collect context and build an exact patch request before asking ChatGPT.",
+        )
+        if self.config.sync_with_remote:
+            self._activity(
+                "git_sync",
+                "Syncing the local project with GitHub.",
+                "Planning against stale files can produce bad edits or conflicts.",
+            )
         sync_log = self.git.sync_pull() if self.config.sync_with_remote else []
+        self._activity(
+            "history_load",
+            "Loading recent conversation history.",
+            "Follow-up requests should preserve recent context and constraints.",
+        )
         history = self.sessions.load()
+        self._activity(
+            "context_collect",
+            "Collecting relevant project files.",
+            "Aster sends only the files most likely to matter instead of the whole drive.",
+        )
         context = self.collector.collect(self.config.project_root, goal)
-        messages = self.prompt_builder.build(goal, context, history)
-        self.logger.log("prompt_sent", {"mode": resolved_mode, "messages": messages, "goal": goal, "sync_log": sync_log})
-        raw = self._generate(resolved_mode, messages)
+        self._activity(
+            "context_ready",
+            f"Collected {len(context.relevant_files)} relevant files and skipped {len(context.skipped_files)}.",
+            "This keeps the prompt focused and avoids overflowing ChatGPT with low-value context.",
+            details={"relevant_files": len(context.relevant_files), "skipped_files": len(context.skipped_files)},
+        )
+        self._activity(
+            "prompt_build",
+            "Building the structured ChatGPT request.",
+            "The browser prompt has to be deterministic so Aster can parse file operations back out.",
+        )
+        prompt_package = self.prompt_builder.build(
+            goal,
+            context,
+            history,
+            mode=resolved_mode,
+            max_chars=self.config.max_total_prompt_bytes,
+        )
+        if resolved_mode == "browser":
+            self._activity(
+                "prompt_compact",
+                f"Built a browser-sized prompt of about {prompt_package.approx_chars} characters.",
+                "Browser mode has a lower input limit than the API, so Aster trims context before sending it.",
+                details={
+                    "included_files": len(prompt_package.included_files),
+                    "omitted_files": len(prompt_package.omitted_files),
+                    "approx_chars": prompt_package.approx_chars,
+                    "compacted": prompt_package.compacted,
+                },
+            )
+        self.logger.log(
+            "prompt_sent",
+            {
+                "mode": resolved_mode,
+                "goal": goal,
+                "sync_log": sync_log,
+                **self._summarize_prompt_package(prompt_package),
+            },
+        )
+        self._activity(
+            "transport_generate",
+            f"Sending the request through {resolved_mode} mode.",
+            "This is where Aster asks ChatGPT for exact file operations.",
+        )
+        raw = self._generate(resolved_mode, prompt_package.messages)
+        self._activity(
+            "response_parse",
+            "Parsing ChatGPT's response into a patch plan.",
+            "Aster rejects vague advice and only accepts concrete operations it can preview or apply.",
+        )
         plan = self._parse_with_retry(goal, context, history, resolved_mode, raw)
+        self._activity(
+            "safety_check",
+            "Running safety checks on the proposed operations.",
+            "Aster verifies paths stay inside the project and flags destructive changes.",
+        )
         warnings = self.guard.validate(plan)
+        self._activity(
+            "preview_build",
+            "Building the diff preview.",
+            "You need to see the exact file changes before deciding whether to apply them.",
+        )
         preview = build_plan_preview(self.config.project_root, plan)
+        self._activity(
+            "history_save",
+            "Saving this exchange into session history.",
+            "Future follow-up requests can build on what just happened.",
+        )
         self.sessions.append("user", goal)
         self.sessions.append("assistant", preview[:4000])
+        self._activity(
+            "plan_ready",
+            f"Plan ready with {len(plan.operations)} operations.",
+            "You can review the preview, inspect the raw response, and apply only if it looks correct.",
+            status="success",
+            details={"operations": len(plan.operations), "warnings": len(warnings)},
+        )
         return OrchestrationResult(
             context=context,
             plan=plan,
@@ -69,18 +159,48 @@ class AsterOrchestrator:
 
     def apply(self, plan: ParsedPlan, selected_indices: list[int] | None = None, dry_run: bool | None = None) -> list[str]:
         effective_dry_run = self.config.dry_run if dry_run is None else dry_run
+        self._activity(
+            "apply_start",
+            "Applying the selected patch operations.",
+            "Aster is about to back up files and perform the approved local changes.",
+            details={"dry_run": effective_dry_run},
+        )
         results = self.applier.apply(plan, selected_indices=selected_indices, dry_run=effective_dry_run)
         if not effective_dry_run and self.config.git_integration and self.config.auto_commit_and_push:
             commit_message = self._build_commit_message(plan)
+            self._activity(
+                "git_commit_push",
+                "Committing and pushing the applied changes to GitHub.",
+                "This keeps the remote repo updated after a successful local apply.",
+                details={"commit_message": commit_message},
+            )
             results.append(self.git.ensure_branch("main"))
             results.extend(self.git.commit_all_if_needed(commit_message))
             if self.config.sync_with_remote:
                 results.extend(self.git.sync_push())
+        self._activity(
+            "apply_done",
+            "Apply run finished.",
+            "Local changes, backups, and optional Git operations are complete.",
+            status="success",
+        )
         return results
 
     def connect_remote(self, url: str) -> str:
+        self._activity(
+            "git_remote_connect",
+            "Connecting this project folder to the configured GitHub remote.",
+            "Aster needs a remote to keep local edits and GitHub in sync.",
+            details={"url": url},
+        )
         result = self.git.set_remote(url)
         self.logger.log("git_remote_set", {"url": url, "result": result})
+        self._activity(
+            "git_remote_connected",
+            "GitHub remote connection updated.",
+            "Future apply runs can now commit and push to that repo.",
+            status="success",
+        )
         return result
 
     def _generate(self, mode: str, messages: list[dict[str, str]]) -> str:
@@ -97,18 +217,66 @@ class AsterOrchestrator:
             return result.raw_text
         if not self.config.api_mode_enabled:
             raise RuntimeError("API mode is disabled. Use browser mode or enable API mode in config.")
+        self._activity(
+            "api_request",
+            "Sending the structured request to the OpenAI API.",
+            "API mode returns a machine-readable response directly without browser automation.",
+        )
         return self.api_transport.generate(messages, PATCH_PLAN_SCHEMA)
 
     def _parse_with_retry(self, goal: str, context: CollectedContext, history, mode: str, raw: str) -> ParsedPlan:
         try:
             return self.parser.parse(raw)
         except Exception:
-            messages = self.prompt_builder.build_retry(goal, context, history, raw)
-            self.logger.log("prompt_retry", {"mode": mode, "messages": messages})
-            retried_raw = self._generate(mode, messages)
+            self._activity(
+                "retry_request",
+                "The first response was not machine-parseable, so Aster is retrying with stricter instructions.",
+                "Aster only accepts exact file operations and will reprompt once if ChatGPT replies vaguely.",
+                status="warning",
+            )
+            prompt_package = self.prompt_builder.build_retry(
+                goal,
+                context,
+                history,
+                raw,
+                mode=mode,
+                max_chars=self.config.max_total_prompt_bytes,
+            )
+            self.logger.log(
+                "prompt_retry",
+                {
+                    "mode": mode,
+                    "prior_response_preview": raw[:500],
+                    **self._summarize_prompt_package(prompt_package),
+                },
+            )
+            retried_raw = self._generate(mode, prompt_package.messages)
             return self.parser.parse(retried_raw)
 
     def _build_commit_message(self, plan: ParsedPlan) -> str:
         summary = " ".join(plan.summary.split()).strip()
         summary = summary[:72] if summary else "apply patch plan"
         return f"{self.config.auto_commit_message_prefix}: {summary}"
+
+    def _activity(
+        self,
+        step: str,
+        message: str,
+        why: str,
+        *,
+        status: str = "info",
+        details: dict[str, object] | None = None,
+    ) -> None:
+        self.logger.activity(step, message, why, status=status, details=details)
+
+    @staticmethod
+    def _summarize_prompt_package(prompt_package) -> dict[str, object]:
+        user_message = next((item["content"] for item in prompt_package.messages if item["role"] == "user"), "")
+        return {
+            "message_count": len(prompt_package.messages),
+            "approx_chars": prompt_package.approx_chars,
+            "included_files": list(prompt_package.included_files),
+            "omitted_files": list(prompt_package.omitted_files),
+            "compacted": prompt_package.compacted,
+            "user_preview": user_message[:1200],
+        }

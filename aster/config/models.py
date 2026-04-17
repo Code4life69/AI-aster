@@ -9,6 +9,7 @@ class AsterConfig:
     project_root: Path
     ignore_patterns: list[str] = field(default_factory=lambda: [
         ".git/",
+        ".aster/",
         ".venv/",
         "node_modules/",
         "__pycache__/",

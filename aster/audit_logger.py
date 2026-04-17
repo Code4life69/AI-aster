@@ -22,6 +22,25 @@ class AuditLogger:
         with self.file.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=True) + "\n")
 
+    def activity(
+        self,
+        step: str,
+        message: str,
+        why: str = "",
+        *,
+        status: str = "info",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "step": step,
+            "message": message,
+            "why": why,
+            "status": status,
+        }
+        if details:
+            payload["details"] = details
+        self.log("activity", payload)
+
 
 def _normalize(value: Any) -> Any:
     if is_dataclass(value):

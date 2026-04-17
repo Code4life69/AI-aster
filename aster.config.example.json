@@ -1,6 +1,7 @@
 {
   "ignore_patterns": [
     ".git/",
+    ".aster/",
     ".venv/",
     "node_modules/",
     "__pycache__/",

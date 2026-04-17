@@ -86,6 +86,7 @@ Double-click launch:
 - `Start Aster.vbs`: opens Aster with no console window.
 - `Start Aster.cmd`: launches through PowerShell and auto-bootstraps the virtual environment if needed.
 - `Start Aster Console.cmd`: same launcher, but keeps the console visible for troubleshooting.
+- The UI now shows the patch preview, raw model response, and a live tail of `.aster` logs on the right side.
 
 CLI planning only:
 
