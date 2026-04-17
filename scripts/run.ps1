@@ -5,14 +5,30 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
+$PythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$ExistingUi = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.ExecutablePath -eq $PythonExe -and $_.CommandLine -match 'run_assistant\.py"\s+ui|run_assistant\.py\s+ui'
+} | Select-Object -First 1
+if ($ExistingUi) {
+    Write-Host "Aster UI is already running."
+    return
+}
+
 $DataDir = Join-Path $ProjectRoot ".aster"
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 $StdoutLog = Join-Path $DataDir "last_launch_stdout.log"
 $StderrLog = Join-Path $DataDir "last_launch_stderr.log"
-Set-Content -Path $StdoutLog -Value "" -Encoding utf8
-Set-Content -Path $StderrLog -Value "" -Encoding utf8
+try {
+    Set-Content -Path $StdoutLog -Value "" -Encoding utf8 -ErrorAction Stop
+} catch {
+    Write-Warning "Could not reset $StdoutLog because it is in use. Appending to the existing file instead."
+}
+try {
+    Set-Content -Path $StderrLog -Value "" -Encoding utf8 -ErrorAction Stop
+} catch {
+    Write-Warning "Could not reset $StderrLog because it is in use. Appending to the existing file instead."
+}
 
-$PythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $PythonExe)) {
     Write-Host "Virtual environment not found. Bootstrapping..."
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "bootstrap.ps1")
