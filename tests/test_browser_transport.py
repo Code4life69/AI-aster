@@ -42,6 +42,11 @@ class _FakeExecutor:
         return self.reply
 
 
+class _Line:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
 def test_reply_detection_is_blocked_while_show_in_text_field_is_present() -> None:
     transport = BrowserChatGPTTransport()
     transport._executor = _FakeExecutor("Good to see you, Justin.")
@@ -145,3 +150,25 @@ def test_score_reply_candidate_penalizes_input_too_large_error() -> None:
     error_text = "Input too large\nRetry"
     patch = '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}'
     assert BrowserChatGPTTransport._score_reply_candidate(patch) > BrowserChatGPTTransport._score_reply_candidate(error_text)
+
+
+def test_chatgpt_page_detection_accepts_chatgpt_hints() -> None:
+    lines = [_Line("Ask anything"), _Line("Search chats")]
+    ui_state = {
+        "send_prompt_present": False,
+        "show_in_text_field_present": False,
+        "stop_streaming_present": False,
+    }
+
+    assert BrowserChatGPTTransport._looks_like_chatgpt_page(lines, ui_state) is True
+
+
+def test_chatgpt_page_detection_rejects_unrelated_browser_content() -> None:
+    lines = [_Line("Github"), _Line("Two Cops"), _Line("Ask Gemini")]
+    ui_state = {
+        "send_prompt_present": False,
+        "show_in_text_field_present": False,
+        "stop_streaming_present": False,
+    }
+
+    assert BrowserChatGPTTransport._looks_like_chatgpt_page(lines, ui_state) is False

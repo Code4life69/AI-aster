@@ -34,6 +34,19 @@ BROWSER_READY_HINTS = (
     "ask anything",
     "message chatgpt",
     "what are you working on",
+    "type a message",
+    "send a message",
+)
+
+CHATGPT_PAGE_HINTS = BROWSER_READY_HINTS + (
+    "search chats",
+    "new chat",
+    "projects",
+    "gpts",
+    "explore gpts",
+    "chatgpt",
+    "openai",
+    "chatgpt can make mistakes",
 )
 
 STOP_STREAMING_HINTS = (
@@ -187,7 +200,11 @@ class BrowserChatGPTTransport:
         try:
             self._ensure_runtime()
             target = self._ensure_chatgpt_window(chatgpt_url=chatgpt_url, launch_timeout_sec=launch_timeout_sec)
-            self._wait_for_chatgpt_ready(target, timeout_sec=min(20.0, max(8.0, launch_timeout_sec)))
+            self._prepare_chatgpt_window(
+                target,
+                chatgpt_url=chatgpt_url,
+                timeout_sec=min(20.0, max(8.0, launch_timeout_sec)),
+            )
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             before_lines = self._ocr.extract(image)
             self._log(
@@ -750,16 +767,49 @@ class BrowserChatGPTTransport:
                 "ChatGPT browser window was not found after launch. Open ChatGPT, sign in if needed, then try again."
             )
 
-    def _wait_for_chatgpt_ready(self, target, timeout_sec: float) -> None:
+    def _prepare_chatgpt_window(self, target, chatgpt_url: str, timeout_sec: float) -> None:
+        self._activity(
+            "browser_window_reset",
+            "Resetting the attached browser tab to a fresh ChatGPT page.",
+            "Starting from a clean ChatGPT page avoids stale thread content and wrong-tab captures during browser runs.",
+            details={"url": chatgpt_url},
+        )
+        self._navigate_browser_to_chatgpt(target, chatgpt_url)
+        if self._wait_for_chatgpt_ready(target, timeout_sec=timeout_sec):
+            return
+        image = self._capture.capture_region(target.left, target.top, target.width, target.height)
+        lines = self._ocr.extract(image)
+        ui_state = self._ui_state(target)
+        self._log(
+            "chatgpt_page_not_ready",
+            {
+                "ui_state": ui_state,
+                "ocr_preview": [line.text[:120] for line in lines[:8]],
+            },
+        )
+        raise RuntimeError(
+            "Attached browser window did not reach a usable ChatGPT page. "
+            "Open ChatGPT in the active browser window and make sure the composer is visible."
+        )
+
+    def _navigate_browser_to_chatgpt(self, target, chatgpt_url: str) -> None:
+        self._executor.focus_window_target(target)
+        pyautogui.hotkey("ctrl", "l")
+        time.sleep(0.15)
+        self._paste_prompt_via_clipboard(target, chatgpt_url, click_point=None)
+        time.sleep(0.15)
+        pyautogui.press("enter")
+        time.sleep(0.8)
+
+    def _wait_for_chatgpt_ready(self, target, timeout_sec: float) -> bool:
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline:
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             ui_state = self._ui_state(target)
             visible_text = "\n".join(line.text.lower() for line in lines[:20])
-            has_ready_hint = any(hint in visible_text for hint in BROWSER_READY_HINTS)
             loading = "loading" in visible_text
-            if has_ready_hint and not loading:
+            if self._looks_like_chatgpt_page(lines, ui_state) and not loading:
                 self._log(
                     "window_ready_confirmed",
                     {
@@ -767,9 +817,23 @@ class BrowserChatGPTTransport:
                         "ocr_preview": [line.text[:120] for line in lines[:6]],
                     },
                 )
-                return
+                return True
             time.sleep(0.6)
         self._log("window_ready_timeout", {"ui_state": self._ui_state(target)})
+        return False
+
+    @staticmethod
+    def _looks_like_chatgpt_page(lines, ui_state: dict[str, Any]) -> bool:
+        visible_text = "\n".join(line.text.lower() for line in lines[:24])
+        if any(hint in visible_text for hint in CHATGPT_PAGE_HINTS):
+            return True
+        return any(
+            (
+                ui_state.get("send_prompt_present"),
+                ui_state.get("show_in_text_field_present"),
+                ui_state.get("stop_streaming_present"),
+            )
+        )
 
     def _capture_reply_text(self, target, before_lines, prompt: str, timeout_sec: float) -> str:
         deadline = time.monotonic() + timeout_sec
@@ -951,18 +1015,17 @@ class BrowserChatGPTTransport:
 
     def _scroll_reply_to_bottom(self, target) -> None:
         self._focus_reply_area(target)
-        for _ in range(2):
+        for _ in range(3):
             pyautogui.press("end")
-            time.sleep(0.15)
-            pyautogui.scroll(-2000)
-            time.sleep(0.35)
+            time.sleep(0.25)
+            pyautogui.press("pagedown")
+            time.sleep(0.25)
 
     def _scroll_reply_up(self, target) -> None:
         self._focus_reply_area(target)
-        pyautogui.press("pageup")
-        time.sleep(0.2)
-        pyautogui.scroll(1800)
-        time.sleep(0.35)
+        for _ in range(2):
+            pyautogui.press("pageup")
+            time.sleep(0.25)
 
     def _focus_reply_area(self, target) -> None:
         self._executor.focus_window_target(target)
