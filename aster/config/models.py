@@ -44,8 +44,8 @@ class AsterConfig:
     browser_launch_timeout_seconds: int = 45
     auto_apply: bool = False
     git_integration: bool = True
-    auto_commit_and_push: bool = True
-    push_runtime_logs_after_plan: bool = True
+    auto_commit_and_push: bool = False
+    push_runtime_logs_after_plan: bool = False
     auto_commit_message_prefix: str = "Aster update"
     git_remote_name: str = "origin"
     sync_with_remote: bool = True
