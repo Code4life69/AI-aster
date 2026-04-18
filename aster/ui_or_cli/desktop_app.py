@@ -5,11 +5,167 @@ import os
 import threading
 import traceback
 import tkinter as tk
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aster.config import load_config
 from aster.orchestrator import AsterOrchestrator
+
+
+try:
+    GUI_TIMEZONE = ZoneInfo("America/Chicago")
+except ZoneInfoNotFoundError:
+    GUI_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def _format_gui_timestamp(raw_ts: object) -> str:
+    text = str(raw_ts or "").strip()
+    if not text:
+        return "--:--"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    localized = parsed.astimezone(GUI_TIMEZONE)
+    return f"{localized.strftime('%I:%M:%S %p').lstrip('0')} CT"
+
+
+def _compact_text(value: object, *, limit: int = 180) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _format_detail_summary(details: object) -> str:
+    if not isinstance(details, dict) or not details:
+        return ""
+    parts: list[str] = []
+    for key, value in details.items():
+        parts.append(f"{key}={_compact_text(value, limit=80)}")
+    return ", ".join(parts)
+
+
+def _format_ui_state_summary(ui_state: object) -> str:
+    if not isinstance(ui_state, dict) or not ui_state:
+        return ""
+    parts: list[str] = []
+    title = _compact_text(ui_state.get("window_title", ""), limit=60)
+    if title:
+        parts.append(f"title={title}")
+    if "send_prompt_present" in ui_state or "send_prompt_enabled" in ui_state:
+        parts.append(
+            "send="
+            f"{ui_state.get('send_prompt_present')}/"
+            f"{ui_state.get('send_prompt_enabled')}"
+        )
+    if "show_in_text_field_present" in ui_state:
+        parts.append(f"show_in_text={ui_state.get('show_in_text_field_present')}")
+    if "stop_streaming_present" in ui_state:
+        parts.append(f"stop={ui_state.get('stop_streaming_present')}")
+    if "composer_edit_length" in ui_state:
+        parts.append(f"composer={ui_state.get('composer_edit_length')}")
+    return ", ".join(parts)
+
+
+def _format_activity_entry(event: dict[str, object]) -> str | None:
+    if event.get("kind") != "activity":
+        return None
+    payload = event.get("payload", {})
+    if not isinstance(payload, dict):
+        return None
+    message = _compact_text(payload.get("message", ""), limit=220)
+    if not message:
+        return None
+    status = str(payload.get("status", "info")).strip().lower()
+    stamp = _format_gui_timestamp(event.get("ts"))
+    headline = f"[{stamp}] {message}"
+    if status and status != "info":
+        headline += f" [{status}]"
+    lines = [headline]
+    why = _compact_text(payload.get("why", ""), limit=240)
+    if why:
+        lines.append(f"Why: {why}")
+    details = _format_detail_summary(payload.get("details"))
+    if details:
+        lines.append(f"Details: {details}")
+    return "\n".join(lines)
+
+
+def _format_trace_entry(event: dict[str, object]) -> str | None:
+    kind = str(event.get("kind", "")).strip()
+    if not kind or kind == "activity":
+        return None
+    payload = event.get("payload", {})
+    if not isinstance(payload, dict):
+        payload = {}
+    stamp = _format_gui_timestamp(event.get("ts"))
+
+    if kind == "browser_transport":
+        event_name = str(payload.get("event", "browser_transport")).strip() or "browser_transport"
+        lines = [f"[{stamp}] {event_name}"]
+        details: list[str] = []
+        title = payload.get("title") or payload.get("target_title")
+        if title:
+            details.append(f"title={_compact_text(title, limit=60)}")
+        for key in ("attempt_index", "strategy", "prompt_length", "reply_length", "parsed_length", "length", "source"):
+            if key in payload:
+                details.append(f"{key}={_compact_text(payload.get(key), limit=60)}")
+        score = payload.get("score")
+        if isinstance(score, (int, float)):
+            details.append(f"score={score:.1f}")
+        ui_state = _format_ui_state_summary(payload.get("ui_state"))
+        if ui_state:
+            details.append(ui_state)
+        preview = payload.get("preview")
+        if not preview:
+            ocr_preview = payload.get("ocr_preview")
+            if isinstance(ocr_preview, list) and ocr_preview:
+                preview = " | ".join(str(item) for item in ocr_preview[:6])
+        if details:
+            lines.append("Details: " + ", ".join(details))
+        if preview:
+            lines.append("Preview: " + _compact_text(preview, limit=260))
+        return "\n".join(lines)
+
+    if kind == "prompt_sent":
+        lines = [f"[{stamp}] prompt_sent"]
+        details = [
+            f"mode={_compact_text(payload.get('mode'), limit=30)}",
+            f"attempt_index={_compact_text(payload.get('attempt_index'), limit=12)}",
+            f"approx_chars={_compact_text(payload.get('approx_chars'), limit=12)}",
+            f"included_files={len(payload.get('included_files', [])) if isinstance(payload.get('included_files'), list) else 0}",
+            f"omitted_files={len(payload.get('omitted_files', [])) if isinstance(payload.get('omitted_files'), list) else 0}",
+        ]
+        lines.append("Details: " + ", ".join(details))
+        goal = payload.get("goal")
+        if goal:
+            lines.append("Goal: " + _compact_text(goal, limit=220))
+        return "\n".join(lines)
+
+    if kind == "prompt_retry":
+        lines = [f"[{stamp}] prompt_retry"]
+        details = [
+            f"mode={_compact_text(payload.get('mode'), limit=30)}",
+            f"approx_chars={_compact_text(payload.get('approx_chars'), limit=12)}",
+        ]
+        lines.append("Details: " + ", ".join(details))
+        preview = payload.get("prior_response_preview")
+        if preview:
+            lines.append("Preview: " + _compact_text(preview, limit=260))
+        return "\n".join(lines)
+
+    if kind == "browser_result":
+        return f"[{stamp}] browser_result\nDetails: {_format_detail_summary(payload)}"
+
+    if kind in {"apply_operation", "backup_created", "git_remote_set"}:
+        details = _format_detail_summary(payload)
+        return f"[{stamp}] {kind}" + (f"\nDetails: {details}" if details else "")
+
+    details = _format_detail_summary(payload)
+    return f"[{stamp}] {kind}" + (f"\nDetails: {details}" if details else "")
 
 
 class DesktopApp:
@@ -76,14 +232,15 @@ class DesktopApp:
         self.preview = tk.Text(left, wrap="none")
         self.preview.pack(fill="both", expand=True)
 
-        ttk.Label(right, text="Active Reasoning").pack(anchor="w")
+        ttk.Label(right, text="Active Reasoning (Central Time)").pack(anchor="w")
         self.activity_view = tk.Text(right, wrap="word", height=16)
         self.activity_view.pack(fill="x")
 
-        ttk.Label(right, text="Audit Log Tail").pack(anchor="w", pady=(8, 0))
+        ttk.Label(right, text="Live Trace And Launch Logs (Central Time)").pack(anchor="w", pady=(8, 0))
         self.audit_view = tk.Text(right, wrap="word")
         self.audit_view.pack(fill="both", expand=True)
         self._refresh_views()
+        self.root.after(1200, self._auto_refresh_views)
 
     def _browse(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.project_root.get())
@@ -152,23 +309,13 @@ class DesktopApp:
                 event = json.loads(raw_line)
             except json.JSONDecodeError:
                 continue
-            if event.get("kind") != "activity":
+            entry = _format_activity_entry(event)
+            if not entry:
                 continue
+            entries.append(entry)
             payload = event.get("payload", {})
-            ts = str(event.get("ts", ""))[11:19]
-            message = str(payload.get("message", "")).strip()
-            why = str(payload.get("why", "")).strip()
-            details = payload.get("details")
-            if not message:
-                continue
-            block = f"[{ts}] {message}"
-            if why:
-                block += f"\nWhy: {why}"
-            if isinstance(details, dict) and details:
-                summary = ", ".join(f"{key}={value}" for key, value in details.items())
-                block += f"\nDetails: {summary}"
-            entries.append(block)
-            latest_message = message
+            if isinstance(payload, dict):
+                latest_message = str(payload.get("message", "")).strip() or latest_message
         self.activity_view.delete("1.0", "end")
         self.activity_view.insert("end", "\n\n".join(entries[-18:]) if entries else "No activity yet.")
         if self._is_busy() and latest_message:
@@ -180,7 +327,16 @@ class DesktopApp:
         launch_err = Path(self.project_root.get()) / ".aster" / "last_launch_stderr.log"
         chunks: list[str] = []
         if audit_file.exists():
-            chunks.append("audit.log.jsonl\n" + "\n".join(self._tail_lines(audit_file, max_lines=40, max_chars=80000)))
+            trace_entries: list[str] = []
+            for raw_line in self._tail_lines(audit_file, max_lines=220, max_chars=120000):
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                formatted = _format_trace_entry(event)
+                if formatted:
+                    trace_entries.append(formatted)
+            chunks.append("Audit Trace\n" + ("\n\n".join(trace_entries[-28:]) if trace_entries else "No trace events yet."))
         if launch_out.exists():
             chunks.append("last_launch_stdout.log\n" + self._tail_text(launch_out, max_chars=3000))
         if launch_err.exists():
@@ -223,6 +379,11 @@ class DesktopApp:
             self.root.after(400, self._poll_worker)
             return
         self._finish_worker()
+
+    def _auto_refresh_views(self) -> None:
+        if not self._is_busy():
+            self._refresh_views()
+        self.root.after(1200, self._auto_refresh_views)
 
     def _finish_worker(self) -> None:
         self._set_busy(False)
