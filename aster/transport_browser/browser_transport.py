@@ -28,6 +28,14 @@ BROWSER_REPLY_NOISE = (
     "explore gpts",
     "chatgpt",
     "openai",
+    "ask gemini",
+    "github",
+    "pull request",
+    "issues",
+    "commit",
+    "context omitted for browser size safety",
+    "included_files",
+    "omitted_files",
 )
 
 BROWSER_READY_HINTS = (
@@ -71,6 +79,12 @@ PROMPT_ECHO_MARKERS = (
     "reason:",
     "content:",
     "your message",
+    "context omitted for browser size safety",
+    "included_files",
+    "omitted_files",
+    "return promptpackage",
+    "self.log(""activity""",
+    "def _normalize",
 )
 
 pyautogui = None
@@ -1202,21 +1216,24 @@ class BrowserChatGPTTransport:
             return False
         if any(hint in lowered for hint in INPUT_TOO_LARGE_HINTS):
             return False
-        code_tokens = (
-            "def ",
-            "class ",
-            "import ",
-            "from ",
-            "return ",
-            "self.",
-            " tk.",
-            "tk.",
-            "{\"",
-            '"summary"',
-            "operations",
-            "```",
-        )
-        return cleaned.count("\n") >= 2 and any(token in cleaned for token in code_tokens)
+        if any(bad in lowered for bad in (
+            "ask gemini",
+            "github",
+            "context omitted for browser size safety",
+            "included_files",
+            "omitted_files",
+            "return promptpackage",
+            "def _normalize",
+            "self.log(""activity""",
+        )):
+            return False
+        if "aster patch begin" in lowered or "aster_patch_begin" in lowered:
+            return True
+        if cls._looks_like_patch_plan_json(cleaned):
+            return True
+        if '"operations"' in cleaned and "{" in cleaned and "}" in cleaned:
+            return True
+        return False
 
     @classmethod
     def _score_reply_candidate(cls, text: str) -> float:
@@ -1241,13 +1258,28 @@ class BrowserChatGPTTransport:
             "what are you working on",
             "input too large",
             "message too long",
+            "ask gemini",
+            "github",
+            "context omitted for browser size safety",
+            "included_files",
+            "omitted_files",
+            "return promptpackage",
+            "def _normalize",
+            "self.log(""activity""",
         ):
             if noise in lowered:
-                score -= 140.0
+                score -= 180.0
         if "thought for" in lowered:
             score -= 25.0
         if any(hint in lowered for hint in STOP_STREAMING_HINTS):
             score -= 40.0
+        if not (
+            "aster patch begin" in lowered
+            or "aster_patch_begin" in lowered
+            or cls._looks_like_patch_plan_json(cleaned)
+            or ('"operations"' in cleaned and "{" in cleaned and "}" in cleaned)
+        ):
+            score -= 200.0
         return score
 
     def _raise_for_browser_error(self, lines, ui_state: dict[str, Any], *, stage: str) -> None:
@@ -1351,3 +1383,4 @@ def _load_gui_dependencies():
     pyautogui = pyautogui_module
     Desktop = desktop_cls
     return pyautogui, Desktop
+
