@@ -24,6 +24,14 @@ WRONG_PAGE_HINTS = (
     "search?q=",
 )
 
+LOADING_HINTS = (
+    "loading",
+    "please wait",
+    "just a moment",
+    "one moment",
+    "checking your browser",
+)
+
 
 def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
     preview = tuple(_line_preview(lines, limit=8))
@@ -43,6 +51,10 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
     wrong_page_hits = [
         hint for hint in WRONG_PAGE_HINTS if hint in visible_text or hint in composer_preview or hint in window_title
     ]
+    loading_detected = any(
+        hint in visible_text or hint in composer_preview or hint in window_title
+        for hint in LOADING_HINTS
+    )
     wrong_page_signals_present = bool(wrong_page_hits) and "chatgpt" not in window_title and "chatgpt" not in visible_text
     likely_existing_chat = window_title_suggests_existing_chat(str(ui_state.get("window_title", "")))
     likely_fresh_chat = looks_like_chatgpt and composer_visible and not likely_existing_chat
@@ -90,6 +102,7 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
         likely_existing_chat=likely_existing_chat,
         composer_ready=composer_visible,
         likely_wrong_page=wrong_page_signals_present,
+        loading_detected=loading_detected,
         ready_score=ready_score,
         page_kind=page_kind,
         visible_text=visible_text,

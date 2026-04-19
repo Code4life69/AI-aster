@@ -367,3 +367,162 @@ def test_analyze_screen_marks_wrong_page_when_non_chatgpt_signals_dominate() -> 
     assert analysis.page_kind == "wrong_page"
     assert analysis.likely_wrong_page is True
     assert analysis.ready_score < 0
+
+
+def test_page_readiness_failure_classifies_wrong_page() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "Other Site - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("Ask Gemini"), _Line("YouTube"), _Line("Pull request")],
+        ui_state={
+            "window_title": "Other Site - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": None,
+            "composer_edit_preview": "",
+        },
+    )
+
+    failure = transport._page_readiness_failure_details(analysis)
+
+    assert failure["code"] == "wrong_page_detected"
+    assert "wrong-page" in failure["reason"].lower()
+    assert "ask gemini" in failure["wrong_page_hits"]
+
+
+def test_page_readiness_failure_classifies_composer_missing() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("ChatGPT"), _Line("New chat")],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": None,
+            "composer_edit_preview": "",
+        },
+    )
+
+    failure = transport._page_readiness_failure_details(analysis)
+
+    assert failure["code"] == "composer_missing"
+    assert "composer" in failure["reason"].lower()
+
+
+def test_page_readiness_failure_classifies_still_loading() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("Loading"), _Line("Please wait")],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": None,
+            "composer_edit_preview": "",
+        },
+    )
+
+    failure = transport._page_readiness_failure_details(analysis)
+
+    assert analysis.loading_detected is True
+    assert failure["code"] == "still_loading"
+
+
+def test_page_readiness_failure_classifies_likely_wrong_window() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "Downloads - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("Downloads"), _Line("Recent files")],
+        ui_state={
+            "window_title": "Downloads - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": None,
+            "composer_edit_preview": "",
+        },
+    )
+
+    failure = transport._page_readiness_failure_details(analysis)
+
+    assert failure["code"] == "likely_wrong_window"
+    assert "window" in failure["reason"].lower()
+
+
+def test_page_readiness_failure_falls_back_to_low_readiness_score() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": True,
+            "composer_edit_length": None,
+            "composer_edit_preview": "",
+        },
+    )
+
+    failure = transport._page_readiness_failure_details(analysis)
+
+    assert failure["code"] == "low_readiness_score"
+    assert "threshold" in failure["reason"].lower()
+
+
+def test_page_readiness_log_payload_includes_failure_reason_and_loading_state() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("Loading"), _Line("Please wait")],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": None,
+            "composer_edit_preview": "",
+        },
+    )
+
+    payload = transport._page_readiness_log_payload(analysis)
+
+    assert payload["window_title"] == "ChatGPT - Google Chrome"
+    assert payload["failure_code"] == "still_loading"
+    assert payload["loading_detected"] is True
+    assert payload["page_classification"]["loading_detected"] is True

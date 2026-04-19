@@ -31,6 +31,7 @@ class PageClassification:
     likely_existing_chat: bool
     composer_ready: bool = False
     likely_wrong_page: bool = False
+    loading_detected: bool = False
     ready_score: float = 0.0
     page_kind: str = "unknown"
     visible_text: str = ""

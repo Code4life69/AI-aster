@@ -164,6 +164,16 @@ REPLY_TRACKER_POLICY = ReplyTrackerPolicy(
 pyautogui = None
 Desktop = None
 
+PAGE_READINESS_SCORE_THRESHOLD = 55.0
+PAGE_READINESS_WRONG_PAGE_MARKERS = (
+    "ask gemini",
+    "github",
+    "youtube",
+    "pull request",
+    "issues",
+    "commit",
+)
+
 
 @dataclass(slots=True)
 class BrowserResult:
@@ -1057,43 +1067,15 @@ class BrowserChatGPTTransport:
         image = self._capture.capture_region(target.left, target.top, target.width, target.height)
         lines = self._ocr.extract(image)
         analysis = self._analyze_screen(target, lines=lines)
-        visible_text = analysis.visible_text
-        wrong_page_markers = (
-            "ask gemini",
-            "github",
-            "youtube",
-            "pull request",
-            "issues",
-            "commit",
-        )
-        if any(marker in visible_text for marker in wrong_page_markers) and not self._looks_like_chatgpt_page(lines, analysis.ui_state):
-            self._log(
-                "wrong_page_detected",
-                {
-                    "ui_state": analysis.ui_state,
-                    "ocr_preview": list(analysis.ocr_preview),
-                    "page_classification": self._screen_analysis_payload(analysis),
-                },
-            )
-            raise RuntimeError(
-                "Attached browser window does not look like a clean ChatGPT page. "
-                "Wrong-page markers were visible in OCR."
-            )
+        failure = self._page_readiness_failure_details(analysis)
+        if failure["code"] == "wrong_page_detected":
+            self._log("wrong_page_detected", self._page_readiness_log_payload(analysis, failure))
+            raise RuntimeError(self._page_readiness_error_message(failure))
         if ready:
             self._ensure_fresh_chat_thread(target, chatgpt_url=chatgpt_url, timeout_sec=min(10.0, timeout_sec))
             return
-        self._log(
-            "chatgpt_page_not_ready",
-            {
-                "ui_state": analysis.ui_state,
-                "ocr_preview": list(analysis.ocr_preview),
-                "page_classification": self._screen_analysis_payload(analysis),
-            },
-        )
-        raise RuntimeError(
-            "Attached browser window did not reach a usable ChatGPT page. "
-            "Open ChatGPT in the active browser window and make sure the composer is visible."
-        )
+        self._log("chatgpt_page_not_ready", self._page_readiness_log_payload(analysis, failure))
+        raise RuntimeError(self._page_readiness_error_message(failure))
 
     def _navigate_browser_to_chatgpt(self, target, chatgpt_url: str) -> None:
         self._focus_window(target)
@@ -1147,8 +1129,11 @@ class BrowserChatGPTTransport:
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             analysis = self._analyze_screen(target, lines=lines)
-            loading = "loading" in analysis.visible_text
-            if analysis.looks_like_chatgpt and analysis.ready_score >= 55.0 and not loading:
+            if (
+                analysis.looks_like_chatgpt
+                and analysis.ready_score >= PAGE_READINESS_SCORE_THRESHOLD
+                and not analysis.loading_detected
+            ):
                 self._log(
                     "window_ready_confirmed",
                     {
@@ -1160,14 +1145,8 @@ class BrowserChatGPTTransport:
                 return True
             time.sleep(0.6)
         timeout_analysis = self._analyze_screen(target)
-        self._log(
-            "window_ready_timeout",
-            {
-                "ui_state": timeout_analysis.ui_state,
-                "ocr_preview": list(timeout_analysis.ocr_preview),
-                "page_classification": self._screen_analysis_payload(timeout_analysis),
-            },
-        )
+        failure = self._page_readiness_failure_details(timeout_analysis)
+        self._log("window_ready_timeout", self._page_readiness_log_payload(timeout_analysis, failure))
         return False
 
     @staticmethod
@@ -1431,8 +1410,133 @@ class BrowserChatGPTTransport:
             "likely_existing_chat": analysis.likely_existing_chat,
             "composer_ready": analysis.composer_ready,
             "likely_wrong_page": analysis.likely_wrong_page,
+            "loading_detected": analysis.loading_detected,
             "signals": list(analysis.signals[:8]),
         }
+
+    @staticmethod
+    def _page_readiness_wrong_page_hits(analysis: PageClassification) -> list[str]:
+        visible_text = analysis.visible_text
+        window_title = _normalize(str(analysis.ui_state.get("window_title", "")))
+        return [
+            marker
+            for marker in PAGE_READINESS_WRONG_PAGE_MARKERS
+            if marker in visible_text or marker in window_title
+        ]
+
+    @classmethod
+    def _page_readiness_failure_details(cls, analysis: PageClassification) -> dict[str, Any]:
+        title = str(analysis.ui_state.get("window_title", "") or "")
+        normalized_title = _normalize(title)
+        wrong_page_hits = cls._page_readiness_wrong_page_hits(analysis)
+        likely_wrong_window = (
+            not analysis.looks_like_chatgpt
+            and not analysis.composer_visible
+            and not analysis.send_button_present
+            and not analysis.stop_streaming_present
+            and not analysis.show_in_text_field_present
+            and "chatgpt" not in normalized_title
+        )
+
+        if wrong_page_hits and not analysis.looks_like_chatgpt:
+            return {
+                "code": "wrong_page_detected",
+                "reason": f"Wrong-page markers detected: {', '.join(wrong_page_hits[:2])}.",
+                "wrong_page_hits": wrong_page_hits,
+                "loading_detected": analysis.loading_detected,
+            }
+        if analysis.wrong_page_signals_present or analysis.likely_wrong_page:
+            return {
+                "code": "wrong_page_detected",
+                "reason": "Wrong-page signals were stronger than ChatGPT readiness signals.",
+                "wrong_page_hits": wrong_page_hits,
+                "loading_detected": analysis.loading_detected,
+            }
+        if analysis.loading_detected:
+            return {
+                "code": "still_loading",
+                "reason": "The attached page still appears to be loading.",
+                "wrong_page_hits": wrong_page_hits,
+                "loading_detected": analysis.loading_detected,
+            }
+        if likely_wrong_window:
+            return {
+                "code": "likely_wrong_window",
+                "reason": "The attached window did not show ChatGPT labels or composer controls.",
+                "wrong_page_hits": wrong_page_hits,
+                "loading_detected": analysis.loading_detected,
+            }
+        if (
+            analysis.looks_like_chatgpt
+            and not analysis.composer_visible
+            and not analysis.send_button_present
+            and not analysis.stop_streaming_present
+        ):
+            return {
+                "code": "composer_missing",
+                "reason": "ChatGPT signals were present, but the composer was not visible.",
+                "wrong_page_hits": wrong_page_hits,
+                "loading_detected": analysis.loading_detected,
+            }
+        return {
+            "code": "low_readiness_score",
+            "reason": (
+                "ChatGPT readiness stayed below the acceptance threshold "
+                f"({round(analysis.ready_score, 1)} < {PAGE_READINESS_SCORE_THRESHOLD:.1f})."
+            ),
+            "wrong_page_hits": wrong_page_hits,
+            "loading_detected": analysis.loading_detected,
+        }
+
+    def _page_readiness_log_payload(
+        self,
+        analysis: PageClassification,
+        failure: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        details = failure or self._page_readiness_failure_details(analysis)
+        return {
+            "failure_code": details["code"],
+            "failure_reason": details["reason"],
+            "window_title": str(analysis.ui_state.get("window_title", "") or ""),
+            "ready_score": round(analysis.ready_score, 1),
+            "composer_visible": analysis.composer_visible,
+            "send_button_present": analysis.send_button_present,
+            "stop_streaming_present": analysis.stop_streaming_present,
+            "wrong_page_signals_present": analysis.wrong_page_signals_present,
+            "loading_detected": details["loading_detected"],
+            "wrong_page_hits": list(details.get("wrong_page_hits", [])[:3]),
+            "ocr_preview": list(analysis.ocr_preview),
+            "page_classification": self._screen_analysis_payload(analysis),
+            "ui_state": analysis.ui_state,
+        }
+
+    @staticmethod
+    def _page_readiness_error_message(failure: dict[str, Any]) -> str:
+        code = failure["code"]
+        if code == "wrong_page_detected":
+            return (
+                "Attached browser window appears to be the wrong page. "
+                f"{failure['reason']} Open ChatGPT in the active browser window."
+            )
+        if code == "composer_missing":
+            return (
+                "Attached ChatGPT window did not expose a visible composer. "
+                "Open a ready ChatGPT page where the composer is visible."
+            )
+        if code == "still_loading":
+            return (
+                "Attached ChatGPT window still appears to be loading. "
+                "Wait for the page to finish loading, then try again."
+            )
+        if code == "likely_wrong_window":
+            return (
+                "Attached browser window may not be the ChatGPT tab. "
+                "Focus the ChatGPT window before running Aster."
+            )
+        return (
+            "Attached browser window did not reach a usable ChatGPT page. "
+            f"{failure['reason']}"
+        )
 
     def _read_visible_reply_text(self, target) -> str:
         try:
