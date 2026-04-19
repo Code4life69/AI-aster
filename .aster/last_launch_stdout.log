@@ -4,4 +4,4 @@ OK      git: git version 2.51.0.windows.1
 OK      project_root: Project root is available: C:\Ai Asistant
 OK      write_access: Write access confirmed under C:\Ai Asistant\.aster
 OK      browser_runtime: Browser runtime modules and Screen Reader imports are available.
-OK      repo_state: Repository is on branch aster/page-readiness-diagnostics.
+OK      repo_state: Repository is on branch aster/readiness-score-breakdown.
