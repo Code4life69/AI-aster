@@ -33,6 +33,16 @@ class PageClassification:
     likely_wrong_page: bool = False
     loading_detected: bool = False
     ready_score: float = 0.0
+    score_components: dict[str, float] = field(default_factory=dict)
+    chatgpt_hint_hits: tuple[str, ...] = ()
+    composer_hint_hits: tuple[str, ...] = ()
+    wrong_page_hits: tuple[str, ...] = ()
+    loading_hint_hits: tuple[str, ...] = ()
+    wrong_page_penalties: tuple[str, ...] = ()
+    loading_penalties: tuple[str, ...] = ()
+    ui_state_bonuses: tuple[str, ...] = ()
+    ui_state_penalties: tuple[str, ...] = ()
+    missing_readiness_signals: tuple[str, ...] = ()
     page_kind: str = "unknown"
     visible_text: str = ""
     signals: tuple[str, ...] = ()

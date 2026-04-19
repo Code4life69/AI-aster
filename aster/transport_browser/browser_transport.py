@@ -1398,6 +1398,14 @@ class BrowserChatGPTTransport:
     def _screen_analysis_payload(analysis: PageClassification) -> dict[str, Any]:
         return {
             "ready_score": round(analysis.ready_score, 1),
+            "score_components": {key: round(value, 1) for key, value in analysis.score_components.items()},
+            "chatgpt_hint_hits": list(analysis.chatgpt_hint_hits),
+            "composer_hint_hits": list(analysis.composer_hint_hits),
+            "wrong_page_penalties": list(analysis.wrong_page_penalties),
+            "loading_penalties": list(analysis.loading_penalties),
+            "ui_state_bonuses": list(analysis.ui_state_bonuses),
+            "ui_state_penalties": list(analysis.ui_state_penalties),
+            "missing_readiness_signals": list(analysis.missing_readiness_signals[:5]),
             "page_kind": analysis.page_kind,
             "looks_like_chatgpt": analysis.looks_like_chatgpt,
             "composer_visible": analysis.composer_visible,
@@ -1444,6 +1452,7 @@ class BrowserChatGPTTransport:
                 "reason": f"Wrong-page markers detected: {', '.join(wrong_page_hits[:2])}.",
                 "wrong_page_hits": wrong_page_hits,
                 "loading_detected": analysis.loading_detected,
+                "missing_signals": list(analysis.missing_readiness_signals[:5]),
             }
         if analysis.wrong_page_signals_present or analysis.likely_wrong_page:
             return {
@@ -1451,6 +1460,7 @@ class BrowserChatGPTTransport:
                 "reason": "Wrong-page signals were stronger than ChatGPT readiness signals.",
                 "wrong_page_hits": wrong_page_hits,
                 "loading_detected": analysis.loading_detected,
+                "missing_signals": list(analysis.missing_readiness_signals[:5]),
             }
         if analysis.loading_detected:
             return {
@@ -1458,6 +1468,7 @@ class BrowserChatGPTTransport:
                 "reason": "The attached page still appears to be loading.",
                 "wrong_page_hits": wrong_page_hits,
                 "loading_detected": analysis.loading_detected,
+                "missing_signals": list(analysis.missing_readiness_signals[:5]),
             }
         if likely_wrong_window:
             return {
@@ -1465,6 +1476,7 @@ class BrowserChatGPTTransport:
                 "reason": "The attached window did not show ChatGPT labels or composer controls.",
                 "wrong_page_hits": wrong_page_hits,
                 "loading_detected": analysis.loading_detected,
+                "missing_signals": list(analysis.missing_readiness_signals[:5]),
             }
         if (
             analysis.looks_like_chatgpt
@@ -1477,15 +1489,20 @@ class BrowserChatGPTTransport:
                 "reason": "ChatGPT signals were present, but the composer was not visible.",
                 "wrong_page_hits": wrong_page_hits,
                 "loading_detected": analysis.loading_detected,
+                "missing_signals": list(analysis.missing_readiness_signals[:5]),
             }
+        missing = list(analysis.missing_readiness_signals[:3])
+        missing_suffix = f" Missing strongest signals: {', '.join(missing)}." if missing else ""
         return {
             "code": "low_readiness_score",
             "reason": (
                 "ChatGPT readiness stayed below the acceptance threshold "
                 f"({round(analysis.ready_score, 1)} < {PAGE_READINESS_SCORE_THRESHOLD:.1f})."
+                f"{missing_suffix}"
             ),
             "wrong_page_hits": wrong_page_hits,
             "loading_detected": analysis.loading_detected,
+            "missing_signals": list(analysis.missing_readiness_signals[:5]),
         }
 
     def _page_readiness_log_payload(
@@ -1499,12 +1516,20 @@ class BrowserChatGPTTransport:
             "failure_reason": details["reason"],
             "window_title": str(analysis.ui_state.get("window_title", "") or ""),
             "ready_score": round(analysis.ready_score, 1),
+            "score_components": {key: round(value, 1) for key, value in analysis.score_components.items()},
+            "chatgpt_hint_hits": list(analysis.chatgpt_hint_hits),
+            "composer_hint_hits": list(analysis.composer_hint_hits),
             "composer_visible": analysis.composer_visible,
             "send_button_present": analysis.send_button_present,
             "stop_streaming_present": analysis.stop_streaming_present,
             "wrong_page_signals_present": analysis.wrong_page_signals_present,
             "loading_detected": details["loading_detected"],
             "wrong_page_hits": list(details.get("wrong_page_hits", [])[:3]),
+            "wrong_page_penalties": list(analysis.wrong_page_penalties),
+            "loading_penalties": list(analysis.loading_penalties),
+            "ui_state_bonuses": list(analysis.ui_state_bonuses),
+            "ui_state_penalties": list(analysis.ui_state_penalties),
+            "missing_readiness_signals": list(details.get("missing_signals", [])[:5]),
             "ocr_preview": list(analysis.ocr_preview),
             "page_classification": self._screen_analysis_payload(analysis),
             "ui_state": analysis.ui_state,

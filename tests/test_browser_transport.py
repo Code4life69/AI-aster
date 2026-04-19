@@ -342,6 +342,10 @@ def test_analyze_screen_marks_chatgpt_ready_from_composer_and_title() -> None:
     assert analysis.page_kind == "chatgpt"
     assert analysis.ready_score >= 55.0
     assert analysis.composer_ready is True
+    assert analysis.score_components["chatgpt_label_bonus"] == 25.0
+    assert analysis.score_components["composer_hint_bonus"] == 35.0
+    assert "chatgpt" in analysis.chatgpt_hint_hits
+    assert "ask anything" in analysis.composer_hint_hits
 
 
 def test_analyze_screen_marks_wrong_page_when_non_chatgpt_signals_dominate() -> None:
@@ -367,6 +371,8 @@ def test_analyze_screen_marks_wrong_page_when_non_chatgpt_signals_dominate() -> 
     assert analysis.page_kind == "wrong_page"
     assert analysis.likely_wrong_page is True
     assert analysis.ready_score < 0
+    assert analysis.score_components["wrong_page_penalty"] < 0
+    assert "ask gemini:-10" in analysis.wrong_page_penalties
 
 
 def test_page_readiness_failure_classifies_wrong_page() -> None:
@@ -446,6 +452,8 @@ def test_page_readiness_failure_classifies_still_loading() -> None:
 
     assert analysis.loading_detected is True
     assert failure["code"] == "still_loading"
+    assert analysis.score_components["loading_penalty"] == -15.0
+    assert analysis.loading_penalties
 
 
 def test_page_readiness_failure_classifies_likely_wrong_window() -> None:
@@ -498,6 +506,8 @@ def test_page_readiness_failure_falls_back_to_low_readiness_score() -> None:
 
     assert failure["code"] == "low_readiness_score"
     assert "threshold" in failure["reason"].lower()
+    assert "composer hints (+35)" in failure["missing_signals"]
+    assert "send button (+20)" in failure["missing_signals"]
 
 
 def test_page_readiness_log_payload_includes_failure_reason_and_loading_state() -> None:
@@ -525,4 +535,36 @@ def test_page_readiness_log_payload_includes_failure_reason_and_loading_state() 
     assert payload["window_title"] == "ChatGPT - Google Chrome"
     assert payload["failure_code"] == "still_loading"
     assert payload["loading_detected"] is True
+    assert payload["score_components"]["loading_penalty"] == -15.0
+    assert payload["loading_penalties"]
     assert payload["page_classification"]["loading_detected"] is True
+
+
+def test_page_readiness_log_payload_includes_score_breakdown_and_missing_signals() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": True,
+            "send_prompt_enabled": False,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": None,
+            "composer_edit_preview": "",
+        },
+    )
+
+    payload = transport._page_readiness_log_payload(analysis)
+
+    assert payload["failure_code"] == "low_readiness_score"
+    assert payload["score_components"]["chatgpt_label_bonus"] == 25.0
+    assert payload["score_components"]["send_button_bonus"] == 20.0
+    assert "composer hints (+35)" in payload["missing_readiness_signals"]
+    assert "chatgpt" in payload["chatgpt_hint_hits"]
+    assert payload["ui_state_bonuses"] == ["send_button_present"]
