@@ -31,6 +31,7 @@ class PageClassification:
     likely_existing_chat: bool
     composer_ready: bool = False
     likely_wrong_page: bool = False
+    likely_idle_composer: bool = False
     loading_detected: bool = False
     ready_score: float = 0.0
     score_components: dict[str, float] = field(default_factory=dict)

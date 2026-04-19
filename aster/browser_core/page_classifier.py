@@ -71,10 +71,21 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
     wrong_page_signals_present = bool(wrong_page_hits) and "chatgpt" not in window_title and "chatgpt" not in visible_text
     likely_existing_chat = window_title_suggests_existing_chat(str(ui_state.get("window_title", "")))
     likely_fresh_chat = looks_like_chatgpt and composer_visible and not likely_existing_chat
+    likely_idle_composer = _likely_idle_composer(
+        window_title=window_title,
+        composer_visible=composer_visible,
+        composer_preview=composer_preview,
+        send_present=send_present,
+        stop_streaming=stop_streaming,
+        show_in_text=show_in_text,
+        loading_detected=loading_detected,
+        wrong_page_hit_sources=wrong_page_hit_sources,
+    )
 
     chatgpt_label_bonus = 25.0 if "chatgpt" in visible_text or "chatgpt" in window_title else 0.0
     chatgpt_surface_bonus = min(20.0, 10.0 * len(chatgpt_surface_hits))
     composer_hint_bonus = 35.0 if composer_visible else 0.0
+    idle_composer_bonus = 10.0 if likely_idle_composer else 0.0
     send_button_bonus = 20.0 if send_present else 0.0
     stop_streaming_bonus = 18.0 if stop_streaming else 0.0
     show_in_text_bonus = 10.0 if show_in_text else 0.0
@@ -96,6 +107,7 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
         "chatgpt_label_bonus": chatgpt_label_bonus,
         "chatgpt_surface_bonus": chatgpt_surface_bonus,
         "composer_hint_bonus": composer_hint_bonus,
+        "idle_composer_bonus": idle_composer_bonus,
         "send_button_bonus": send_button_bonus,
         "stop_streaming_bonus": stop_streaming_bonus,
         "show_in_text_field_bonus": show_in_text_bonus,
@@ -110,6 +122,8 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
         signals.append("chatgpt_surface")
     if composer_hint_bonus > 0:
         signals.append("composer_visible")
+    if idle_composer_bonus > 0:
+        signals.append("likely_idle_composer")
     if send_button_bonus > 0:
         signals.append("send_button")
     if stop_streaming_bonus > 0:
@@ -156,6 +170,7 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
             ("composer hints (+35)", composer_hint_bonus),
             ("ChatGPT label/title (+25)", chatgpt_label_bonus),
             ("ChatGPT surface hints (+20)", chatgpt_surface_bonus),
+            ("idle composer state (+10)", idle_composer_bonus),
             ("send button (+20)", send_button_bonus),
             ("stop streaming (+18)", stop_streaming_bonus),
             ("show in text field (+10)", show_in_text_bonus),
@@ -181,6 +196,7 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
         likely_existing_chat=likely_existing_chat,
         composer_ready=composer_visible,
         likely_wrong_page=wrong_page_signals_present,
+        likely_idle_composer=likely_idle_composer,
         loading_detected=loading_detected,
         ready_score=ready_score,
         score_components=score_components,
@@ -308,6 +324,32 @@ def _send_button_absence_reason(
             "ChatGPT surface hints were visible with the composer, but no actionable composer controls were detected."
         )
     return "Composer hints were visible, but no send button was detected."
+
+
+def _likely_idle_composer(
+    *,
+    window_title: str,
+    composer_visible: bool,
+    composer_preview: str,
+    send_present: bool,
+    stop_streaming: bool,
+    show_in_text: bool,
+    loading_detected: bool,
+    wrong_page_hit_sources: dict[str, tuple[str, ...]],
+) -> bool:
+    if "chatgpt" not in window_title:
+        return False
+    if not composer_visible:
+        return False
+    if any((send_present, stop_streaming, show_in_text, loading_detected)):
+        return False
+    if not any(hint in composer_preview for hint in BROWSER_READY_HINTS):
+        return False
+    # Stay conservative when wrong-page markers contaminate the title/composer itself.
+    for sources in wrong_page_hit_sources.values():
+        if "window_title" in sources or "composer_preview" in sources:
+            return False
+    return True
 
 
 def _normalize(text: str) -> str:

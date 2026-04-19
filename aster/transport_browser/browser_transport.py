@@ -1412,6 +1412,7 @@ class BrowserChatGPTTransport:
             "page_kind": analysis.page_kind,
             "looks_like_chatgpt": analysis.looks_like_chatgpt,
             "composer_visible": analysis.composer_visible,
+            "likely_idle_composer": analysis.likely_idle_composer,
             "send_button_present": analysis.send_button_present,
             "send_button_enabled": analysis.send_button_enabled,
             "show_in_text_field_present": analysis.show_in_text_field_present,
@@ -1501,6 +1502,11 @@ class BrowserChatGPTTransport:
             if analysis.send_button_absence_reason
             else ""
         )
+        idle_suffix = (
+            " The page still resembles an idle ChatGPT composer state, so this may reflect a UIA control-detection gap."
+            if analysis.likely_idle_composer
+            else ""
+        )
         return {
             "code": "low_readiness_score",
             "reason": (
@@ -1508,6 +1514,7 @@ class BrowserChatGPTTransport:
                 f"({round(analysis.ready_score, 1)} < {PAGE_READINESS_SCORE_THRESHOLD:.1f})."
                 f"{missing_suffix}"
                 f"{control_suffix}"
+                f"{idle_suffix}"
             ),
             "wrong_page_hits": wrong_page_hits,
             "loading_detected": analysis.loading_detected,
@@ -1530,6 +1537,7 @@ class BrowserChatGPTTransport:
             "chatgpt_surface_hits": list(analysis.chatgpt_surface_hits),
             "composer_hint_hits": list(analysis.composer_hint_hits),
             "composer_visible": analysis.composer_visible,
+            "likely_idle_composer": analysis.likely_idle_composer,
             "send_button_present": analysis.send_button_present,
             "stop_streaming_present": analysis.stop_streaming_present,
             "wrong_page_signals_present": analysis.wrong_page_signals_present,

@@ -573,6 +573,60 @@ def test_page_readiness_log_payload_includes_score_breakdown_and_missing_signals
     assert payload["ui_state_bonuses"] == ["send_button_present"]
 
 
+def test_idle_chatgpt_composer_without_send_button_is_still_ready() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        },
+    )
+
+    assert analysis.looks_like_chatgpt is True
+    assert analysis.likely_idle_composer is True
+    assert analysis.ready_score >= 55.0
+    assert analysis.score_components["idle_composer_bonus"] == 10.0
+    assert analysis.score_components["chatgpt_surface_bonus"] == 0.0
+    assert "idle composer state (+10)" not in analysis.missing_readiness_signals
+
+
+def test_idle_chatgpt_composer_payload_explains_uia_gap() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        },
+    )
+    payload = transport._screen_analysis_payload(analysis)
+
+    assert payload["likely_idle_composer"] is True
+    assert payload["send_button_absence_reason"]
+    assert "UIA control-detection gap" in payload["send_button_absence_reason"]
+
+
 def test_composer_visible_without_controls_gets_absence_reason_and_gaps() -> None:
     transport = BrowserChatGPTTransport()
 
@@ -602,6 +656,7 @@ def test_composer_visible_without_controls_gets_absence_reason_and_gaps() -> Non
 
     assert payload["send_button_absence_reason"] == analysis.send_button_absence_reason
     assert "send_button_missing" in payload["actionable_control_gaps"]
+    assert payload["likely_idle_composer"] is True
 
 
 def test_chatgpt_surface_hints_can_make_valid_page_ready_without_send_button() -> None:
@@ -653,3 +708,29 @@ def test_stray_wrong_page_text_does_not_over_penalize_valid_chatgpt_page() -> No
     assert analysis.score_components["wrong_page_penalty"] == -4.0
     assert "visible_text:github:-4" in analysis.wrong_page_penalties
     assert analysis.ready_score >= 55.0
+
+
+def test_wrong_page_with_placeholder_text_and_non_chatgpt_title_still_fails() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "Other Site - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("GitHub")],
+        ui_state={
+            "window_title": "Other Site - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        },
+    )
+    failure = transport._page_readiness_failure_details(analysis)
+
+    assert analysis.likely_idle_composer is False
+    assert analysis.looks_like_chatgpt is False
+    assert failure["code"] == "wrong_page_detected"
