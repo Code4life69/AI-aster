@@ -343,8 +343,10 @@ def test_analyze_screen_marks_chatgpt_ready_from_composer_and_title() -> None:
     assert analysis.ready_score >= 55.0
     assert analysis.composer_ready is True
     assert analysis.score_components["chatgpt_label_bonus"] == 25.0
+    assert analysis.score_components["chatgpt_surface_bonus"] == 10.0
     assert analysis.score_components["composer_hint_bonus"] == 35.0
     assert "chatgpt" in analysis.chatgpt_hint_hits
+    assert "search chats" in analysis.chatgpt_surface_hits
     assert "ask anything" in analysis.composer_hint_hits
 
 
@@ -372,7 +374,7 @@ def test_analyze_screen_marks_wrong_page_when_non_chatgpt_signals_dominate() -> 
     assert analysis.likely_wrong_page is True
     assert analysis.ready_score < 0
     assert analysis.score_components["wrong_page_penalty"] < 0
-    assert "ask gemini:-10" in analysis.wrong_page_penalties
+    assert "visible_text:ask gemini:-10" in analysis.wrong_page_penalties
 
 
 def test_page_readiness_failure_classifies_wrong_page() -> None:
@@ -507,6 +509,7 @@ def test_page_readiness_failure_falls_back_to_low_readiness_score() -> None:
     assert failure["code"] == "low_readiness_score"
     assert "threshold" in failure["reason"].lower()
     assert "composer hints (+35)" in failure["missing_signals"]
+    assert "ChatGPT surface hints (+20)" in failure["missing_signals"]
     assert "send button (+20)" in failure["missing_signals"]
 
 
@@ -568,3 +571,85 @@ def test_page_readiness_log_payload_includes_score_breakdown_and_missing_signals
     assert "composer hints (+35)" in payload["missing_readiness_signals"]
     assert "chatgpt" in payload["chatgpt_hint_hits"]
     assert payload["ui_state_bonuses"] == ["send_button_present"]
+
+
+def test_composer_visible_without_controls_gets_absence_reason_and_gaps() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("Ask anything"), _Line("Search chats")],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        },
+    )
+
+    assert analysis.send_button_absence_reason
+    assert "send button" in analysis.send_button_absence_reason.lower()
+    assert "send_button_missing" in analysis.actionable_control_gaps
+    assert "no_actionable_composer_controls" in analysis.actionable_control_gaps
+
+    payload = transport._page_readiness_log_payload(analysis)
+
+    assert payload["send_button_absence_reason"] == analysis.send_button_absence_reason
+    assert "send_button_missing" in payload["actionable_control_gaps"]
+
+
+def test_chatgpt_surface_hints_can_make_valid_page_ready_without_send_button() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "New chat - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("Ask anything"), _Line("Search chats"), _Line("New chat")],
+        ui_state={
+            "window_title": "New chat - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        },
+    )
+
+    assert analysis.looks_like_chatgpt is True
+    assert analysis.ready_score >= 55.0
+    assert analysis.score_components["chatgpt_surface_bonus"] == 20.0
+
+
+def test_stray_wrong_page_text_does_not_over_penalize_valid_chatgpt_page() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("Ask anything"), _Line("Search chats"), _Line("GitHub")],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        },
+    )
+
+    assert analysis.looks_like_chatgpt is True
+    assert analysis.score_components["wrong_page_penalty"] == -4.0
+    assert "visible_text:github:-4" in analysis.wrong_page_penalties
+    assert analysis.ready_score >= 55.0

@@ -1400,11 +1400,14 @@ class BrowserChatGPTTransport:
             "ready_score": round(analysis.ready_score, 1),
             "score_components": {key: round(value, 1) for key, value in analysis.score_components.items()},
             "chatgpt_hint_hits": list(analysis.chatgpt_hint_hits),
+            "chatgpt_surface_hits": list(analysis.chatgpt_surface_hits),
             "composer_hint_hits": list(analysis.composer_hint_hits),
             "wrong_page_penalties": list(analysis.wrong_page_penalties),
             "loading_penalties": list(analysis.loading_penalties),
             "ui_state_bonuses": list(analysis.ui_state_bonuses),
             "ui_state_penalties": list(analysis.ui_state_penalties),
+            "actionable_control_gaps": list(analysis.actionable_control_gaps),
+            "send_button_absence_reason": analysis.send_button_absence_reason,
             "missing_readiness_signals": list(analysis.missing_readiness_signals[:5]),
             "page_kind": analysis.page_kind,
             "looks_like_chatgpt": analysis.looks_like_chatgpt,
@@ -1493,12 +1496,18 @@ class BrowserChatGPTTransport:
             }
         missing = list(analysis.missing_readiness_signals[:3])
         missing_suffix = f" Missing strongest signals: {', '.join(missing)}." if missing else ""
+        control_suffix = (
+            f" {analysis.send_button_absence_reason}"
+            if analysis.send_button_absence_reason
+            else ""
+        )
         return {
             "code": "low_readiness_score",
             "reason": (
                 "ChatGPT readiness stayed below the acceptance threshold "
                 f"({round(analysis.ready_score, 1)} < {PAGE_READINESS_SCORE_THRESHOLD:.1f})."
                 f"{missing_suffix}"
+                f"{control_suffix}"
             ),
             "wrong_page_hits": wrong_page_hits,
             "loading_detected": analysis.loading_detected,
@@ -1518,6 +1527,7 @@ class BrowserChatGPTTransport:
             "ready_score": round(analysis.ready_score, 1),
             "score_components": {key: round(value, 1) for key, value in analysis.score_components.items()},
             "chatgpt_hint_hits": list(analysis.chatgpt_hint_hits),
+            "chatgpt_surface_hits": list(analysis.chatgpt_surface_hits),
             "composer_hint_hits": list(analysis.composer_hint_hits),
             "composer_visible": analysis.composer_visible,
             "send_button_present": analysis.send_button_present,
@@ -1529,6 +1539,8 @@ class BrowserChatGPTTransport:
             "loading_penalties": list(analysis.loading_penalties),
             "ui_state_bonuses": list(analysis.ui_state_bonuses),
             "ui_state_penalties": list(analysis.ui_state_penalties),
+            "actionable_control_gaps": list(analysis.actionable_control_gaps),
+            "send_button_absence_reason": analysis.send_button_absence_reason,
             "missing_readiness_signals": list(details.get("missing_signals", [])[:5]),
             "ocr_preview": list(analysis.ocr_preview),
             "page_classification": self._screen_analysis_payload(analysis),

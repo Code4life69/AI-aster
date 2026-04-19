@@ -15,6 +15,15 @@ CHATGPT_PAGE_HINTS = BROWSER_READY_HINTS + (
     "chatgpt can make mistakes",
 )
 
+CHATGPT_SURFACE_HINTS = (
+    "search chats",
+    "new chat",
+    "projects",
+    "gpts",
+    "explore gpts",
+    "chatgpt can make mistakes",
+)
+
 WRONG_PAGE_HINTS = (
     "ask gemini",
     "github",
@@ -44,8 +53,15 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
     stop_streaming = bool(ui_state.get("stop_streaming_present"))
     visible_chatgpt_hint_hits = tuple(_collect_hits(CHATGPT_PAGE_HINTS, visible_text))
     chatgpt_hint_hits = tuple(_collect_hits(CHATGPT_PAGE_HINTS, visible_text, window_title))
+    chatgpt_surface_hits = tuple(_collect_hits(CHATGPT_SURFACE_HINTS, visible_text))
     composer_hint_hits = tuple(_collect_hits(BROWSER_READY_HINTS, visible_text, composer_preview))
-    wrong_page_hits = tuple(_collect_hits(WRONG_PAGE_HINTS, visible_text, composer_preview, window_title))
+    wrong_page_hit_sources = _collect_hit_sources(
+        WRONG_PAGE_HINTS,
+        visible_text=visible_text,
+        composer_preview=composer_preview,
+        window_title=window_title,
+    )
+    wrong_page_hits = tuple(wrong_page_hit_sources)
     loading_hint_hits = tuple(_collect_hits(LOADING_HINTS, visible_text, composer_preview, window_title))
     composer_visible = bool(composer_hint_hits)
     looks_like_chatgpt = bool(visible_chatgpt_hint_hits) or (
@@ -57,15 +73,28 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
     likely_fresh_chat = looks_like_chatgpt and composer_visible and not likely_existing_chat
 
     chatgpt_label_bonus = 25.0 if "chatgpt" in visible_text or "chatgpt" in window_title else 0.0
+    chatgpt_surface_bonus = min(20.0, 10.0 * len(chatgpt_surface_hits))
     composer_hint_bonus = 35.0 if composer_visible else 0.0
     send_button_bonus = 20.0 if send_present else 0.0
     stop_streaming_bonus = 18.0 if stop_streaming else 0.0
     show_in_text_bonus = 10.0 if show_in_text else 0.0
-    wrong_page_penalty = -min(35.0, 10.0 * len(wrong_page_hits)) if wrong_page_hits else 0.0
+    strong_chatgpt_context = bool(
+        composer_visible
+        or chatgpt_label_bonus > 0
+        or chatgpt_surface_bonus > 0
+        or send_present
+        or show_in_text
+        or stop_streaming
+    )
+    wrong_page_penalty, wrong_page_penalties = _compute_wrong_page_penalty(
+        wrong_page_hit_sources,
+        strong_chatgpt_context=strong_chatgpt_context,
+    )
     # Loading already blocks readiness in the transport, so this penalty is diagnostic rather than semantic.
     loading_penalty = -15.0 if loading_detected else 0.0
     score_components = {
         "chatgpt_label_bonus": chatgpt_label_bonus,
+        "chatgpt_surface_bonus": chatgpt_surface_bonus,
         "composer_hint_bonus": composer_hint_bonus,
         "send_button_bonus": send_button_bonus,
         "stop_streaming_bonus": stop_streaming_bonus,
@@ -77,6 +106,8 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
     signals: list[str] = []
     if chatgpt_label_bonus > 0:
         signals.append("chatgpt_label")
+    if chatgpt_surface_bonus > 0:
+        signals.append("chatgpt_surface")
     if composer_hint_bonus > 0:
         signals.append("composer_visible")
     if send_button_bonus > 0:
@@ -104,13 +135,27 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
         if enabled
     )
     ui_state_penalties: tuple[str, ...] = ()
-    wrong_page_penalties = tuple(f"{hint}:-10" for hint in wrong_page_hits[:3])
     loading_penalties = tuple(f"{hint}:-15" for hint in loading_hint_hits[:2])
+    actionable_control_gaps = _actionable_control_gaps(
+        composer_visible=composer_visible,
+        send_present=send_present,
+        stop_streaming=stop_streaming,
+        show_in_text=show_in_text,
+    )
+    send_button_absence_reason = _send_button_absence_reason(
+        composer_visible=composer_visible,
+        send_present=send_present,
+        stop_streaming=stop_streaming,
+        show_in_text=show_in_text,
+        composer_preview=composer_preview,
+        chatgpt_surface_hits=chatgpt_surface_hits,
+    )
     missing_readiness_signals = tuple(
         label
         for label, value in (
             ("composer hints (+35)", composer_hint_bonus),
             ("ChatGPT label/title (+25)", chatgpt_label_bonus),
+            ("ChatGPT surface hints (+20)", chatgpt_surface_bonus),
             ("send button (+20)", send_button_bonus),
             ("stop streaming (+18)", stop_streaming_bonus),
             ("show in text field (+10)", show_in_text_bonus),
@@ -140,6 +185,7 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
         ready_score=ready_score,
         score_components=score_components,
         chatgpt_hint_hits=chatgpt_hint_hits,
+        chatgpt_surface_hits=chatgpt_surface_hits,
         composer_hint_hits=composer_hint_hits,
         wrong_page_hits=wrong_page_hits,
         loading_hint_hits=loading_hint_hits,
@@ -147,6 +193,8 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
         loading_penalties=loading_penalties,
         ui_state_bonuses=ui_state_bonuses,
         ui_state_penalties=ui_state_penalties,
+        actionable_control_gaps=actionable_control_gaps,
+        send_button_absence_reason=send_button_absence_reason,
         missing_readiness_signals=missing_readiness_signals,
         page_kind=page_kind,
         visible_text=visible_text,
@@ -182,6 +230,84 @@ def _collect_hits(hints: tuple[str, ...], *texts: str) -> list[str]:
         if any(hint in text for text in texts if text):
             hits.append(hint)
     return hits
+
+
+def _collect_hit_sources(hints: tuple[str, ...], **texts: str) -> dict[str, tuple[str, ...]]:
+    hits: dict[str, tuple[str, ...]] = {}
+    for hint in hints:
+        sources = [name for name, text in texts.items() if text and hint in text]
+        if sources:
+            hits[hint] = tuple(sources)
+    return hits
+
+
+def _compute_wrong_page_penalty(
+    wrong_page_hit_sources: dict[str, tuple[str, ...]],
+    *,
+    strong_chatgpt_context: bool,
+) -> tuple[float, tuple[str, ...]]:
+    total = 0.0
+    details: list[str] = []
+    for hint, sources in wrong_page_hit_sources.items():
+        if "window_title" in sources or "composer_preview" in sources:
+            penalty = -10.0
+        elif strong_chatgpt_context:
+            penalty = -4.0
+        else:
+            penalty = -10.0
+        total += penalty
+        source_label = "+".join(sources)
+        details.append(f"{source_label}:{hint}:{int(penalty)}")
+    total = max(-35.0, total)
+    return total, tuple(details[:3])
+
+
+def _actionable_control_gaps(
+    *,
+    composer_visible: bool,
+    send_present: bool,
+    stop_streaming: bool,
+    show_in_text: bool,
+) -> tuple[str, ...]:
+    if not composer_visible:
+        return ()
+    gaps: list[str] = []
+    if not send_present:
+        gaps.append("send_button_missing")
+    if not stop_streaming:
+        gaps.append("stop_streaming_missing")
+    if not show_in_text:
+        gaps.append("show_in_text_field_missing")
+    if not any((send_present, stop_streaming, show_in_text)):
+        gaps.append("no_actionable_composer_controls")
+    return tuple(gaps)
+
+
+def _send_button_absence_reason(
+    *,
+    composer_visible: bool,
+    send_present: bool,
+    stop_streaming: bool,
+    show_in_text: bool,
+    composer_preview: str,
+    chatgpt_surface_hits: tuple[str, ...],
+) -> str:
+    if not composer_visible or send_present:
+        return ""
+    if stop_streaming:
+        return "Stop-streaming control was present, so the send button was likely replaced by an active reply state."
+    if show_in_text:
+        return "Show-in-text-field control was present, so the composer appears to be in prompt-preview state rather than send-ready state."
+    if any(hint in composer_preview for hint in BROWSER_READY_HINTS):
+        return (
+            "Composer placeholder text was visible, but no send button was detected. "
+            "This may be a valid idle ChatGPT composer state or a UIA control-detection gap."
+        )
+    if chatgpt_surface_hits:
+        return (
+            "ChatGPT surface hints were visible with the composer, but no actionable composer controls were detected."
+        )
+    return "Composer hints were visible, but no send button was detected."
 
 
 def _normalize(text: str) -> str:

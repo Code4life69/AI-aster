@@ -35,6 +35,7 @@ class PageClassification:
     ready_score: float = 0.0
     score_components: dict[str, float] = field(default_factory=dict)
     chatgpt_hint_hits: tuple[str, ...] = ()
+    chatgpt_surface_hits: tuple[str, ...] = ()
     composer_hint_hits: tuple[str, ...] = ()
     wrong_page_hits: tuple[str, ...] = ()
     loading_hint_hits: tuple[str, ...] = ()
@@ -42,6 +43,8 @@ class PageClassification:
     loading_penalties: tuple[str, ...] = ()
     ui_state_bonuses: tuple[str, ...] = ()
     ui_state_penalties: tuple[str, ...] = ()
+    actionable_control_gaps: tuple[str, ...] = ()
+    send_button_absence_reason: str = ""
     missing_readiness_signals: tuple[str, ...] = ()
     page_kind: str = "unknown"
     visible_text: str = ""
