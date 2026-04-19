@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 import sys
@@ -16,30 +15,30 @@ from aster.browser_core import (
     BrowserStrategy,
     PageClassification,
     RecoveryAction,
+    ReplyTrackerPolicy,
     ThreadRegistry,
     build_reply_capture_result,
     build_recovery_handlers,
     build_turn_anchor,
-    choose_best_reply_candidate,
-    clean_captured_segment,
+    choose_best_reply_candidate_for_policy,
     classify_page,
     composer_has_user_text,
+    extract_structured_block,
     decide_and_execute_recovery,
     decision_payload,
-    extract_reply_from_ocr_lines,
+    extract_reply_from_ocr_lines_for_policy,
     looks_like_browser_url_text,
     looks_like_chatgpt_page,
-    looks_like_code_reply_candidate,
-    looks_like_reply_started_candidate,
-    looks_like_substantive_reply_candidate,
+    looks_like_patch_plan_json,
+    looks_like_reply_started_candidate_for_policy,
     merge_text_segments,
+    merge_reply_segment_sources,
     reply_detection_blocked,
     reply_looks_incomplete,
     reply_matches_anchor,
-    score_candidate,
-    segment_looks_like_prompt_echo,
+    score_candidate_for_policy,
+    segment_looks_like_prompt_echo_for_policy,
     serialize_anchor,
-    should_ignore_candidate,
     window_title_suggests_existing_chat,
 )
 
@@ -160,6 +159,41 @@ PROMPT_CONFIRMATION_STOPWORDS = {
     "included_files",
     "omitted_files",
 }
+
+REPLY_TRACKER_POLICY = ReplyTrackerPolicy(
+    browser_reply_noise=BROWSER_REPLY_NOISE,
+    input_too_large_hints=INPUT_TOO_LARGE_HINTS,
+    prompt_echo_markers=PROMPT_ECHO_MARKERS,
+    stop_streaming_hints=STOP_STREAMING_HINTS,
+    penalty_markers=(
+        "good to see you",
+        "company knowledge",
+        "show in text field",
+        "ask anything",
+        "what are you working on",
+        "input too large",
+        "message too long",
+        "ask gemini",
+        "github",
+        "context omitted for browser size safety",
+        "included_files",
+        "omitted_files",
+        "return promptpackage",
+        "def _normalize",
+        'self.log("activity"',
+    ),
+    operation_markers=("CREATE FILE", "EDIT FILE", "REPLACE FILE", "RUN COMMANDS", "NEED THESE FILES FIRST"),
+    extra_bad_markers=(
+        "ask gemini",
+        "github",
+        "context omitted for browser size safety",
+        "included_files",
+        "omitted_files",
+        "return promptpackage",
+        "def _normalize",
+        'self.log("activity"',
+    ),
+)
 
 pyautogui = None
 Desktop = None
@@ -460,7 +494,7 @@ class BrowserChatGPTTransport:
                     timeout_sec=timeout_sec,
                     prompt_anchor=prompt_anchor,
                 )
-                parsed = self.extract_structured_block(reply)
+                parsed = extract_structured_block(reply)
                 self._log(
                     "generate_reply_captured",
                     {
@@ -621,7 +655,7 @@ class BrowserChatGPTTransport:
             timeout_sec=1.0,
         )
         if candidate.strip():
-            if self._reply_detection_blocked(state):
+            if reply_detection_blocked(state):
                 self._log(
                     "reply_detection_suppressed",
                     {
@@ -631,13 +665,17 @@ class BrowserChatGPTTransport:
                     },
                 )
                 return False
-            if not self._looks_like_reply_started_candidate(candidate, state):
+            if not looks_like_reply_started_candidate_for_policy(
+                candidate,
+                ui_state=state,
+                policy=REPLY_TRACKER_POLICY,
+            ):
                 self._log(
                     "reply_detection_suppressed",
                     {
                         "reason": "low_signal_candidate",
                         "candidate_preview": candidate[:160],
-                        "score": self._score_reply_candidate(candidate),
+                        "score": score_candidate_for_policy(candidate, policy=REPLY_TRACKER_POLICY),
                         "ui_state": state,
                     },
                 )
@@ -654,7 +692,7 @@ class BrowserChatGPTTransport:
                 continue
             if "ask anything" in lowered:
                 continue
-            if self._reply_detection_blocked(state):
+            if reply_detection_blocked(state):
                 self._log(
                     "reply_detection_suppressed",
                     {
@@ -664,33 +702,23 @@ class BrowserChatGPTTransport:
                     },
                 )
                 return False
-            if not self._looks_like_reply_started_candidate(lowered, state):
+            if not looks_like_reply_started_candidate_for_policy(
+                lowered,
+                ui_state=state,
+                policy=REPLY_TRACKER_POLICY,
+            ):
                 self._log(
                     "reply_detection_suppressed",
                     {
                         "reason": "low_signal_line",
                         "line_preview": lowered[:160],
-                        "score": self._score_reply_candidate(lowered),
+                        "score": score_candidate_for_policy(lowered, policy=REPLY_TRACKER_POLICY),
                         "ui_state": state,
                     },
                 )
                 return False
             return True
         return False
-
-    @staticmethod
-    def _reply_detection_blocked(ui_state: dict[str, Any]) -> bool:
-        return reply_detection_blocked(ui_state)
-
-    @classmethod
-    def _looks_like_reply_started_candidate(cls, text: str, ui_state: dict[str, Any]) -> bool:
-        return looks_like_reply_started_candidate(
-            text,
-            ui_state=ui_state,
-            score_candidate=cls._score_reply_candidate,
-            looks_like_substantive_candidate=cls._looks_like_substantive_reply_candidate,
-            looks_like_code_candidate=cls._looks_like_code_reply_candidate,
-        )
 
     def _needs_send_retry(self, lines, prompt: str) -> bool:
         full = "\n".join(line.text.lower() for line in lines)
@@ -1237,11 +1265,12 @@ class BrowserChatGPTTransport:
             lines = self._ocr.extract(image)
             self._raise_for_browser_error(lines, ui_state, stage="reply_capture")
             ocr_text, uia_text = self._capture_visible_reply_sources(target, before_lines, prompt, lines=lines)
-            current_best = self._choose_best_reply_candidate(
+            current_best = choose_best_reply_candidate_for_policy(
                 {
                     "ocr": ocr_text,
                     "uia": uia_text,
                 },
+                policy=REPLY_TRACKER_POLICY,
                 prompt_anchor=prompt_anchor,
             )
             if current_best is not None:
@@ -1258,7 +1287,7 @@ class BrowserChatGPTTransport:
                             "preview": candidate[:240],
                         },
                     )
-                if self._looks_like_patch_plan_json(candidate):
+                if looks_like_patch_plan_json(candidate):
                     if candidate == last_structured:
                         stable_structured_hits += 1
                     else:
@@ -1270,7 +1299,7 @@ class BrowserChatGPTTransport:
                     not scanned_with_scroll
                     and not self._response_still_streaming(ui_state)
                     and score >= 180.0
-                    and self._reply_looks_incomplete(candidate)
+                    and reply_looks_incomplete(candidate)
                 ):
                     scrolled = self._capture_reply_text_by_scrolling(target, before_lines, prompt, max_steps=10)
                     if scrolled.strip():
@@ -1281,8 +1310,9 @@ class BrowserChatGPTTransport:
                                 "preview": scrolled[:240],
                             },
                         )
-                        best_from_scroll = self._choose_best_reply_candidate(
+                        best_from_scroll = choose_best_reply_candidate_for_policy(
                             {"scrolled": scrolled},
+                            policy=REPLY_TRACKER_POLICY,
                             prompt_anchor=prompt_anchor,
                         )
                         if best_from_scroll is not None:
@@ -1290,12 +1320,12 @@ class BrowserChatGPTTransport:
                             if score > best_score or (score == best_score and len(candidate) > len(best_text)):
                                 best_text = candidate
                                 best_score = score
-                            if self._looks_like_patch_plan_json(candidate):
+                            if looks_like_patch_plan_json(candidate):
                                 return candidate
                     scanned_with_scroll = True
             attempt_index += 1
 
-        if self._looks_like_patch_plan_json(best_text):
+        if looks_like_patch_plan_json(best_text):
             return best_text
 
         fallback = self._executor.read_chatgpt_browser_reply(
@@ -1306,13 +1336,13 @@ class BrowserChatGPTTransport:
             prompt,
             timeout_sec=min(8.0, max(2.0, timeout_sec / 4.0)),
         )
-        fallback_block = self.extract_structured_block(fallback)
-        if self._looks_like_patch_plan_json(fallback_block):
+        fallback_block = extract_structured_block(fallback)
+        if looks_like_patch_plan_json(fallback_block):
             self._log(
                 "reply_candidate_selected",
                 {
                     "source": "screen_reader_fallback",
-                    "score": self._score_reply_candidate(fallback_block),
+                    "score": score_candidate_for_policy(fallback_block, policy=REPLY_TRACKER_POLICY),
                     "length": len(fallback_block),
                     "preview": fallback_block[:240],
                 },
@@ -1320,22 +1350,19 @@ class BrowserChatGPTTransport:
             return fallback_block
         return best_text or fallback or ""
 
-    def _choose_best_reply_candidate(self, sources: dict[str, str], *, prompt_anchor=None) -> tuple[str, str, float] | None:
-        return choose_best_reply_candidate(
-            sources,
-            extract_structured_block=self.extract_structured_block,
-            is_patch_json=self._looks_like_patch_plan_json,
-            should_ignore_candidate=self._should_ignore_reply_candidate,
-            score_candidate=self._score_reply_candidate,
-            prompt_anchor=prompt_anchor,
-        )
-
     def _capture_visible_reply_sources(self, target, before_lines, prompt: str, lines=None) -> tuple[str, str]:
         after_lines = lines
         if after_lines is None:
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             after_lines = self._ocr.extract(image)
-        ocr_text = self._extract_reply_from_ocr_lines(before_lines, after_lines, target, prompt)
+        ocr_text = extract_reply_from_ocr_lines_for_policy(
+            before_lines,
+            after_lines,
+            target_width=target.width,
+            target_height=target.height,
+            prompt=prompt,
+            policy=REPLY_TRACKER_POLICY,
+        )
         uia_text = self._read_visible_reply_text(target)
         return ocr_text, uia_text
 
@@ -1352,7 +1379,7 @@ class BrowserChatGPTTransport:
 
         for step in range(max_steps):
             segment = self._capture_visible_reply_segment(target, before_lines, prompt)
-            if self._segment_looks_like_prompt_echo(segment):
+            if segment_looks_like_prompt_echo_for_policy(segment, policy=REPLY_TRACKER_POLICY):
                 self._log(
                     "reply_scroll_prompt_boundary",
                     {
@@ -1382,8 +1409,8 @@ class BrowserChatGPTTransport:
                     },
                 )
 
-            merged = self._merge_text_segments(list(reversed(segments)))
-            if self._looks_like_patch_plan_json(merged):
+            merged = merge_text_segments(list(reversed(segments)))
+            if looks_like_patch_plan_json(merged):
                 self._scroll_reply_to_bottom(target)
                 return merged
             if repeated >= 2:
@@ -1391,11 +1418,11 @@ class BrowserChatGPTTransport:
             self._scroll_reply_up(target)
 
         self._scroll_reply_to_bottom(target)
-        return self._merge_text_segments(list(reversed(segments)))
+        return merge_text_segments(list(reversed(segments)))
 
     def _capture_visible_reply_segment(self, target, before_lines, prompt: str) -> str:
         ocr_text, uia_text = self._capture_visible_reply_sources(target, before_lines, prompt)
-        return self._clean_captured_segment(self._merge_text_segments([uia_text, ocr_text]))
+        return merge_reply_segment_sources(uia_text, ocr_text, policy=REPLY_TRACKER_POLICY)
 
     def _scroll_reply_to_bottom(self, target) -> None:
         self._focus_reply_area(target)
@@ -1451,22 +1478,6 @@ class BrowserChatGPTTransport:
             ) from fallback_exc
 
     @staticmethod
-    def _merge_text_segments(segments: list[str]) -> str:
-        return merge_text_segments(segments)
-
-    @staticmethod
-    def _reply_looks_incomplete(text: str) -> bool:
-        return reply_looks_incomplete(text)
-
-    @staticmethod
-    def _segment_looks_like_prompt_echo(text: str) -> bool:
-        return segment_looks_like_prompt_echo(text, prompt_echo_markers=PROMPT_ECHO_MARKERS)
-
-    @staticmethod
-    def _clean_captured_segment(text: str) -> str:
-        return clean_captured_segment(text, prompt_echo_markers=PROMPT_ECHO_MARKERS)
-
-    @staticmethod
     def _response_still_streaming(ui_state: dict[str, Any]) -> bool:
         return bool(ui_state.get("stop_streaming_present"))
 
@@ -1497,17 +1508,6 @@ class BrowserChatGPTTransport:
             "likely_wrong_page": analysis.likely_wrong_page,
             "signals": list(analysis.signals[:8]),
         }
-
-    def _extract_reply_from_ocr_lines(self, before_lines, after_lines, target, prompt: str) -> str:
-        return extract_reply_from_ocr_lines(
-            before_lines,
-            after_lines,
-            target_width=target.width,
-            target_height=target.height,
-            prompt=prompt,
-            browser_reply_noise=BROWSER_REPLY_NOISE,
-            prompt_echo_markers=PROMPT_ECHO_MARKERS,
-        )
 
     def _read_visible_reply_text(self, target) -> str:
         try:
@@ -1548,86 +1548,6 @@ class BrowserChatGPTTransport:
         return "\n".join(text for _, _, text in selected)
 
     @staticmethod
-    def extract_structured_block(raw_text: str) -> str:
-        text = raw_text.strip()
-        if not text:
-            return ""
-        marker_match = re.search(
-            r"ASTER[_ ]PATCH[_ ]BEGIN\s*(\{.*?\})\s*ASTER[_ ]PATCH[_ ]END",
-            text,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        if marker_match:
-            return marker_match.group(1).strip()
-        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-        if fenced:
-            return fenced[-1].strip()
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return text[start : end + 1].strip()
-        return text
-
-    @classmethod
-    def _looks_like_substantive_reply_candidate(cls, text: str) -> bool:
-        return looks_like_substantive_reply_candidate(
-            text,
-            browser_reply_noise=BROWSER_REPLY_NOISE,
-            input_too_large_hints=INPUT_TOO_LARGE_HINTS,
-            prompt_echo_markers=PROMPT_ECHO_MARKERS,
-            is_patch_json=cls._looks_like_patch_plan_json,
-            extra_bad_markers=(
-                "ask gemini",
-                "github",
-                "context omitted for browser size safety",
-                "included_files",
-                "omitted_files",
-                "return promptpackage",
-                "def _normalize",
-                'self.log("activity"',
-            ),
-        )
-
-    @staticmethod
-    def _looks_like_code_reply_candidate(text: str) -> bool:
-        return looks_like_code_reply_candidate(text)
-
-    @classmethod
-    def _should_ignore_reply_candidate(cls, text: str) -> bool:
-        return should_ignore_candidate(
-            text,
-            is_patch_json=cls._looks_like_patch_plan_json,
-            prompt_echo_markers=PROMPT_ECHO_MARKERS,
-        )
-
-    @classmethod
-    def _score_reply_candidate(cls, text: str) -> float:
-        return score_candidate(
-            text,
-            is_patch_json=cls._looks_like_patch_plan_json,
-            prompt_echo_markers=PROMPT_ECHO_MARKERS,
-            stop_streaming_hints=STOP_STREAMING_HINTS,
-            penalty_markers=(
-                "good to see you",
-                "company knowledge",
-                "show in text field",
-                "ask anything",
-                "what are you working on",
-                "input too large",
-                "message too long",
-                "ask gemini",
-                "github",
-                "context omitted for browser size safety",
-                "included_files",
-                "omitted_files",
-                "return promptpackage",
-                "def _normalize",
-                'self.log("activity"',
-            ),
-            operation_markers=("CREATE FILE", "EDIT FILE", "REPLACE FILE", "RUN COMMANDS", "NEED THESE FILES FIRST"),
-        )
-
-    @staticmethod
     def _window_title_suggests_existing_thread(title: str) -> bool:
         return window_title_suggests_existing_chat(title)
 
@@ -1655,18 +1575,6 @@ class BrowserChatGPTTransport:
                 "ChatGPT browser rejected the prompt as too large. "
                 "Aster needs a smaller browser prompt for this run."
             )
-
-    @staticmethod
-    def _looks_like_patch_plan_json(text: str) -> bool:
-        candidate = BrowserChatGPTTransport.extract_structured_block(text)
-        try:
-            data = json.loads(candidate)
-        except Exception:
-            return False
-        if not isinstance(data, dict):
-            return False
-        operations = data.get("operations")
-        return isinstance(operations, list) and bool(operations)
 
     @staticmethod
     def _looks_like_browser_url_text(text: str) -> bool:

@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import json
 import re
+from dataclasses import dataclass
 from typing import Callable
 
 from .models import ReplyCaptureResult, TurnAnchor
 from .turn_anchor import anchor_match_confidence, anchor_matches
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyTrackerPolicy:
+    browser_reply_noise: tuple[str, ...] = ()
+    input_too_large_hints: tuple[str, ...] = ()
+    prompt_echo_markers: tuple[str, ...] = ()
+    stop_streaming_hints: tuple[str, ...] = ()
+    penalty_markers: tuple[str, ...] = ()
+    operation_markers: tuple[str, ...] = ()
+    extra_bad_markers: tuple[str, ...] = ()
 
 
 def build_reply_capture_result(
@@ -56,6 +69,22 @@ def looks_like_reply_started_candidate(
     return looks_like_code_candidate(text)
 
 
+def choose_best_reply_candidate_for_policy(
+    sources: dict[str, str],
+    *,
+    policy: ReplyTrackerPolicy,
+    prompt_anchor: TurnAnchor | None = None,
+) -> tuple[str, str, float] | None:
+    return choose_best_reply_candidate(
+        sources,
+        extract_structured_block=extract_structured_block,
+        is_patch_json=looks_like_patch_plan_json,
+        should_ignore_candidate=lambda candidate: should_ignore_candidate_for_policy(candidate, policy=policy),
+        score_candidate=lambda candidate: score_candidate_for_policy(candidate, policy=policy),
+        prompt_anchor=prompt_anchor,
+    )
+
+
 def choose_best_reply_candidate(
     sources: dict[str, str],
     *,
@@ -90,6 +119,26 @@ def choose_best_reply_candidate(
             if best is None or score > best[2] or (score == best[2] and len(candidate) > len(best[1])):
                 best = (source, candidate, score)
     return best
+
+
+def extract_reply_from_ocr_lines_for_policy(
+    before_lines,
+    after_lines,
+    *,
+    target_width: int,
+    target_height: int,
+    prompt: str,
+    policy: ReplyTrackerPolicy,
+) -> str:
+    return extract_reply_from_ocr_lines(
+        before_lines,
+        after_lines,
+        target_width=target_width,
+        target_height=target_height,
+        prompt=prompt,
+        browser_reply_noise=policy.browser_reply_noise,
+        prompt_echo_markers=policy.prompt_echo_markers,
+    )
 
 
 def extract_reply_from_ocr_lines(
@@ -140,6 +189,13 @@ def extract_reply_from_ocr_lines(
     return "\n".join(text for _, _, text in selected)
 
 
+def merge_reply_segment_sources(uia_text: str, ocr_text: str, *, policy: ReplyTrackerPolicy) -> str:
+    return clean_captured_segment_for_policy(
+        merge_text_segments([uia_text, ocr_text]),
+        policy=policy,
+    )
+
+
 def merge_text_segments(segments: list[str]) -> str:
     merged_lines: list[str] = []
     merged_norms: list[str] = []
@@ -182,6 +238,14 @@ def segment_looks_like_prompt_echo(text: str, *, prompt_echo_markers: tuple[str,
         return False
     hits = sum(1 for marker in prompt_echo_markers if marker in lowered)
     return hits >= 2 or ("your message" in lowered and "path:" in lowered)
+
+
+def segment_looks_like_prompt_echo_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> bool:
+    return segment_looks_like_prompt_echo(text, prompt_echo_markers=policy.prompt_echo_markers)
+
+
+def clean_captured_segment_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> str:
+    return clean_captured_segment(text, prompt_echo_markers=policy.prompt_echo_markers)
 
 
 def clean_captured_segment(text: str, *, prompt_echo_markers: tuple[str, ...]) -> str:
@@ -229,6 +293,17 @@ def looks_like_substantive_reply_candidate(
     return False
 
 
+def looks_like_substantive_reply_candidate_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> bool:
+    return looks_like_substantive_reply_candidate(
+        text,
+        browser_reply_noise=policy.browser_reply_noise,
+        input_too_large_hints=policy.input_too_large_hints,
+        prompt_echo_markers=policy.prompt_echo_markers,
+        is_patch_json=looks_like_patch_plan_json,
+        extra_bad_markers=policy.extra_bad_markers,
+    )
+
+
 def looks_like_code_reply_candidate(text: str) -> bool:
     cleaned = text.strip()
     if len(cleaned) < 80:
@@ -246,6 +321,14 @@ def looks_like_code_reply_candidate(text: str) -> bool:
     if sum(1 for line in lines if any(char in line for char in "()[]{}=:")) >= 2:
         signals += 1
     return signals >= 2
+
+
+def should_ignore_candidate_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> bool:
+    return should_ignore_candidate(
+        text,
+        is_patch_json=looks_like_patch_plan_json,
+        prompt_echo_markers=policy.prompt_echo_markers,
+    )
 
 
 def should_ignore_candidate(
@@ -266,6 +349,17 @@ def should_ignore_candidate(
         if "on its own line" in lowered or "do not wrap the json" in lowered:
             return True
     return False
+
+
+def score_candidate_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> float:
+    return score_candidate(
+        text,
+        is_patch_json=looks_like_patch_plan_json,
+        prompt_echo_markers=policy.prompt_echo_markers,
+        stop_streaming_hints=policy.stop_streaming_hints,
+        penalty_markers=policy.penalty_markers,
+        operation_markers=policy.operation_markers,
+    )
 
 
 def score_candidate(
@@ -307,6 +401,57 @@ def score_candidate(
     ):
         score -= 200.0
     return score
+
+
+def looks_like_reply_started_candidate_for_policy(
+    text: str,
+    *,
+    ui_state: dict[str, object],
+    policy: ReplyTrackerPolicy,
+) -> bool:
+    return looks_like_reply_started_candidate(
+        text,
+        ui_state=ui_state,
+        score_candidate=lambda candidate: score_candidate_for_policy(candidate, policy=policy),
+        looks_like_substantive_candidate=lambda candidate: looks_like_substantive_reply_candidate_for_policy(
+            candidate,
+            policy=policy,
+        ),
+        looks_like_code_candidate=looks_like_code_reply_candidate,
+    )
+
+
+def extract_structured_block(raw_text: str) -> str:
+    text = raw_text.strip()
+    if not text:
+        return ""
+    marker_match = re.search(
+        r"ASTER[_ ]PATCH[_ ]BEGIN\s*(\{.*?\})\s*ASTER[_ ]PATCH[_ ]END",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if marker_match:
+        return marker_match.group(1).strip()
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        return fenced[-1].strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1].strip()
+    return text
+
+
+def looks_like_patch_plan_json(text: str) -> bool:
+    candidate = extract_structured_block(text)
+    try:
+        data = json.loads(candidate)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    operations = data.get("operations")
+    return isinstance(operations, list) and bool(operations)
 
 
 def _line_text(line) -> str:

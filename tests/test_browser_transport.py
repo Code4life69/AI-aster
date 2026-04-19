@@ -1,4 +1,14 @@
-from aster.transport_browser.browser_transport import BrowserChatGPTTransport
+from aster.browser_core.reply_tracker import (
+    clean_captured_segment_for_policy,
+    extract_structured_block,
+    looks_like_patch_plan_json,
+    merge_text_segments,
+    reply_looks_incomplete,
+    score_candidate_for_policy,
+    segment_looks_like_prompt_echo_for_policy,
+    should_ignore_candidate_for_policy,
+)
+from aster.transport_browser.browser_transport import BrowserChatGPTTransport, REPLY_TRACKER_POLICY
 
 
 def test_extract_structured_block_prefers_fenced_json() -> None:
@@ -9,14 +19,14 @@ def test_extract_structured_block_prefers_fenced_json() -> None:
     ```
     trailing text
     """
-    parsed = BrowserChatGPTTransport.extract_structured_block(raw)
+    parsed = extract_structured_block(raw)
     assert parsed.startswith("{")
     assert '"summary":"ok"' in parsed
 
 
 def test_extract_structured_block_falls_back_to_outer_json() -> None:
     raw = 'noise {"summary":"ok","notes":[],"operations":[{"type":"RUN COMMANDS","path":".","reason":"verify","commands":["pytest"]}]} end'
-    parsed = BrowserChatGPTTransport.extract_structured_block(raw)
+    parsed = extract_structured_block(raw)
     assert parsed.startswith("{")
     assert parsed.endswith("}")
 
@@ -29,7 +39,7 @@ def test_extract_structured_block_prefers_aster_markers() -> None:
     ASTER_PATCH_END
     random footer
     """
-    parsed = BrowserChatGPTTransport.extract_structured_block(raw)
+    parsed = extract_structured_block(raw)
     assert parsed.startswith("{")
     assert '"CREATE FILE"' in parsed
 
@@ -172,11 +182,14 @@ def test_reply_detection_rejects_code_like_reply_while_send_button_is_still_visi
 def test_score_reply_candidate_prefers_patch_json_over_page_greeting() -> None:
     greeting = "Good to see you, Justin.\nCompany knowledge"
     patch = '{"summary":"ok","notes":[],"operations":[{"type":"EDIT FILE","path":"app.py","reason":"fix","content":"print(1)"}]}'
-    assert BrowserChatGPTTransport._score_reply_candidate(patch) > BrowserChatGPTTransport._score_reply_candidate(greeting)
+    assert score_candidate_for_policy(patch, policy=REPLY_TRACKER_POLICY) > score_candidate_for_policy(
+        greeting,
+        policy=REPLY_TRACKER_POLICY,
+    )
 
 
 def test_merge_text_segments_stitches_overlapping_reply_slices() -> None:
-    merged = BrowserChatGPTTransport._merge_text_segments(
+    merged = merge_text_segments(
         [
             "ASTER_PATCH_BEGIN\n{\n  \"summary\": \"ok\",",
             "{\n  \"summary\": \"ok\",\n  \"notes\": [],",
@@ -190,12 +203,12 @@ def test_merge_text_segments_stitches_overlapping_reply_slices() -> None:
 
 def test_reply_looks_incomplete_for_partial_marker_block() -> None:
     partial = 'ASTER_PATCH_BEGIN\n{"summary":"ok","operations":['
-    assert BrowserChatGPTTransport._reply_looks_incomplete(partial) is True
+    assert reply_looks_incomplete(partial) is True
 
 
 def test_segment_looks_like_prompt_echo_for_context_block() -> None:
     segment = "User goal:\nBuild app\n\nRelevant file contents:\nPATH: app.py\nREASON: source_or_related_file"
-    assert BrowserChatGPTTransport._segment_looks_like_prompt_echo(segment) is True
+    assert segment_looks_like_prompt_echo_for_policy(segment, policy=REPLY_TRACKER_POLICY) is True
 
 
 def test_reply_candidate_ignore_rejects_retry_instruction_echo() -> None:
@@ -206,18 +219,38 @@ def test_reply_candidate_ignore_rejects_retry_instruction_echo() -> None:
     Previous response was rejected because it was vague.
     ASTER_PATCH_END on its own line
     """
-    assert BrowserChatGPTTransport._should_ignore_reply_candidate(candidate) is True
+    assert should_ignore_candidate_for_policy(candidate, policy=REPLY_TRACKER_POLICY) is True
 
 
 def test_reply_candidate_ignore_keeps_real_patch_json() -> None:
     candidate = '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}'
-    assert BrowserChatGPTTransport._should_ignore_reply_candidate(candidate) is False
+    assert should_ignore_candidate_for_policy(candidate, policy=REPLY_TRACKER_POLICY) is False
 
 
 def test_score_reply_candidate_penalizes_input_too_large_error() -> None:
     error_text = "Input too large\nRetry"
     patch = '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}'
-    assert BrowserChatGPTTransport._score_reply_candidate(patch) > BrowserChatGPTTransport._score_reply_candidate(error_text)
+    assert score_candidate_for_policy(patch, policy=REPLY_TRACKER_POLICY) > score_candidate_for_policy(
+        error_text,
+        policy=REPLY_TRACKER_POLICY,
+    )
+
+
+def test_reply_tracker_policy_detects_patch_json() -> None:
+    assert looks_like_patch_plan_json(
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}'
+    ) is True
+
+
+def test_clean_captured_segment_for_policy_removes_transport_noise() -> None:
+    cleaned = clean_captured_segment_for_policy(
+        "User goal:\nBuild app\nStop streaming\n{\"summary\":\"ok\"}",
+        policy=REPLY_TRACKER_POLICY,
+    )
+
+    assert "User goal" not in cleaned
+    assert "Stop streaming" not in cleaned
+    assert '{"summary":"ok"}' in cleaned
 
 
 def test_chatgpt_page_detection_accepts_chatgpt_hints() -> None:

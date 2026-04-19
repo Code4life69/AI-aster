@@ -10,16 +10,29 @@ from aster.browser_core.recovery_engine import (
     execute_recovery,
 )
 from aster.browser_core.reply_tracker import (
+    ReplyTrackerPolicy,
     choose_best_reply_candidate,
+    choose_best_reply_candidate_for_policy,
+    clean_captured_segment_for_policy,
+    extract_structured_block,
     extract_reply_from_ocr_lines,
+    extract_reply_from_ocr_lines_for_policy,
+    looks_like_patch_plan_json,
     looks_like_code_reply_candidate,
     looks_like_reply_started_candidate,
+    looks_like_reply_started_candidate_for_policy,
     looks_like_substantive_reply_candidate,
+    looks_like_substantive_reply_candidate_for_policy,
+    merge_reply_segment_sources,
     reply_detection_blocked,
     reply_matches_anchor,
+    reply_looks_incomplete,
     score_candidate,
+    score_candidate_for_policy,
     segment_looks_like_prompt_echo,
+    segment_looks_like_prompt_echo_for_policy,
     should_ignore_candidate,
+    should_ignore_candidate_for_policy,
     build_reply_capture_result,
 )
 from aster.browser_core.thread_router import ThreadRegistry
@@ -37,6 +50,26 @@ class _Line:
         self.text = text
         self.bbox = (200, 150, 520, 180)
         self.center = (260, 165)
+
+
+TEST_REPLY_POLICY = ReplyTrackerPolicy(
+    browser_reply_noise=("ask anything", "search chats", "company knowledge"),
+    input_too_large_hints=("input too large", "message too long"),
+    prompt_echo_markers=(
+        "user goal:",
+        "relevant file contents:",
+        "path:",
+        "do not wrap the json",
+        "if you are missing context",
+        "previous response was rejected",
+        "aster patch begin on its own line",
+        "aster patch end on its own line",
+    ),
+    stop_streaming_hints=("stop generating", "stop streaming"),
+    penalty_markers=("good to see you", "company knowledge", "input too large"),
+    operation_markers=("CREATE FILE", "EDIT FILE", "RUN COMMANDS", "NEED THESE FILES FIRST"),
+    extra_bad_markers=("def _normalize", 'self.log("activity"'),
+)
 
 
 def test_page_classifier_detects_fresh_chat() -> None:
@@ -143,6 +176,39 @@ def test_reply_tracker_prefers_patch_candidate_over_prompt_echo() -> None:
     assert best[0] == "uia"
 
 
+def test_reply_tracker_policy_prefers_patch_candidate_over_prompt_echo() -> None:
+    best = choose_best_reply_candidate_for_policy(
+        {
+            "ocr": "User goal:\nBuild app\nRelevant file contents:\nPATH: app.py",
+            "uia": '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}',
+        },
+        policy=TEST_REPLY_POLICY,
+    )
+
+    assert best is not None
+    assert best[0] == "uia"
+
+
+def test_reply_tracker_extracts_structured_block_from_markers() -> None:
+    raw = """
+    random intro
+    ASTER_PATCH_BEGIN
+    {"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"main.py","reason":"bootstrap","content":"print('ok')"}]}
+    ASTER_PATCH_END
+    random footer
+    """
+
+    parsed = extract_structured_block(raw)
+
+    assert parsed.startswith("{")
+    assert '"CREATE FILE"' in parsed
+
+
+def test_reply_tracker_patch_json_detection_requires_operations() -> None:
+    assert looks_like_patch_plan_json('{"summary":"ok","notes":[],"operations":[{"type":"RUN COMMANDS","path":".","reason":"verify"}]}') is True
+    assert looks_like_patch_plan_json('{"summary":"ok","notes":[],"operations":[]}') is False
+
+
 def test_reply_tracker_rejects_anchor_echo_candidate() -> None:
     anchor = build_turn_anchor("create a hello world python file in live_browser_test")
     candidate = "Please create a hello world python file in live_browser_test."
@@ -191,6 +257,28 @@ def test_reply_started_candidate_uses_extracted_helpers() -> None:
     assert started is True
 
 
+def test_reply_started_candidate_for_policy_uses_policy_rules() -> None:
+    started = looks_like_reply_started_candidate_for_policy(
+        (
+            "def build_ui(self) -> None:\n"
+            "    frame = tk.Frame(self.root)\n"
+            "    frame.pack(fill='both', expand=True)\n"
+            "    self._status_label = tk.Label(frame, text='Ready to run browser capture')\n"
+            "    self._status_label.pack()\n"
+            "    return frame\n"
+        ),
+        ui_state={
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": True,
+        },
+        policy=TEST_REPLY_POLICY,
+    )
+
+    assert started is True
+
+
 def test_reply_tracker_should_ignore_prompt_echo_candidate() -> None:
     ignored = should_ignore_candidate(
         "User goal:\nBuild app\nRelevant file contents:\nPATH: app.py",
@@ -199,6 +287,38 @@ def test_reply_tracker_should_ignore_prompt_echo_candidate() -> None:
     )
 
     assert ignored is True
+
+
+def test_reply_tracker_policy_ignores_retry_instruction_echo() -> None:
+    ignored = should_ignore_candidate_for_policy(
+        """
+        ASTER_PATCH_BEGIN on its own line
+        Do not wrap the JSON in markdown fences.
+        If you are missing context, return NEED THESE FILES FIRST.
+        Previous response was rejected because it was vague.
+        ASTER_PATCH_END on its own line
+        """,
+        policy=TEST_REPLY_POLICY,
+    )
+
+    assert ignored is True
+
+
+def test_reply_tracker_policy_scores_patch_above_error_text() -> None:
+    patch = '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}'
+    error_text = "Input too large\nRetry"
+
+    assert score_candidate_for_policy(patch, policy=TEST_REPLY_POLICY) > score_candidate_for_policy(
+        error_text,
+        policy=TEST_REPLY_POLICY,
+    )
+
+
+def test_reply_tracker_policy_detects_substantive_patch_reply() -> None:
+    assert looks_like_substantive_reply_candidate_for_policy(
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}',
+        policy=TEST_REPLY_POLICY,
+    ) is True
 
 
 def test_reply_tracker_extracts_ocr_reply_region_without_sidebar_noise() -> None:
@@ -219,6 +339,56 @@ def test_reply_tracker_extracts_ocr_reply_region_without_sidebar_noise() -> None
 
     assert extracted.startswith("{")
     assert "Search chats" not in extracted
+
+
+def test_reply_tracker_policy_extracts_ocr_reply_region_without_sidebar_noise() -> None:
+    before_lines = [_Line("Ask anything")]
+    sidebar_line = _Line("Search chats")
+    sidebar_line.center = (20, 165)
+    reply_line = _Line('{"summary":"ok","operations":[{"type":"CREATE FILE","path":"app.py"}]}')
+
+    extracted = extract_reply_from_ocr_lines_for_policy(
+        before_lines,
+        [sidebar_line, reply_line],
+        target_width=1200,
+        target_height=900,
+        prompt="create app.py",
+        policy=TEST_REPLY_POLICY,
+    )
+
+    assert extracted.startswith("{")
+    assert "Search chats" not in extracted
+
+
+def test_reply_tracker_policy_cleans_and_merges_reply_segments() -> None:
+    merged = merge_reply_segment_sources(
+        "User goal:\nBuild app\nShare",
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add"}]}',
+        policy=TEST_REPLY_POLICY,
+    )
+
+    assert "User goal" not in merged
+    assert "Share" not in merged
+    assert '"operations"' in merged
+
+
+def test_reply_tracker_policy_detects_prompt_echo_and_incomplete_reply() -> None:
+    segment = "User goal:\nBuild app\nRelevant file contents:\nPATH: app.py"
+    partial = 'ASTER_PATCH_BEGIN\n{"summary":"ok","operations":['
+
+    assert segment_looks_like_prompt_echo_for_policy(segment, policy=TEST_REPLY_POLICY) is True
+    assert reply_looks_incomplete(partial) is True
+
+
+def test_reply_tracker_policy_cleans_prompt_echo_lines() -> None:
+    cleaned = clean_captured_segment_for_policy(
+        "User goal:\nBuild app\nStop streaming\n{\"summary\":\"ok\"}",
+        policy=TEST_REPLY_POLICY,
+    )
+
+    assert "User goal" not in cleaned
+    assert "Stop streaming" not in cleaned
+    assert '{"summary":"ok"}' in cleaned
 
 
 def test_recovery_engine_executes_mapped_handler() -> None:
