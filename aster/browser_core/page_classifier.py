@@ -71,16 +71,18 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
     wrong_page_signals_present = bool(wrong_page_hits) and "chatgpt" not in window_title and "chatgpt" not in visible_text
     likely_existing_chat = window_title_suggests_existing_chat(str(ui_state.get("window_title", "")))
     likely_fresh_chat = looks_like_chatgpt and composer_visible and not likely_existing_chat
-    likely_idle_composer = _likely_idle_composer(
+    idle_composer_source = _idle_composer_source(
         window_title=window_title,
         composer_visible=composer_visible,
         composer_preview=composer_preview,
+        visible_text=visible_text,
         send_present=send_present,
         stop_streaming=stop_streaming,
         show_in_text=show_in_text,
         loading_detected=loading_detected,
         wrong_page_hit_sources=wrong_page_hit_sources,
     )
+    likely_idle_composer = bool(idle_composer_source)
 
     chatgpt_label_bonus = 25.0 if "chatgpt" in visible_text or "chatgpt" in window_title else 0.0
     chatgpt_surface_bonus = min(20.0, 10.0 * len(chatgpt_surface_hits))
@@ -162,6 +164,7 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
         stop_streaming=stop_streaming,
         show_in_text=show_in_text,
         composer_preview=composer_preview,
+        idle_composer_source=idle_composer_source,
         chatgpt_surface_hits=chatgpt_surface_hits,
     )
     missing_readiness_signals = tuple(
@@ -197,6 +200,7 @@ def classify_page(lines, ui_state: dict[str, object]) -> PageClassification:
         composer_ready=composer_visible,
         likely_wrong_page=wrong_page_signals_present,
         likely_idle_composer=likely_idle_composer,
+        idle_composer_source=idle_composer_source,
         loading_detected=loading_detected,
         ready_score=ready_score,
         score_components=score_components,
@@ -306,6 +310,7 @@ def _send_button_absence_reason(
     stop_streaming: bool,
     show_in_text: bool,
     composer_preview: str,
+    idle_composer_source: str,
     chatgpt_surface_hits: tuple[str, ...],
 ) -> str:
     if not composer_visible or send_present:
@@ -314,9 +319,19 @@ def _send_button_absence_reason(
         return "Stop-streaming control was present, so the send button was likely replaced by an active reply state."
     if show_in_text:
         return "Show-in-text-field control was present, so the composer appears to be in prompt-preview state rather than send-ready state."
-    if any(hint in composer_preview for hint in BROWSER_READY_HINTS):
+    if idle_composer_source == "both":
         return (
-            "Composer placeholder text was visible, but no send button was detected. "
+            "Composer placeholder text was visible in both UIA composer preview and OCR/screen text, "
+            "but no send button was detected. This may be a valid idle ChatGPT composer state or a UIA control-detection gap."
+        )
+    if idle_composer_source == "composer_preview":
+        return (
+            "Composer placeholder text was visible in the UIA composer preview, but no send button was detected. "
+            "This may be a valid idle ChatGPT composer state or a UIA control-detection gap."
+        )
+    if idle_composer_source == "ocr_visible_text":
+        return (
+            "Composer placeholder text was visible in OCR/screen text, but no send button was detected. "
             "This may be a valid idle ChatGPT composer state or a UIA control-detection gap."
         )
     if chatgpt_surface_hits:
@@ -326,30 +341,37 @@ def _send_button_absence_reason(
     return "Composer hints were visible, but no send button was detected."
 
 
-def _likely_idle_composer(
+def _idle_composer_source(
     *,
     window_title: str,
     composer_visible: bool,
     composer_preview: str,
+    visible_text: str,
     send_present: bool,
     stop_streaming: bool,
     show_in_text: bool,
     loading_detected: bool,
     wrong_page_hit_sources: dict[str, tuple[str, ...]],
-) -> bool:
+) -> str:
     if "chatgpt" not in window_title:
-        return False
+        return ""
     if not composer_visible:
-        return False
+        return ""
     if any((send_present, stop_streaming, show_in_text, loading_detected)):
-        return False
-    if not any(hint in composer_preview for hint in BROWSER_READY_HINTS):
-        return False
+        return ""
     # Stay conservative when wrong-page markers contaminate the title/composer itself.
     for sources in wrong_page_hit_sources.values():
         if "window_title" in sources or "composer_preview" in sources:
-            return False
-    return True
+            return ""
+    preview_match = any(hint in composer_preview for hint in BROWSER_READY_HINTS)
+    visible_match = any(hint in visible_text for hint in BROWSER_READY_HINTS)
+    if preview_match and visible_match:
+        return "both"
+    if preview_match:
+        return "composer_preview"
+    if visible_match:
+        return "ocr_visible_text"
+    return ""
 
 
 def _normalize(text: str) -> str:
