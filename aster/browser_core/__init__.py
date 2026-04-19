@@ -10,8 +10,21 @@ from .models import (
     TurnAnchor,
 )
 from .page_classifier import classify_page, looks_like_chatgpt_page, window_title_suggests_existing_chat
-from .recovery_engine import decide_recovery
-from .reply_tracker import build_reply_capture_result, reply_matches_anchor
+from .recovery_engine import decide_recovery, decision_payload, execute_recovery
+from .reply_tracker import (
+    build_reply_capture_result,
+    choose_best_reply_candidate,
+    clean_captured_segment,
+    extract_reply_from_ocr_lines,
+    looks_like_code_reply_candidate,
+    looks_like_substantive_reply_candidate,
+    merge_text_segments,
+    reply_looks_incomplete,
+    reply_matches_anchor,
+    score_candidate,
+    segment_looks_like_prompt_echo,
+    should_ignore_candidate,
+)
 from .thread_router import ThreadRegistry
 from .turn_anchor import (
     anchor_match_confidence,
@@ -39,10 +52,20 @@ __all__ = [
     "classify_page",
     "composer_has_user_text",
     "decide_recovery",
+    "decision_payload",
     "deserialize_anchor",
+    "execute_recovery",
+    "extract_reply_from_ocr_lines",
+    "looks_like_code_reply_candidate",
     "looks_like_browser_url_text",
     "looks_like_chatgpt_page",
+    "looks_like_substantive_reply_candidate",
+    "merge_text_segments",
+    "reply_looks_incomplete",
     "reply_matches_anchor",
+    "score_candidate",
+    "segment_looks_like_prompt_echo",
     "serialize_anchor",
+    "should_ignore_candidate",
     "window_title_suggests_existing_chat",
 ]

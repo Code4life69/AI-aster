@@ -266,7 +266,7 @@ class AsterOrchestrator:
 
     def _sync_repo_state(self, commit_message: str, paths: list[str] | None = None) -> list[str]:
         if paths is None:
-            results = self.git.commit_all_if_needed(commit_message)
+            results = self.git.commit_all_if_needed(commit_message, exclude_paths=list(self.RUNTIME_LOG_PATHS))
         else:
             results = self.git.commit_paths_if_needed(commit_message, paths)
         if self.config.sync_with_remote:

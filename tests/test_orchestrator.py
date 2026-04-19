@@ -13,6 +13,7 @@ class _FakeApplier:
 class _FakeGit:
     def __init__(self) -> None:
         self.commit_messages: list[str] = []
+        self.commit_exclude_paths: list[list[str]] = []
         self.runtime_commit_messages: list[str] = []
         self.runtime_commit_paths: list[list[str]] = []
         self.push_calls = 0
@@ -22,8 +23,9 @@ class _FakeGit:
         self.pull_calls += 1
         return []
 
-    def commit_all_if_needed(self, message: str) -> list[str]:
+    def commit_all_if_needed(self, message: str, exclude_paths: list[str] | None = None) -> list[str]:
         self.commit_messages.append(message)
+        self.commit_exclude_paths.append(list(exclude_paths or []))
         return [f"commit {message}"]
 
     def commit_paths_if_needed(self, message: str, paths: list[str]) -> list[str]:
@@ -94,6 +96,7 @@ def test_apply_pushes_command_operations_after_approval(tmp_path: Path) -> None:
     results = orchestrator.apply(plan, dry_run=False)
 
     assert orchestrator.git.commit_messages
+    assert orchestrator.git.commit_exclude_paths[-1] == list(AsterOrchestrator.RUNTIME_LOG_PATHS)
     assert orchestrator.git.push_calls == 1
     assert any("push" in item for item in results)
 
@@ -119,6 +122,7 @@ def test_apply_pushes_safe_file_only_plans(tmp_path: Path) -> None:
     orchestrator.apply(plan, dry_run=False)
 
     assert orchestrator.git.commit_messages
+    assert orchestrator.git.commit_exclude_paths[-1] == list(AsterOrchestrator.RUNTIME_LOG_PATHS)
     assert orchestrator.git.push_calls == 1
 
 

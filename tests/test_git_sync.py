@@ -23,7 +23,7 @@ def test_commit_all_if_needed_creates_commit(tmp_path: Path) -> None:
     sync = GitSync(tmp_path)
     results = sync.commit_all_if_needed("test commit")
 
-    assert any("git add -A -> 0" in item for item in results)
+    assert any("git add -A -- ." in item for item in results)
     assert any("git commit -m test commit -> 0" in item for item in results)
     log = _git(tmp_path, "log", "--oneline")
     assert "test commit" in log.stdout
@@ -83,3 +83,36 @@ def test_commit_paths_if_needed_only_commits_selected_paths(tmp_path: Path) -> N
     assert "app.py" not in head_files.stdout
     status = _git(tmp_path, "status", "--porcelain")
     assert " M app.py" in status.stdout
+
+
+def test_commit_all_if_needed_can_exclude_runtime_logs(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.name", "Aster Test")
+    _git(tmp_path, "config", "user.email", "aster@example.com")
+    audit_dir = tmp_path / ".aster"
+    audit_dir.mkdir()
+    (audit_dir / "audit.log.jsonl").write_text('{"kind":"seed"}\n', encoding="utf-8")
+    (audit_dir / "last_launch_stdout.log").write_text("seed\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("print('v1')\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "initial")
+
+    (audit_dir / "audit.log.jsonl").write_text('{"kind":"next"}\n', encoding="utf-8")
+    (audit_dir / "last_launch_stdout.log").write_text("next\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("print('v2')\n", encoding="utf-8")
+
+    sync = GitSync(tmp_path)
+    results = sync.commit_all_if_needed(
+        "code only",
+        exclude_paths=[".aster/audit.log.jsonl", ".aster/last_launch_stdout.log"],
+    )
+
+    assert any(":(exclude).aster/audit.log.jsonl" in item for item in results)
+    assert any("git commit -m code only -> 0" in item for item in results)
+    head_files = _git(tmp_path, "show", "--name-only", "--pretty=format:", "HEAD")
+    assert "app.py" in head_files.stdout
+    assert ".aster/audit.log.jsonl" not in head_files.stdout
+    assert ".aster/last_launch_stdout.log" not in head_files.stdout
+    status = _git(tmp_path, "status", "--porcelain")
+    assert " M .aster/audit.log.jsonl" in status.stdout
+    assert " M .aster/last_launch_stdout.log" in status.stdout

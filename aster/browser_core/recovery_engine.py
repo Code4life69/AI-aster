@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+
 from .models import PageClassification, RecoveryAction, RecoveryDecision
 
 
@@ -45,3 +47,26 @@ def decide_recovery(
         reason="The page classification is incomplete; rescan before taking a stronger action.",
         attempts_used=attempts_used,
     )
+
+
+def decision_payload(decision: RecoveryDecision) -> dict[str, object]:
+    return {
+        "action": decision.action.value,
+        "reason": decision.reason,
+        "attempts_used": decision.attempts_used,
+        "should_stop": decision.should_stop,
+    }
+
+
+def execute_recovery(
+    decision: RecoveryDecision,
+    *,
+    handlers: Mapping[RecoveryAction, Callable[[], object] | None],
+) -> bool:
+    if decision.should_stop:
+        return False
+    handler = handlers.get(decision.action)
+    if handler is None:
+        return False
+    handler()
+    return True

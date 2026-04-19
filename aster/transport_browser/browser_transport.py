@@ -15,16 +15,29 @@ from aster.audit_logger import AuditLogger
 from aster.browser_core import (
     BrowserStrategy,
     PageClassification,
+    RecoveryAction,
     ThreadRegistry,
     build_reply_capture_result,
     build_turn_anchor,
+    choose_best_reply_candidate,
+    clean_captured_segment,
     classify_page,
     composer_has_user_text,
     decide_recovery,
+    decision_payload,
+    execute_recovery,
+    extract_reply_from_ocr_lines,
     looks_like_browser_url_text,
     looks_like_chatgpt_page,
+    looks_like_code_reply_candidate,
+    looks_like_substantive_reply_candidate,
+    merge_text_segments,
+    reply_looks_incomplete,
     reply_matches_anchor,
+    score_candidate,
+    segment_looks_like_prompt_echo,
     serialize_anchor,
+    should_ignore_candidate,
     window_title_suggests_existing_chat,
 )
 
@@ -482,16 +495,8 @@ class BrowserChatGPTTransport:
                 attempts_used=1,
                 max_attempts=self.max_recovery_attempts,
             )
-            self._log(
-                "recovery_decision",
-                {
-                    "action": recovery.action.value,
-                    "reason": recovery.reason,
-                    "attempts_used": recovery.attempts_used,
-                    "should_stop": recovery.should_stop,
-                },
-            )
-            # TODO: execute recovery decisions through a dedicated browser recovery coordinator.
+            self._log("recovery_decision", decision_payload(recovery))
+            execute_recovery(recovery, handlers={RecoveryAction.RESCAN: lambda: None})
             self._activity(
                 "browser_failed",
                 "Browser mode failed before a valid patch block was captured.",
@@ -1072,13 +1077,30 @@ class BrowserChatGPTTransport:
     def _prepare_chatgpt_window(self, target, chatgpt_url: str, timeout_sec: float) -> None:
         ready = self._wait_for_chatgpt_ready(target, timeout_sec=min(timeout_sec, 12.0))
         if not ready:
-            self._activity(
-                "browser_window_reset",
-                "Resetting the attached browser tab to a fresh ChatGPT page.",
-                "The initial browser window did not settle into a usable ChatGPT state, so Aster is forcing a direct navigation retry.",
-                details={"url": chatgpt_url},
+            recovery = decide_recovery(
+                self._last_page_classification,
+                attempts_used=0,
+                max_attempts=self.max_recovery_attempts,
             )
-            self._navigate_browser_to_chatgpt(target, chatgpt_url)
+            self._log("recovery_decision", decision_payload(recovery))
+            if recovery.action in {RecoveryAction.RELOAD_PAGE, RecoveryAction.REOPEN_CHATGPT}:
+                self._activity(
+                    "browser_window_reset",
+                    "Resetting the attached browser tab to a fresh ChatGPT page.",
+                    "The initial browser window did not settle into a usable ChatGPT state, so Aster is forcing a direct navigation retry.",
+                    details={"url": chatgpt_url, "recovery_action": recovery.action.value},
+                )
+            execute_recovery(
+                recovery,
+                handlers={
+                    RecoveryAction.RESCAN: lambda: None,
+                    RecoveryAction.REFOCUS_COMPOSER: lambda: self._focus_composer(target, []),
+                    # Dedicated reopen/reattach logic is still pending, so conservative recovery
+                    # currently falls back to a direct ChatGPT navigation inside the same window.
+                    RecoveryAction.RELOAD_PAGE: lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
+                    RecoveryAction.REOPEN_CHATGPT: lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
+                },
+            )
             ready = self._wait_for_chatgpt_ready(target, timeout_sec=timeout_sec)
         image = self._capture.capture_region(target.left, target.top, target.width, target.height)
         lines = self._ocr.extract(image)
@@ -1300,49 +1322,14 @@ class BrowserChatGPTTransport:
         return best_text or fallback or ""
 
     def _choose_best_reply_candidate(self, sources: dict[str, str], *, prompt_anchor=None) -> tuple[str, str, float] | None:
-        best: tuple[str, str, float] | None = None
-        for source, text in sources.items():
-            raw = text.strip()
-            if not raw:
-                continue
-            variants = [raw]
-            block = self.extract_structured_block(raw)
-            if block and block != raw:
-                variants.insert(0, block)
-            for candidate in variants:
-                if self._should_ignore_reply_candidate(candidate):
-                    self._log(
-                        "reply_candidate_ignored",
-                        {
-                            "source": source,
-                            "length": len(candidate),
-                            "preview": candidate[:220],
-                        },
-                    )
-                    continue
-                score = self._score_reply_candidate(candidate)
-                capture = build_reply_capture_result(
-                    candidate,
-                    source,
-                    score,
-                    looks_complete=self._looks_like_patch_plan_json(candidate),
-                    anchor=prompt_anchor,
-                )
-                if prompt_anchor is not None and reply_matches_anchor(capture, prompt_anchor) and not capture.looks_complete:
-                    self._log(
-                        "reply_candidate_ignored",
-                        {
-                            "source": source,
-                            "length": len(candidate),
-                            "preview": candidate[:220],
-                            "reason": "prompt_anchor_match",
-                            "anchor_confidence": capture.anchor_confidence,
-                        },
-                    )
-                    continue
-                if best is None or score > best[2] or (score == best[2] and len(candidate) > len(best[1])):
-                    best = (source, candidate, score)
-        return best
+        return choose_best_reply_candidate(
+            sources,
+            extract_structured_block=self.extract_structured_block,
+            is_patch_json=self._looks_like_patch_plan_json,
+            should_ignore_candidate=self._should_ignore_reply_candidate,
+            score_candidate=self._score_reply_candidate,
+            prompt_anchor=prompt_anchor,
+        )
 
     def _capture_visible_reply_sources(self, target, before_lines, prompt: str, lines=None) -> tuple[str, str]:
         after_lines = lines
@@ -1466,62 +1453,19 @@ class BrowserChatGPTTransport:
 
     @staticmethod
     def _merge_text_segments(segments: list[str]) -> str:
-        merged_lines: list[str] = []
-        merged_norms: list[str] = []
-        for segment in segments:
-            lines = [line.strip() for line in segment.splitlines() if line.strip()]
-            norms = [_normalize(line) for line in lines]
-            if not lines:
-                continue
-            overlap = 0
-            max_overlap = min(len(merged_norms), len(norms), 30)
-            for count in range(max_overlap, 0, -1):
-                if merged_norms[-count:] == norms[:count]:
-                    overlap = count
-                    break
-            for line, norm in zip(lines[overlap:], norms[overlap:]):
-                if merged_norms and norm == merged_norms[-1]:
-                    continue
-                merged_lines.append(line)
-                merged_norms.append(norm)
-        return "\n".join(merged_lines)
+        return merge_text_segments(segments)
 
     @staticmethod
     def _reply_looks_incomplete(text: str) -> bool:
-        cleaned = text.strip()
-        if not cleaned:
-            return True
-        lowered = _normalize(cleaned)
-        if "aster patch begin" in lowered and "aster patch end" not in lowered:
-            return True
-        if '"operations"' in cleaned and not cleaned.rstrip().endswith("}"):
-            return True
-        if "thought for" in lowered:
-            return True
-        return False
+        return reply_looks_incomplete(text)
 
     @staticmethod
     def _segment_looks_like_prompt_echo(text: str) -> bool:
-        lowered = _normalize(text)
-        if not lowered:
-            return False
-        hits = sum(1 for marker in PROMPT_ECHO_MARKERS if marker in lowered)
-        return hits >= 2 or ("your message" in lowered and "path:" in lowered)
+        return segment_looks_like_prompt_echo(text, prompt_echo_markers=PROMPT_ECHO_MARKERS)
 
     @staticmethod
     def _clean_captured_segment(text: str) -> str:
-        kept: list[str] = []
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            lowered = _normalize(line)
-            if not line:
-                continue
-            if any(marker in lowered for marker in PROMPT_ECHO_MARKERS):
-                continue
-            if lowered in {"share", "stop streaming", "stop generating"}:
-                continue
-            kept.append(line)
-        return "\n".join(kept)
+        return clean_captured_segment(text, prompt_echo_markers=PROMPT_ECHO_MARKERS)
 
     @staticmethod
     def _response_still_streaming(ui_state: dict[str, Any]) -> bool:
@@ -1556,40 +1500,15 @@ class BrowserChatGPTTransport:
         }
 
     def _extract_reply_from_ocr_lines(self, before_lines, after_lines, target, prompt: str) -> str:
-        before_seen = {_normalize(line.text) for line in before_lines}
-        prompt_words = {word for word in re.findall(r"[a-z0-9]{4,}", prompt.lower())}
-        selected: list[tuple[int, int, str]] = []
-        seen: set[str] = set()
-
-        for line in after_lines:
-            text = " ".join(line.text.split())
-            lowered = _normalize(text)
-            if not text:
-                continue
-            if line.bbox[1] < 110:
-                continue
-            if line.bbox[3] > max(0, target.height - 70):
-                continue
-            if line.center[0] < target.width * 0.18:
-                continue
-            if lowered in seen:
-                continue
-            if any(noise in lowered for noise in BROWSER_REPLY_NOISE):
-                continue
-            if any(marker in lowered for marker in PROMPT_ECHO_MARKERS):
-                continue
-            overlap = sum(1 for word in prompt_words if word in lowered)
-            if prompt_words and overlap >= max(6, len(prompt_words) // 2) and "{" not in text and '"' not in text:
-                continue
-            if lowered in before_seen and "{" not in text and '"' not in text:
-                continue
-            selected.append((line.bbox[1], line.bbox[0], text))
-            seen.add(lowered)
-
-        if not selected:
-            return ""
-        selected.sort(key=lambda item: (item[0], item[1]))
-        return "\n".join(text for _, _, text in selected)
+        return extract_reply_from_ocr_lines(
+            before_lines,
+            after_lines,
+            target_width=target.width,
+            target_height=target.height,
+            prompt=prompt,
+            browser_reply_noise=BROWSER_REPLY_NOISE,
+            prompt_echo_markers=PROMPT_ECHO_MARKERS,
+        )
 
     def _read_visible_reply_text(self, target) -> str:
         try:
@@ -1652,117 +1571,62 @@ class BrowserChatGPTTransport:
 
     @classmethod
     def _looks_like_substantive_reply_candidate(cls, text: str) -> bool:
-        cleaned = text.strip()
-        if len(cleaned) < 80:
-            return False
-        lowered = _normalize(cleaned)
-        if cls._segment_looks_like_prompt_echo(cleaned):
-            return False
-        if any(noise in lowered for noise in BROWSER_REPLY_NOISE):
-            return False
-        if any(hint in lowered for hint in INPUT_TOO_LARGE_HINTS):
-            return False
-        if any(bad in lowered for bad in (
-            "ask gemini",
-            "github",
-            "context omitted for browser size safety",
-            "included_files",
-            "omitted_files",
-            "return promptpackage",
-            "def _normalize",
-            "self.log(""activity""",
-        )):
-            return False
-        if "aster patch begin" in lowered or "aster_patch_begin" in lowered:
-            return True
-        if cls._looks_like_patch_plan_json(cleaned):
-            return True
-        if '"operations"' in cleaned and "{" in cleaned and "}" in cleaned:
-            return True
-        return False
+        return looks_like_substantive_reply_candidate(
+            text,
+            browser_reply_noise=BROWSER_REPLY_NOISE,
+            input_too_large_hints=INPUT_TOO_LARGE_HINTS,
+            prompt_echo_markers=PROMPT_ECHO_MARKERS,
+            is_patch_json=cls._looks_like_patch_plan_json,
+            extra_bad_markers=(
+                "ask gemini",
+                "github",
+                "context omitted for browser size safety",
+                "included_files",
+                "omitted_files",
+                "return promptpackage",
+                "def _normalize",
+                'self.log("activity"',
+            ),
+        )
 
     @staticmethod
     def _looks_like_code_reply_candidate(text: str) -> bool:
-        cleaned = text.strip()
-        if len(cleaned) < 80:
-            return False
-        lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
-        if len(lines) < 3:
-            return False
-        signals = 0
-        if sum(1 for line in lines if line.startswith(("    ", "\t"))) >= 2:
-            signals += 1
-        if re.search(r"\b(def|class|return|import|from|if|elif|else|for|while|try|except|with)\b", cleaned):
-            signals += 1
-        if re.search(r"\bself\.\w+|\w+\([^)]*\)", cleaned):
-            signals += 1
-        if sum(1 for line in lines if any(char in line for char in "()[]{}=:")) >= 2:
-            signals += 1
-        return signals >= 2
+        return looks_like_code_reply_candidate(text)
 
     @classmethod
     def _should_ignore_reply_candidate(cls, text: str) -> bool:
-        cleaned = text.strip()
-        if not cleaned:
-            return True
-        if cls._looks_like_patch_plan_json(cleaned):
-            return False
-        lowered = _normalize(cleaned)
-        if cls._segment_looks_like_prompt_echo(cleaned):
-            return True
-        if "aster patch begin" in lowered and not cls._looks_like_patch_plan_json(cleaned):
-            if "on its own line" in lowered or "do not wrap the json" in lowered:
-                return True
-        return False
+        return should_ignore_candidate(
+            text,
+            is_patch_json=cls._looks_like_patch_plan_json,
+            prompt_echo_markers=PROMPT_ECHO_MARKERS,
+        )
 
     @classmethod
     def _score_reply_candidate(cls, text: str) -> float:
-        cleaned = text.strip()
-        if not cleaned:
-            return float("-inf")
-        lowered = _normalize(cleaned)
-        score = min(120.0, len(cleaned) / 30.0)
-        if "aster patch begin" in lowered or "aster_patch_begin" in lowered:
-            score += 180.0
-        if '"operations"' in cleaned:
-            score += 80.0
-        if any(op in cleaned for op in ("CREATE FILE", "EDIT FILE", "REPLACE FILE", "RUN COMMANDS", "NEED THESE FILES FIRST")):
-            score += 60.0
-        if cls._looks_like_patch_plan_json(cleaned):
-            score += 220.0
-        if cls._segment_looks_like_prompt_echo(cleaned):
-            score -= 260.0
-        for noise in (
-            "good to see you",
-            "company knowledge",
-            "show in text field",
-            "ask anything",
-            "what are you working on",
-            "input too large",
-            "message too long",
-            "ask gemini",
-            "github",
-            "context omitted for browser size safety",
-            "included_files",
-            "omitted_files",
-            "return promptpackage",
-            "def _normalize",
-            "self.log(""activity""",
-        ):
-            if noise in lowered:
-                score -= 180.0
-        if "thought for" in lowered:
-            score -= 25.0
-        if any(hint in lowered for hint in STOP_STREAMING_HINTS):
-            score -= 40.0
-        if not (
-            "aster patch begin" in lowered
-            or "aster_patch_begin" in lowered
-            or cls._looks_like_patch_plan_json(cleaned)
-            or ('"operations"' in cleaned and "{" in cleaned and "}" in cleaned)
-        ):
-            score -= 200.0
-        return score
+        return score_candidate(
+            text,
+            is_patch_json=cls._looks_like_patch_plan_json,
+            prompt_echo_markers=PROMPT_ECHO_MARKERS,
+            stop_streaming_hints=STOP_STREAMING_HINTS,
+            penalty_markers=(
+                "good to see you",
+                "company knowledge",
+                "show in text field",
+                "ask anything",
+                "what are you working on",
+                "input too large",
+                "message too long",
+                "ask gemini",
+                "github",
+                "context omitted for browser size safety",
+                "included_files",
+                "omitted_files",
+                "return promptpackage",
+                "def _normalize",
+                'self.log("activity"',
+            ),
+            operation_markers=("CREATE FILE", "EDIT FILE", "REPLACE FILE", "RUN COMMANDS", "NEED THESE FILES FIRST"),
+        )
 
     @staticmethod
     def _window_title_suggests_existing_thread(title: str) -> bool:

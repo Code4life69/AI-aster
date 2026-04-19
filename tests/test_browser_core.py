@@ -2,6 +2,13 @@ from pathlib import Path
 
 from aster.browser_core.models import BrowserStrategy, ThreadRecord
 from aster.browser_core.page_classifier import classify_page
+from aster.browser_core.recovery_engine import decide_recovery, decision_payload, execute_recovery
+from aster.browser_core.reply_tracker import (
+    choose_best_reply_candidate,
+    extract_reply_from_ocr_lines,
+    score_candidate,
+    segment_looks_like_prompt_echo,
+)
 from aster.browser_core.thread_router import ThreadRegistry
 from aster.browser_core.turn_anchor import (
     anchor_match_confidence,
@@ -15,6 +22,8 @@ from aster.browser_core.turn_anchor import (
 class _Line:
     def __init__(self, text: str) -> None:
         self.text = text
+        self.bbox = (200, 150, 520, 180)
+        self.center = (260, 165)
 
 
 def test_page_classifier_detects_fresh_chat() -> None:
@@ -91,3 +100,77 @@ def test_thread_registry_load_save_upsert_and_choose_strategy(tmp_path: Path) ->
     assert loaded.choose_strategy(reuse_enabled=False) == "create_new"
     assert loaded.choose_strategy(reuse_enabled=True, thread_id="thread-1") == "reuse_existing"
     assert loaded.choose_strategy(reuse_enabled=True, thread_id="missing") == "unknown"
+
+
+def test_reply_tracker_prefers_patch_candidate_over_prompt_echo() -> None:
+    sources = {
+        "ocr": "User goal:\nBuild app\nRelevant file contents:\nPATH: app.py",
+        "uia": '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}',
+    }
+
+    best = choose_best_reply_candidate(
+        sources,
+        extract_structured_block=lambda text: text,
+        is_patch_json=lambda text: '"operations"' in text and text.startswith("{"),
+        should_ignore_candidate=lambda text: segment_looks_like_prompt_echo(
+            text,
+            prompt_echo_markers=("user goal:", "relevant file contents:", "path:"),
+        ),
+        score_candidate=lambda text: score_candidate(
+            text,
+            is_patch_json=lambda candidate: '"operations"' in candidate and candidate.startswith("{"),
+            prompt_echo_markers=("user goal:", "relevant file contents:", "path:"),
+            stop_streaming_hints=("stop generating",),
+            penalty_markers=("user goal:",),
+            operation_markers=("CREATE FILE",),
+        ),
+    )
+
+    assert best is not None
+    assert best[0] == "uia"
+
+
+def test_reply_tracker_extracts_ocr_reply_region_without_sidebar_noise() -> None:
+    before_lines = [_Line("Ask anything")]
+    sidebar_line = _Line("Search chats")
+    sidebar_line.center = (20, 165)
+    reply_line = _Line('{"summary":"ok","operations":[{"type":"CREATE FILE","path":"app.py"}]}')
+
+    extracted = extract_reply_from_ocr_lines(
+        before_lines,
+        [sidebar_line, reply_line],
+        target_width=1200,
+        target_height=900,
+        prompt="create app.py",
+        browser_reply_noise=("search chats",),
+        prompt_echo_markers=("user goal:",),
+    )
+
+    assert extracted.startswith("{")
+    assert "Search chats" not in extracted
+
+
+def test_recovery_engine_executes_mapped_handler() -> None:
+    classification = classify_page(
+        [_Line("Ask Gemini")],
+        {
+            "window_title": "Other Site - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": None,
+            "composer_edit_preview": "",
+        },
+    )
+    decision = decide_recovery(classification, attempts_used=0, max_attempts=3)
+    invoked: list[str] = []
+
+    executed = execute_recovery(
+        decision,
+        handlers={decision.action: lambda: invoked.append(decision.action.value)},
+    )
+
+    assert decision_payload(decision)["action"] == decision.action.value
+    assert executed is True
+    assert invoked == [decision.action.value]

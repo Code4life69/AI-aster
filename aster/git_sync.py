@@ -50,15 +50,20 @@ class GitSync:
             return ""
         return result.stdout.strip()
 
-    def commit_all_if_needed(self, message: str) -> list[str]:
+    def commit_all_if_needed(self, message: str, exclude_paths: list[str] | None = None) -> list[str]:
         if not self.is_repo():
             return ["Git commit skipped: repository is not initialized locally."]
         if not self.has_changes():
             return ["Git commit skipped: no tracked or untracked changes detected."]
+        add_command = ["git", "add", "-A", "--", "."]
+        excluded_paths = self._existing_or_tracked_paths(exclude_paths or [])
+        add_command.extend([f":(exclude){path}" for path in excluded_paths])
         results = [
-            self._run(["git", "add", "-A"]),
-            self._run(["git", "commit", "-m", message]),
+            self._run(add_command),
         ]
+        if not self.has_staged_changes():
+            return results + ["Git commit skipped: no non-excluded changes detected."]
+        results.append(self._run(["git", "commit", "-m", message]))
         return results
 
     def commit_paths_if_needed(self, message: str, paths: list[str]) -> list[str]:
@@ -86,6 +91,14 @@ class GitSync:
         if not self.is_repo() or not paths:
             return False
         result = self._completed(["git", "status", "--porcelain", "--", *paths])
+        if result.returncode != 0:
+            return False
+        return bool(result.stdout.strip())
+
+    def has_staged_changes(self) -> bool:
+        if not self.is_repo():
+            return False
+        result = self._completed(["git", "diff", "--cached", "--name-only"])
         if result.returncode != 0:
             return False
         return bool(result.stdout.strip())
