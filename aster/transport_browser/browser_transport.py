@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import time
 import traceback
@@ -11,6 +12,21 @@ from pathlib import Path
 from typing import Any
 
 from aster.audit_logger import AuditLogger
+from aster.browser_core import (
+    BrowserStrategy,
+    PageClassification,
+    ThreadRegistry,
+    build_reply_capture_result,
+    build_turn_anchor,
+    classify_page,
+    composer_has_user_text,
+    decide_recovery,
+    looks_like_browser_url_text,
+    looks_like_chatgpt_page,
+    reply_matches_anchor,
+    serialize_anchor,
+    window_title_suggests_existing_chat,
+)
 
 
 BROWSER_REPLY_NOISE = (
@@ -85,7 +101,50 @@ PROMPT_ECHO_MARKERS = (
     "return promptpackage",
     "self.log(""activity""",
     "def _normalize",
+    "aster_patch_begin on its own line",
+    "aster patch begin on its own line",
+    "aster_patch_end on its own line",
+    "aster patch end on its own line",
+    "do not wrap the json",
+    "if you are missing context",
+    "previous response was rejected",
+    "previous response:",
+    "one or more exact operations",
+    "deterministic. final output rules for browser mode",
 )
+
+PROMPT_CONFIRMATION_STOPWORDS = {
+    "system",
+    "user",
+    "goal",
+    "project",
+    "summary",
+    "relevant",
+    "file",
+    "files",
+    "contents",
+    "content",
+    "conversation",
+    "history",
+    "constraints",
+    "output",
+    "exact",
+    "operations",
+    "browser",
+    "mode",
+    "return",
+    "json",
+    "only",
+    "path",
+    "reason",
+    "final",
+    "rules",
+    "chatgpt",
+    "prompt",
+    "package",
+    "included_files",
+    "omitted_files",
+}
 
 pyautogui = None
 Desktop = None
@@ -97,15 +156,105 @@ class BrowserResult:
     metadata: dict[str, str]
 
 
+class _AutomationNotice:
+    def __init__(self, logger) -> None:
+        self._logger = logger
+        self._process: subprocess.Popen[str] | None = None
+
+    def show(self) -> None:
+        if self._process is not None and self._process.poll() is None:
+            return
+        script = """
+import tkinter as tk
+
+root = tk.Tk()
+root.title("Aster Using Your PC")
+root.attributes("-topmost", True)
+root.resizable(False, False)
+root.configure(bg="#FFF3CD")
+root.protocol("WM_DELETE_WINDOW", lambda: None)
+frame = tk.Frame(root, bg="#FFF3CD", padx=18, pady=14)
+frame.pack(fill="both", expand=True)
+tk.Label(
+    frame,
+    text="Aster is using your keyboard and mouse right now.",
+    font=("Segoe UI", 12, "bold"),
+    bg="#FFF3CD",
+    fg="#5C3B00",
+    justify="left",
+    wraplength=340,
+).pack(anchor="w")
+tk.Label(
+    frame,
+    text="Please do not type, click, or move the mouse until this notice disappears.",
+    font=("Segoe UI", 10),
+    bg="#FFF3CD",
+    fg="#5C3B00",
+    justify="left",
+    wraplength=340,
+    pady=8,
+).pack(anchor="w")
+root.update_idletasks()
+width = max(root.winfo_width(), 390)
+height = max(root.winfo_height(), 120)
+screen_width = root.winfo_screenwidth()
+x = max(20, screen_width - width - 30)
+y = 30
+root.geometry(f"{width}x{height}+{x}+{y}")
+root.mainloop()
+"""
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            self._process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            time.sleep(0.35)
+        except Exception as exc:
+            self._process = None
+            if self._logger is not None:
+                self._logger.log("browser_transport", {"event": "automation_notice_unavailable", "error": str(exc)})
+
+    def hide(self) -> None:
+        if self._process is None:
+            return
+        try:
+            self._process.terminate()
+            self._process.wait(timeout=2.0)
+        except Exception:
+            pass
+        self._process = None
+
+
 class BrowserChatGPTTransport:
     """Experimental browser-mode adapter."""
 
-    def __init__(self, logger: AuditLogger | None = None) -> None:
+    def __init__(
+        self,
+        logger: AuditLogger | None = None,
+        *,
+        strategy: BrowserStrategy | str = BrowserStrategy.PATCH_RUNNER,
+        thread_reuse_enabled: bool = False,
+        thread_registry_path: Path | None = None,
+        verification_level: str = "basic",
+        log_screenshots: bool = False,
+        max_recovery_attempts: int = 3,
+    ) -> None:
         self._executor = None
         self._capture = None
         self._ocr = None
         self._logger = logger
         self._last_window_state: str = ""
+        self._automation_notice = _AutomationNotice(logger)
+        self.strategy = BrowserStrategy(str(strategy))
+        self.thread_reuse_enabled = thread_reuse_enabled
+        self.thread_registry = ThreadRegistry(thread_registry_path or Path(".aster/thread_registry.json"))
+        self.verification_level = verification_level
+        self.log_screenshots = log_screenshots
+        self.max_recovery_attempts = max_recovery_attempts
+        self._last_page_classification: PageClassification | None = None
 
     def _log(self, event: str, payload: dict[str, Any]) -> None:
         if self._logger is None:
@@ -211,87 +360,115 @@ class BrowserChatGPTTransport:
             "Aster will attach to ChatGPT, place the structured prompt, send it, and wait for a parseable reply.",
             details={"prompt_length": len(prompt)},
         )
+        prompt_anchor = build_turn_anchor(prompt)
+        try:
+            self.thread_registry.load()
+        except Exception as exc:
+            self._log("thread_registry_load_failed", {"error": str(exc), "path": str(self.thread_registry.path)})
+        thread_route = self.thread_registry.choose_strategy(reuse_enabled=self.thread_reuse_enabled)
+        self._log(
+            "browser_strategy_selected",
+            {
+                "strategy": self.strategy.value,
+                "thread_route": thread_route,
+                "verification_level": self.verification_level,
+                "log_screenshots": self.log_screenshots,
+                "turn_anchor": serialize_anchor(prompt_anchor),
+            },
+        )
+        # TODO: route into thread-aware conversation reuse once thread discovery is implemented.
         try:
             self._ensure_runtime()
             target = self._ensure_chatgpt_window(chatgpt_url=chatgpt_url, launch_timeout_sec=launch_timeout_sec)
-            self._prepare_chatgpt_window(
-                target,
-                chatgpt_url=chatgpt_url,
-                timeout_sec=min(20.0, max(8.0, launch_timeout_sec)),
-            )
-            image = self._capture.capture_region(target.left, target.top, target.width, target.height)
-            before_lines = self._ocr.extract(image)
-            self._log(
-                "initial_window_state",
-                {
-                    "target_title": target.title,
-                    "ocr_lines": len(before_lines),
-                    "ocr_preview": [line.text[:120] for line in before_lines[:5]],
-                    "ui_state": self._ui_state(target),
-                },
-            )
-            self._activity(
-                "browser_window_ready",
-                f"Attached to the ChatGPT window: {target.title}.",
-                "Aster needs the active browser window before it can place or read the prompt.",
-                details={"window_title": target.title},
-            )
-            self._activity(
-                "browser_prompt_fill",
-                "Trying to place the prompt directly into the ChatGPT composer.",
-                "Direct entry is more reliable than a raw paste because it avoids attachment-style paste behavior.",
-            )
-            populated_directly = self._populate_prompt_directly(target, prompt)
-            self._log("populate_prompt_result", {"direct_uia_write": populated_directly})
-            if not populated_directly:
-                click_point = self._executor.choose_chatgpt_composer_point(target, before_lines)
-                self._log("fallback_clipboard_send_start", {"click_point": click_point})
+            self._show_automation_notice()
+            try:
+                self._prepare_chatgpt_window(
+                    target,
+                    chatgpt_url=chatgpt_url,
+                    timeout_sec=min(20.0, max(8.0, launch_timeout_sec)),
+                )
+                image = self._capture.capture_region(target.left, target.top, target.width, target.height)
+                before_lines = self._ocr.extract(image)
+                self._log(
+                    "initial_window_state",
+                    {
+                        "target_title": target.title,
+                        "ocr_lines": len(before_lines),
+                        "ocr_preview": [line.text[:120] for line in before_lines[:5]],
+                        "ui_state": self._ui_state(target),
+                    },
+                )
                 self._activity(
-                    "browser_prompt_fallback",
-                    "Direct composer entry failed, so Aster is falling back to paste automation.",
-                    "This keeps the run moving even when the browser blocks direct UI automation text entry.",
+                    "browser_window_ready",
+                    f"Attached to the ChatGPT window: {target.title}.",
+                    "Aster needs the active browser window before it can place or read the prompt.",
+                    details={"window_title": target.title},
                 )
-                populated_directly = self._paste_prompt_with_click(target, prompt, click_point)
-            if not populated_directly:
                 self._activity(
-                    "browser_prompt_missing",
-                    "Aster could not confirm that the prompt actually appeared in the ChatGPT composer.",
-                    "It is safer to stop here than to pretend the prompt was sent when the composer stayed blank.",
-                    status="error",
+                    "browser_prompt_fill",
+                    "Trying to place the prompt directly into the ChatGPT composer.",
+                    "Direct entry is more reliable than a raw paste because it avoids attachment-style paste behavior.",
                 )
-                raise RuntimeError(
-                    "Aster could not confirm that the prompt was inserted into the ChatGPT composer. "
-                    "The page stayed in blank composer state."
+                populated_directly = self._populate_prompt_directly(target, prompt, prompt_anchor=prompt_anchor)
+                self._log("populate_prompt_result", {"direct_uia_write": populated_directly})
+                if not populated_directly:
+                    click_point = self._executor.choose_chatgpt_composer_point(target, before_lines)
+                    self._log("fallback_clipboard_send_start", {"click_point": click_point})
+                    self._activity(
+                        "browser_prompt_fallback",
+                        "Direct composer entry failed, so Aster is falling back to paste automation.",
+                        "This keeps the run moving even when the browser blocks direct UI automation text entry.",
+                    )
+                    populated_directly = self._paste_prompt_with_click(target, prompt, click_point, prompt_anchor)
+                if not populated_directly:
+                    self._activity(
+                        "browser_prompt_missing",
+                        "Aster could not confirm that the prompt actually appeared in the ChatGPT composer.",
+                        "It is safer to stop here than to pretend the prompt was sent when the composer stayed blank.",
+                        status="error",
+                    )
+                    raise RuntimeError(
+                        "Aster could not confirm that the prompt was inserted into the ChatGPT composer. "
+                        "The page stayed in blank composer state."
+                    )
+                self._stabilize_and_send(target, before_lines, prompt)
+                self._activity(
+                    "browser_wait_reply",
+                    "Waiting for ChatGPT to start and finish its reply.",
+                    "Aster needs a completed response before it can extract a machine-readable patch block.",
                 )
-            self._stabilize_and_send(target, before_lines, prompt)
-            self._activity(
-                "browser_wait_reply",
-                "Waiting for ChatGPT to start and finish its reply.",
-                "Aster needs a completed response before it can extract a machine-readable patch block.",
-            )
-            reply = self._capture_reply_text(target, before_lines, prompt, timeout_sec=timeout_sec)
-            parsed = self.extract_structured_block(reply)
-            self._log(
-                "generate_reply_captured",
-                {
-                    "reply_length": len(reply),
-                    "parsed_length": len(parsed),
-                    "reply_preview": reply[:300],
-                },
-            )
-            if not parsed.strip():
-                raise RuntimeError("Browser mode could not capture a final ChatGPT response")
-            self._activity(
-                "browser_reply_ready",
-                "Captured a reply from ChatGPT and extracted the structured block.",
-                "Aster can now parse the response into exact file operations.",
-                status="success",
-                details={"reply_length": len(reply), "parsed_length": len(parsed)},
-            )
-            return BrowserResult(
-                raw_text=parsed,
-                metadata={"window_title": target.title},
-            )
+                # TODO: route reply capture through browser_core.reply_tracker once viewport anchoring is implemented.
+                reply = self._capture_reply_text(
+                    target,
+                    before_lines,
+                    prompt,
+                    timeout_sec=timeout_sec,
+                    prompt_anchor=prompt_anchor,
+                )
+                parsed = self.extract_structured_block(reply)
+                self._log(
+                    "generate_reply_captured",
+                    {
+                        "reply_length": len(reply),
+                        "parsed_length": len(parsed),
+                        "reply_preview": reply[:300],
+                    },
+                )
+                if not parsed.strip():
+                    raise RuntimeError("Browser mode could not capture a final ChatGPT response")
+                self._activity(
+                    "browser_reply_ready",
+                    "Captured a reply from ChatGPT and extracted the structured block.",
+                    "Aster can now parse the response into exact file operations.",
+                    status="success",
+                    details={"reply_length": len(reply), "parsed_length": len(parsed)},
+                )
+                return BrowserResult(
+                    raw_text=parsed,
+                    metadata={"window_title": target.title},
+                )
+            finally:
+                self._hide_automation_notice()
         except Exception as exc:
             self._log(
                 "generate_failed",
@@ -300,6 +477,21 @@ class BrowserChatGPTTransport:
                     "traceback": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
                 },
             )
+            recovery = decide_recovery(
+                self._last_page_classification,
+                attempts_used=1,
+                max_attempts=self.max_recovery_attempts,
+            )
+            self._log(
+                "recovery_decision",
+                {
+                    "action": recovery.action.value,
+                    "reason": recovery.reason,
+                    "attempts_used": recovery.attempts_used,
+                    "should_stop": recovery.should_stop,
+                },
+            )
+            # TODO: execute recovery decisions through a dedicated browser recovery coordinator.
             self._activity(
                 "browser_failed",
                 "Browser mode failed before a valid patch block was captured.",
@@ -308,6 +500,19 @@ class BrowserChatGPTTransport:
                 details={"error": str(exc)},
             )
             raise
+
+    def _show_automation_notice(self) -> None:
+        self._log("automation_notice_show", {})
+        self._activity(
+            "browser_takeover_notice",
+            "Aster is about to use the keyboard and mouse.",
+            "Avoiding user input during the automation steps keeps the browser run from being interrupted.",
+        )
+        self._automation_notice.show()
+
+    def _hide_automation_notice(self) -> None:
+        self._automation_notice.hide()
+        self._log("automation_notice_hide", {})
 
     def _stabilize_and_send(self, target, before_lines, prompt: str) -> None:
         deadline = time.monotonic() + 35.0
@@ -394,6 +599,12 @@ class BrowserChatGPTTransport:
 
     def _reply_started(self, before_lines, after_lines, target, ui_state: dict[str, Any] | None = None) -> bool:
         state = ui_state or self._ui_state(target)
+        if (
+            state.get("stop_streaming_present")
+            and not state.get("send_prompt_present")
+            and not state.get("show_in_text_field_present")
+        ):
+            return True
         candidate = self._executor.read_chatgpt_browser_reply(
             target,
             self._capture,
@@ -413,7 +624,7 @@ class BrowserChatGPTTransport:
                     },
                 )
                 return False
-            if self._score_reply_candidate(candidate) < 20.0 and not self._looks_like_substantive_reply_candidate(candidate):
+            if not self._looks_like_reply_started_candidate(candidate, state):
                 self._log(
                     "reply_detection_suppressed",
                     {
@@ -446,7 +657,7 @@ class BrowserChatGPTTransport:
                     },
                 )
                 return False
-            if self._score_reply_candidate(lowered) < 20.0:
+            if not self._looks_like_reply_started_candidate(lowered, state):
                 self._log(
                     "reply_detection_suppressed",
                     {
@@ -466,6 +677,16 @@ class BrowserChatGPTTransport:
             return True
         return ui_state.get("send_prompt_enabled") is True
 
+    @classmethod
+    def _looks_like_reply_started_candidate(cls, text: str, ui_state: dict[str, Any]) -> bool:
+        if cls._score_reply_candidate(text) >= 20.0:
+            return True
+        if cls._looks_like_substantive_reply_candidate(text):
+            return True
+        if ui_state.get("send_prompt_present") or not ui_state.get("stop_streaming_present"):
+            return False
+        return cls._looks_like_code_reply_candidate(text)
+
     def _needs_send_retry(self, lines, prompt: str) -> bool:
         full = "\n".join(line.text.lower() for line in lines)
         prompt_words = [word for word in re.findall(r"[a-z0-9]{4,}", prompt.lower())[:8]]
@@ -480,23 +701,33 @@ class BrowserChatGPTTransport:
     def _click_send_button(self, target) -> None:
         if self._click_named_button(target, "send prompt"):
             return
-        self._executor.focus_window_target(target)
+        self._focus_window(target)
         x = int(target.left + target.width * 0.95)
         y = int(target.top + target.height * 0.93)
         self._log("send_button_coordinate_click", {"x": x, "y": y})
         pyautogui.click(x, y)
 
     def _click_line(self, target, line) -> None:
-        self._executor.focus_window_target(target)
+        self._focus_window(target)
         x = int(target.left + line.center[0])
         y = int(target.top + line.center[1])
         pyautogui.click(x, y)
 
     def _click_named_button(self, target, phrase: str) -> bool:
+        return self._click_named_control(target, phrase, control_types=("Button",))
+
+    def _click_named_control(self, target, phrase: str, control_types: tuple[str, ...] | None = None) -> bool:
         try:
             window = Desktop(backend="uia").window(handle=target.handle)
-            for ctrl in window.descendants(control_type="Button"):
+            for ctrl in window.descendants():
                 name = (ctrl.window_text() or "").strip().lower()
+                if control_types is not None:
+                    try:
+                        control_type = ctrl.element_info.control_type
+                    except Exception:
+                        continue
+                    if control_type not in control_types:
+                        continue
                 if phrase in name:
                     if self._invoke_button(ctrl):
                         self._log("button_invoke", {"phrase": phrase, "name": name, "method": "invoke"})
@@ -508,13 +739,13 @@ class BrowserChatGPTTransport:
             return False
         return False
 
-    def _populate_prompt_directly(self, target, prompt: str) -> bool:
+    def _populate_prompt_directly(self, target, prompt: str, *, prompt_anchor=None) -> bool:
         composer = self._find_composer_edit(target)
         if composer is None:
             self._log("composer_edit_not_found", {"ui_state": self._ui_state(target)})
             return False
         try:
-            self._executor.focus_window_target(target)
+            self._focus_window(target)
             wrapper = composer
             if hasattr(composer, "wrapper_object"):
                 try:
@@ -538,7 +769,7 @@ class BrowserChatGPTTransport:
                 try:
                     self._clear_composer(target)
                     method()
-                    if self._wait_for_prompt_inserted(target, prompt, seconds=6.0):
+                    if self._wait_for_prompt_inserted(target, prompt, seconds=6.0, prompt_anchor=prompt_anchor):
                         self._log("composer_populated", {"method": method_name, "prompt_length": len(prompt)})
                         return True
                 except Exception as exc:
@@ -552,13 +783,13 @@ class BrowserChatGPTTransport:
         self._log("composer_population_failed", {"ui_state": self._ui_state(target)})
         return False
 
-    def _paste_prompt_with_click(self, target, prompt: str, click_point: tuple[int, int]) -> bool:
-        self._executor.focus_window_target(target)
+    def _paste_prompt_with_click(self, target, prompt: str, click_point: tuple[int, int], prompt_anchor=None) -> bool:
+        self._focus_window(target)
         pyautogui.click(click_point[0], click_point[1])
         time.sleep(0.25)
         self._clear_composer(target)
         self._paste_prompt_via_clipboard(target, prompt, click_point=click_point)
-        return self._wait_for_prompt_inserted(target, prompt, seconds=6.0)
+        return self._wait_for_prompt_inserted(target, prompt, seconds=6.0, prompt_anchor=prompt_anchor)
 
     def _paste_prompt_via_clipboard(self, target, prompt: str, click_point: tuple[int, int] | None) -> None:
         previous_clipboard = ""
@@ -568,7 +799,7 @@ class BrowserChatGPTTransport:
             previous_clipboard = pyperclip.paste()
             pyperclip.copy(prompt)
             time.sleep(0.15)
-            self._executor.focus_window_target(target)
+            self._focus_window(target)
             if click_point is not None:
                 pyautogui.click(click_point[0], click_point[1])
                 time.sleep(0.15)
@@ -582,19 +813,19 @@ class BrowserChatGPTTransport:
                 pass
 
     def _clear_composer(self, target) -> None:
-        self._executor.focus_window_target(target)
+        self._focus_window(target)
         pyautogui.hotkey("ctrl", "a")
         time.sleep(0.05)
         pyautogui.press("backspace")
         time.sleep(0.1)
 
-    def _wait_for_prompt_inserted(self, target, prompt: str, seconds: float) -> bool:
+    def _wait_for_prompt_inserted(self, target, prompt: str, seconds: float, *, prompt_anchor=None) -> bool:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             ui_state = self._ui_state(target)
-            if self._prompt_inserted(lines, prompt, ui_state):
+            if self._prompt_inserted(lines, prompt, ui_state, prompt_anchor=prompt_anchor):
                 self._log(
                     "prompt_inserted_confirmed",
                     {"ui_state": ui_state, "ocr_preview": [line.text[:120] for line in lines[:6]]},
@@ -604,25 +835,58 @@ class BrowserChatGPTTransport:
         self._log("prompt_inserted_missing", {"ui_state": self._ui_state(target)})
         return False
 
-    def _prompt_inserted(self, lines, prompt: str, ui_state: dict[str, Any]) -> bool:
+    def _prompt_inserted(self, lines, prompt: str, ui_state: dict[str, Any], *, prompt_anchor=None) -> bool:
         visible_text = "\n".join(line.text.lower() for line in lines)
-        prompt_words = [word for word in re.findall(r"[a-z0-9]{4,}", prompt.lower())[:12]]
+        prompt_words = self._prompt_confirmation_words(prompt)
         matched = sum(1 for word in prompt_words if word in visible_text)
         if ui_state.get("show_in_text_field_present"):
             return True
-        if ui_state.get("send_prompt_present") and ui_state.get("send_prompt_enabled") is True:
+        if self._composer_has_user_text(ui_state):
             return True
+        if prompt_anchor is not None:
+            composer_preview = str(ui_state.get("composer_edit_preview", "") or "")
+            if reply_matches_anchor(
+                build_reply_capture_result(composer_preview, "composer", 0.0, looks_complete=False, anchor=prompt_anchor),
+                prompt_anchor,
+                min_confidence=0.45,
+            ):
+                return True
+            if reply_matches_anchor(
+                build_reply_capture_result(visible_text, "ocr", 0.0, looks_complete=False, anchor=prompt_anchor),
+                prompt_anchor,
+                min_confidence=0.45,
+            ):
+                return True
         if matched >= 2:
             return True
         if "system" in visible_text and matched >= 1:
             return True
         return False
 
+    @staticmethod
+    def _composer_has_user_text(ui_state: dict[str, Any]) -> bool:
+        return composer_has_user_text(ui_state)
+
+    @staticmethod
+    def _prompt_confirmation_words(prompt: str) -> list[str]:
+        words: list[str] = []
+        seen: set[str] = set()
+        for word in re.findall(r"[a-z0-9]{4,}", prompt.lower()):
+            if word in PROMPT_CONFIRMATION_STOPWORDS:
+                continue
+            if word in seen:
+                continue
+            seen.add(word)
+            words.append(word)
+            if len(words) >= 12:
+                break
+        return words
+
     def _find_composer_edit(self, target):
         try:
             window = Desktop(backend="uia").window(handle=target.handle)
             best = None
-            best_bottom = -1
+            best_score = float("-inf")
             for ctrl in window.descendants(control_type="Edit"):
                 try:
                     name = (ctrl.window_text() or "").strip().lower()
@@ -631,12 +895,43 @@ class BrowserChatGPTTransport:
                     continue
                 if "chatgpt.com" in name:
                     continue
-                if rect.bottom > best_bottom:
+                score = self._score_composer_edit_candidate(target, rect, name)
+                if score > best_score:
                     best = ctrl
-                    best_bottom = rect.bottom
+                    best_score = score
+            if best_score < 0:
+                return None
             return best
         except Exception:
             return None
+
+    @classmethod
+    def _score_composer_edit_candidate(cls, target, rect, text: str) -> float:
+        width = max(0, rect.right - rect.left)
+        height = max(0, rect.bottom - rect.top)
+        rel_top = rect.top - target.top
+        rel_bottom = rect.bottom - target.top
+        score = 0.0
+        if width >= target.width * 0.35:
+            score += 40.0
+        else:
+            score -= 40.0
+        if rel_top >= target.height * 0.45:
+            score += 60.0
+        else:
+            score -= 80.0
+        if rel_bottom >= target.height * 0.72:
+            score += 35.0
+        if height >= 24:
+            score += 10.0
+        normalized = _normalize(text)
+        if looks_like_browser_url_text(normalized):
+            score -= 200.0
+        if any(hint in normalized for hint in BROWSER_READY_HINTS):
+            score += 50.0
+        if normalized.startswith("system:") or normalized.startswith("user goal:"):
+            score += 25.0
+        return score
 
     def _focus_composer(self, target, lines) -> None:
         composer = self._find_composer_line(lines)
@@ -644,13 +939,13 @@ class BrowserChatGPTTransport:
             self._click_line(target, composer)
             time.sleep(0.2)
             return
-        self._executor.focus_window_target(target)
+        self._focus_window(target)
         pyautogui.click(int(target.left + target.width * 0.55), int(target.top + target.height * 0.88))
         time.sleep(0.2)
 
     def _attempt_send(self, target, attempt_index: int) -> None:
         strategy = attempt_index % 5
-        self._executor.focus_window_target(target)
+        self._focus_window(target)
         if strategy == 0:
             self._log("send_attempt", {"attempt_index": attempt_index, "strategy": "button_or_enter"})
             self._activity(
@@ -775,18 +1070,20 @@ class BrowserChatGPTTransport:
         ) from last_error
 
     def _prepare_chatgpt_window(self, target, chatgpt_url: str, timeout_sec: float) -> None:
-        self._activity(
-            "browser_window_reset",
-            "Resetting the attached browser tab to a fresh ChatGPT page.",
-            "Starting from a clean ChatGPT page avoids stale thread content and wrong-tab captures during browser runs.",
-            details={"url": chatgpt_url},
-        )
-        self._navigate_browser_to_chatgpt(target, chatgpt_url)
-        ready = self._wait_for_chatgpt_ready(target, timeout_sec=timeout_sec)
+        ready = self._wait_for_chatgpt_ready(target, timeout_sec=min(timeout_sec, 12.0))
+        if not ready:
+            self._activity(
+                "browser_window_reset",
+                "Resetting the attached browser tab to a fresh ChatGPT page.",
+                "The initial browser window did not settle into a usable ChatGPT state, so Aster is forcing a direct navigation retry.",
+                details={"url": chatgpt_url},
+            )
+            self._navigate_browser_to_chatgpt(target, chatgpt_url)
+            ready = self._wait_for_chatgpt_ready(target, timeout_sec=timeout_sec)
         image = self._capture.capture_region(target.left, target.top, target.width, target.height)
         lines = self._ocr.extract(image)
-        ui_state = self._ui_state(target)
-        visible_text = " ".join(line.text.lower() for line in lines[:20])
+        analysis = self._analyze_screen(target, lines=lines)
+        visible_text = analysis.visible_text
         wrong_page_markers = (
             "ask gemini",
             "github",
@@ -795,12 +1092,13 @@ class BrowserChatGPTTransport:
             "issues",
             "commit",
         )
-        if any(marker in visible_text for marker in wrong_page_markers):
+        if any(marker in visible_text for marker in wrong_page_markers) and not self._looks_like_chatgpt_page(lines, analysis.ui_state):
             self._log(
                 "wrong_page_detected",
                 {
-                    "ui_state": ui_state,
-                    "ocr_preview": [line.text[:120] for line in lines[:8]],
+                    "ui_state": analysis.ui_state,
+                    "ocr_preview": list(analysis.ocr_preview),
+                    "page_classification": self._screen_analysis_payload(analysis),
                 },
             )
             raise RuntimeError(
@@ -808,12 +1106,14 @@ class BrowserChatGPTTransport:
                 "Wrong-page markers were visible in OCR."
             )
         if ready:
+            self._ensure_fresh_chat_thread(target, chatgpt_url=chatgpt_url, timeout_sec=min(10.0, timeout_sec))
             return
         self._log(
             "chatgpt_page_not_ready",
             {
-                "ui_state": ui_state,
-                "ocr_preview": [line.text[:120] for line in lines[:8]],
+                "ui_state": analysis.ui_state,
+                "ocr_preview": list(analysis.ocr_preview),
+                "page_classification": self._screen_analysis_payload(analysis),
             },
         )
         raise RuntimeError(
@@ -822,7 +1122,7 @@ class BrowserChatGPTTransport:
         )
 
     def _navigate_browser_to_chatgpt(self, target, chatgpt_url: str) -> None:
-        self._executor.focus_window_target(target)
+        self._focus_window(target)
         pyautogui.hotkey("ctrl", "l")
         time.sleep(0.15)
         self._paste_prompt_via_clipboard(target, chatgpt_url, click_point=None)
@@ -830,41 +1130,77 @@ class BrowserChatGPTTransport:
         pyautogui.press("enter")
         time.sleep(0.8)
 
+    def _ensure_fresh_chat_thread(self, target, chatgpt_url: str, timeout_sec: float) -> None:
+        title = str(getattr(target, "title", "") or "")
+        if not self._window_title_suggests_existing_thread(title):
+            self._reset_to_new_chat_if_possible(target, timeout_sec=timeout_sec)
+            return
+        self._log("stale_thread_title_detected", {"title": title})
+        self._activity(
+            "browser_stale_thread",
+            "Aster detected an existing ChatGPT thread title and is resetting to a fresh chat.",
+            "Old thread context and old code snippets have been contaminating reply capture.",
+            details={"window_title": title},
+        )
+        if self._reset_to_new_chat_if_possible(target, timeout_sec=timeout_sec):
+            return
+        self._log("stale_thread_reset_via_navigation", {"title": title, "url": chatgpt_url})
+        self._navigate_browser_to_chatgpt(target, chatgpt_url)
+        self._wait_for_chatgpt_ready(target, timeout_sec=max(3.0, timeout_sec))
+
+    def _reset_to_new_chat_if_possible(self, target, timeout_sec: float) -> bool:
+        clicked = self._click_named_button(target, "new chat")
+        if not clicked:
+            clicked = self._click_named_control(
+                target,
+                "new chat",
+                control_types=("Button", "Hyperlink", "ListItem", "Text", "MenuItem"),
+            )
+        if not clicked:
+            return False
+        self._log("new_chat_clicked", {"title": getattr(target, "title", "")})
+        self._activity(
+            "browser_new_chat",
+            "Resetting the ChatGPT thread to a new chat before inserting the prompt.",
+            "Aster gets more reliable structured replies from a fresh thread than from a reused conversation title.",
+        )
+        self._wait_for_chatgpt_ready(target, timeout_sec=max(3.0, timeout_sec))
+        return True
+
     def _wait_for_chatgpt_ready(self, target, timeout_sec: float) -> bool:
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline:
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
-            ui_state = self._ui_state(target)
-            visible_text = "\n".join(line.text.lower() for line in lines[:20])
-            loading = "loading" in visible_text
-            if self._looks_like_chatgpt_page(lines, ui_state) and not loading:
+            analysis = self._analyze_screen(target, lines=lines)
+            loading = "loading" in analysis.visible_text
+            if analysis.looks_like_chatgpt and analysis.ready_score >= 55.0 and not loading:
                 self._log(
                     "window_ready_confirmed",
                     {
-                        "ui_state": ui_state,
-                        "ocr_preview": [line.text[:120] for line in lines[:6]],
+                        "ui_state": analysis.ui_state,
+                        "ocr_preview": list(analysis.ocr_preview),
+                        "page_classification": self._screen_analysis_payload(analysis),
                     },
                 )
                 return True
             time.sleep(0.6)
-        self._log("window_ready_timeout", {"ui_state": self._ui_state(target)})
+        timeout_analysis = self._analyze_screen(target)
+        self._log(
+            "window_ready_timeout",
+            {
+                "ui_state": timeout_analysis.ui_state,
+                "ocr_preview": list(timeout_analysis.ocr_preview),
+                "page_classification": self._screen_analysis_payload(timeout_analysis),
+            },
+        )
         return False
 
     @staticmethod
     def _looks_like_chatgpt_page(lines, ui_state: dict[str, Any]) -> bool:
-        visible_text = "\n".join(line.text.lower() for line in lines[:24])
-        if any(hint in visible_text for hint in CHATGPT_PAGE_HINTS):
-            return True
-        return any(
-            (
-                ui_state.get("send_prompt_present"),
-                ui_state.get("show_in_text_field_present"),
-                ui_state.get("stop_streaming_present"),
-            )
-        )
+        return looks_like_chatgpt_page(lines, ui_state)
 
-    def _capture_reply_text(self, target, before_lines, prompt: str, timeout_sec: float) -> str:
+    def _capture_reply_text(self, target, before_lines, prompt: str, timeout_sec: float, *, prompt_anchor=None) -> str:
         deadline = time.monotonic() + timeout_sec
         best_text = ""
         best_score = float("-inf")
@@ -884,7 +1220,8 @@ class BrowserChatGPTTransport:
                 {
                     "ocr": ocr_text,
                     "uia": uia_text,
-                }
+                },
+                prompt_anchor=prompt_anchor,
             )
             if current_best is not None:
                 source, candidate, score = current_best
@@ -923,7 +1260,10 @@ class BrowserChatGPTTransport:
                                 "preview": scrolled[:240],
                             },
                         )
-                        best_from_scroll = self._choose_best_reply_candidate({"scrolled": scrolled})
+                        best_from_scroll = self._choose_best_reply_candidate(
+                            {"scrolled": scrolled},
+                            prompt_anchor=prompt_anchor,
+                        )
                         if best_from_scroll is not None:
                             _, candidate, score = best_from_scroll
                             if score > best_score or (score == best_score and len(candidate) > len(best_text)):
@@ -959,7 +1299,7 @@ class BrowserChatGPTTransport:
             return fallback_block
         return best_text or fallback or ""
 
-    def _choose_best_reply_candidate(self, sources: dict[str, str]) -> tuple[str, str, float] | None:
+    def _choose_best_reply_candidate(self, sources: dict[str, str], *, prompt_anchor=None) -> tuple[str, str, float] | None:
         best: tuple[str, str, float] | None = None
         for source, text in sources.items():
             raw = text.strip()
@@ -970,7 +1310,36 @@ class BrowserChatGPTTransport:
             if block and block != raw:
                 variants.insert(0, block)
             for candidate in variants:
+                if self._should_ignore_reply_candidate(candidate):
+                    self._log(
+                        "reply_candidate_ignored",
+                        {
+                            "source": source,
+                            "length": len(candidate),
+                            "preview": candidate[:220],
+                        },
+                    )
+                    continue
                 score = self._score_reply_candidate(candidate)
+                capture = build_reply_capture_result(
+                    candidate,
+                    source,
+                    score,
+                    looks_complete=self._looks_like_patch_plan_json(candidate),
+                    anchor=prompt_anchor,
+                )
+                if prompt_anchor is not None and reply_matches_anchor(capture, prompt_anchor) and not capture.looks_complete:
+                    self._log(
+                        "reply_candidate_ignored",
+                        {
+                            "source": source,
+                            "length": len(candidate),
+                            "preview": candidate[:220],
+                            "reason": "prompt_anchor_match",
+                            "anchor_confidence": capture.anchor_confidence,
+                        },
+                    )
+                    continue
                 if best is None or score > best[2] or (score == best[2] and len(candidate) > len(best[1])):
                     best = (source, candidate, score)
         return best
@@ -1057,9 +1426,43 @@ class BrowserChatGPTTransport:
             time.sleep(0.25)
 
     def _focus_reply_area(self, target) -> None:
-        self._executor.focus_window_target(target)
+        self._focus_window(target)
         pyautogui.click(int(target.left + target.width * 0.70), int(target.top + target.height * 0.42))
         time.sleep(0.2)
+
+    def _focus_window(self, target) -> None:
+        try:
+            self._executor.focus_window_target(target)
+            return
+        except Exception as exc:
+            error = str(exc)
+            self._log(
+                "window_focus_failed",
+                {
+                    "error": error,
+                    "title": getattr(target, "title", ""),
+                    "handle": getattr(target, "handle", None),
+                },
+            )
+        try:
+            x = int(target.left + min(target.width * 0.5, max(80, target.width * 0.5)))
+            y = int(target.top + min(target.height * 0.08, max(30, min(80, target.height * 0.08))))
+            pyautogui.click(x, y)
+            time.sleep(0.35)
+            self._log(
+                "window_focus_fallback_click",
+                {
+                    "x": x,
+                    "y": y,
+                    "title": getattr(target, "title", ""),
+                    "handle": getattr(target, "handle", None),
+                },
+            )
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                "Could not focus the ChatGPT browser window for automation. "
+                f"Original focus error: {error}. Fallback error: {fallback_exc}."
+            ) from fallback_exc
 
     @staticmethod
     def _merge_text_segments(segments: list[str]) -> str:
@@ -1123,6 +1526,34 @@ class BrowserChatGPTTransport:
     @staticmethod
     def _response_still_streaming(ui_state: dict[str, Any]) -> bool:
         return bool(ui_state.get("stop_streaming_present"))
+
+    def _analyze_screen(self, target, lines=None, ui_state: dict[str, Any] | None = None) -> PageClassification:
+        if lines is None:
+            image = self._capture.capture_region(target.left, target.top, target.width, target.height)
+            lines = self._ocr.extract(image)
+        state = ui_state or self._ui_state(target)
+        classification = classify_page(lines, state)
+        self._last_page_classification = classification
+        return classification
+
+    @staticmethod
+    def _screen_analysis_payload(analysis: PageClassification) -> dict[str, Any]:
+        return {
+            "ready_score": round(analysis.ready_score, 1),
+            "page_kind": analysis.page_kind,
+            "looks_like_chatgpt": analysis.looks_like_chatgpt,
+            "composer_visible": analysis.composer_visible,
+            "send_button_present": analysis.send_button_present,
+            "send_button_enabled": analysis.send_button_enabled,
+            "show_in_text_field_present": analysis.show_in_text_field_present,
+            "stop_streaming_present": analysis.stop_streaming_present,
+            "wrong_page_signals_present": analysis.wrong_page_signals_present,
+            "likely_fresh_chat": analysis.likely_fresh_chat,
+            "likely_existing_chat": analysis.likely_existing_chat,
+            "composer_ready": analysis.composer_ready,
+            "likely_wrong_page": analysis.likely_wrong_page,
+            "signals": list(analysis.signals[:8]),
+        }
 
     def _extract_reply_from_ocr_lines(self, before_lines, after_lines, target, prompt: str) -> str:
         before_seen = {_normalize(line.text) for line in before_lines}
@@ -1250,6 +1681,40 @@ class BrowserChatGPTTransport:
             return True
         return False
 
+    @staticmethod
+    def _looks_like_code_reply_candidate(text: str) -> bool:
+        cleaned = text.strip()
+        if len(cleaned) < 80:
+            return False
+        lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
+        if len(lines) < 3:
+            return False
+        signals = 0
+        if sum(1 for line in lines if line.startswith(("    ", "\t"))) >= 2:
+            signals += 1
+        if re.search(r"\b(def|class|return|import|from|if|elif|else|for|while|try|except|with)\b", cleaned):
+            signals += 1
+        if re.search(r"\bself\.\w+|\w+\([^)]*\)", cleaned):
+            signals += 1
+        if sum(1 for line in lines if any(char in line for char in "()[]{}=:")) >= 2:
+            signals += 1
+        return signals >= 2
+
+    @classmethod
+    def _should_ignore_reply_candidate(cls, text: str) -> bool:
+        cleaned = text.strip()
+        if not cleaned:
+            return True
+        if cls._looks_like_patch_plan_json(cleaned):
+            return False
+        lowered = _normalize(cleaned)
+        if cls._segment_looks_like_prompt_echo(cleaned):
+            return True
+        if "aster patch begin" in lowered and not cls._looks_like_patch_plan_json(cleaned):
+            if "on its own line" in lowered or "do not wrap the json" in lowered:
+                return True
+        return False
+
     @classmethod
     def _score_reply_candidate(cls, text: str) -> float:
         cleaned = text.strip()
@@ -1265,6 +1730,8 @@ class BrowserChatGPTTransport:
             score += 60.0
         if cls._looks_like_patch_plan_json(cleaned):
             score += 220.0
+        if cls._segment_looks_like_prompt_echo(cleaned):
+            score -= 260.0
         for noise in (
             "good to see you",
             "company knowledge",
@@ -1296,6 +1763,10 @@ class BrowserChatGPTTransport:
         ):
             score -= 200.0
         return score
+
+    @staticmethod
+    def _window_title_suggests_existing_thread(title: str) -> bool:
+        return window_title_suggests_existing_chat(title)
 
     def _raise_for_browser_error(self, lines, ui_state: dict[str, Any], *, stage: str) -> None:
         visible_text = "\n".join(line.text for line in lines[:30])
@@ -1334,16 +1805,22 @@ class BrowserChatGPTTransport:
         operations = data.get("operations")
         return isinstance(operations, list) and bool(operations)
 
+    @staticmethod
+    def _looks_like_browser_url_text(text: str) -> bool:
+        return looks_like_browser_url_text(text)
+
     def _log_window_state(self, target, lines, prompt: str, ui_state: dict[str, Any] | None = None) -> None:
         ui_state = ui_state or self._ui_state(target)
+        analysis = self._analyze_screen(target, lines=lines, ui_state=ui_state)
         visible_text = "\n".join(line.text.lower() for line in lines[:12])
         prompt_words = [word for word in re.findall(r"[a-z0-9]{4,}", prompt.lower())[:8]]
         payload = {
             "ui_state": ui_state,
+            "ocr_preview": [line.text[:120] for line in lines[:5]],
+            "page_classification": self._screen_analysis_payload(analysis),
             "ocr_line_count": len(lines),
             "show_in_text_field_visible": "show in text field" in visible_text,
             "prompt_words_visible": [word for word in prompt_words if word in visible_text],
-            "ocr_preview": [line.text[:120] for line in lines[:5]],
         }
         signature = str(payload)
         if signature != self._last_window_state:
@@ -1358,6 +1835,7 @@ class BrowserChatGPTTransport:
             "show_in_text_field_present": False,
             "stop_streaming_present": False,
             "composer_edit_length": None,
+            "composer_edit_preview": "",
         }
         try:
             window = Desktop(backend="uia").window(handle=target.handle)
@@ -1376,9 +1854,12 @@ class BrowserChatGPTTransport:
             composer = self._find_composer_edit(target)
             if composer is not None:
                 try:
-                    state["composer_edit_length"] = len((composer.window_text() or "").strip())
+                    composer_text = (composer.window_text() or "").strip()
+                    state["composer_edit_length"] = len(composer_text)
+                    state["composer_edit_preview"] = composer_text[:120]
                 except Exception:
                     state["composer_edit_length"] = "unknown"
+                    state["composer_edit_preview"] = "unknown"
         except Exception as exc:
             state["inspection_error"] = str(exc)
         return state
@@ -1398,4 +1879,3 @@ def _load_gui_dependencies():
     pyautogui = pyautogui_module
     Desktop = desktop_cls
     return pyautogui, Desktop
-

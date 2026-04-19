@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     doctor.add_argument("--project-root", default=".")
     doctor.add_argument("--json", action="store_true", help="Print the report as JSON")
 
-    sync_runtime = sub.add_parser("sync-runtime", help="Commit and push tracked runtime logs and local changes")
+    sync_runtime = sub.add_parser("sync-runtime", help="Commit and push tracked runtime logs")
     sync_runtime.add_argument("--project-root", default=".")
     sync_runtime.add_argument("--message", default="Aster runtime sync")
 
@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         project_root = Path(args.project_root).resolve()
         config = load_config(project_root)
         orchestrator = AsterOrchestrator(config)
-        for item in orchestrator._sync_repo_state(args.message):
+        for item in orchestrator.sync_runtime_logs(args.message):
             print(item)
         return 0
 

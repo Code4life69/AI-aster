@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from aster.browser_core.models import BrowserStrategy
+
 
 @dataclass(slots=True)
 class AsterConfig:
@@ -42,10 +44,16 @@ class AsterConfig:
     api_mode_enabled: bool = False
     chatgpt_url: str = "https://chatgpt.com/"
     browser_launch_timeout_seconds: int = 45
+    browser_strategy: BrowserStrategy = BrowserStrategy.PATCH_RUNNER
+    thread_reuse_enabled: bool = False
+    thread_registry_path: Path = Path(".aster/thread_registry.json")
+    verification_level: str = "basic"
+    log_screenshots: bool = False
+    max_recovery_attempts: int = 3
     auto_apply: bool = False
     git_integration: bool = True
-    auto_commit_and_push: bool = False
-    push_runtime_logs_after_plan: bool = False
+    auto_commit_and_push: bool = True
+    push_runtime_logs_after_plan: bool = True
     auto_commit_message_prefix: str = "Aster update"
     git_remote_name: str = "origin"
     sync_with_remote: bool = True

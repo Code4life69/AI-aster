@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 
 
@@ -58,7 +59,7 @@ class ParsedPlan:
 
 class ResponseParser:
     def parse(self, raw_text: str) -> ParsedPlan:
-        data = json.loads(raw_text)
+        data = json.loads(self._extract_json(raw_text))
         if not isinstance(data, dict):
             raise ValueError("Response must be a JSON object")
         summary = self._require_string(data.get("summary", ""), "summary", allow_empty=True)
@@ -148,3 +149,24 @@ class ResponseParser:
             if text:
                 cleaned.append(text)
         return cleaned
+
+    @staticmethod
+    def _extract_json(raw_text: str) -> str:
+        text = raw_text.strip()
+        if not text:
+            return text
+        marker_match = re.search(
+            r"ASTER[_ ]PATCH[_ ]BEGIN\s*(\{.*?\})\s*ASTER[_ ]PATCH[_ ]END",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if marker_match:
+            return marker_match.group(1).strip()
+        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+        if fenced:
+            return fenced[-1].strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return text[start : end + 1].strip()
+        return text

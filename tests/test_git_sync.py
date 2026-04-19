@@ -50,3 +50,36 @@ def test_ensure_branch_does_not_rename_current_branch(tmp_path: Path) -> None:
 
     assert "Git branch preserved" in message
     assert sync.current_branch() == "feature/demo"
+
+
+def test_commit_paths_if_needed_only_commits_selected_paths(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.name", "Aster Test")
+    _git(tmp_path, "config", "user.email", "aster@example.com")
+    audit_dir = tmp_path / ".aster"
+    audit_dir.mkdir()
+    (audit_dir / "audit.log.jsonl").write_text('{"kind":"seed"}\n', encoding="utf-8")
+    (tmp_path / "app.py").write_text("print('v1')\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "initial")
+
+    (audit_dir / "audit.log.jsonl").write_text('{"kind":"next"}\n', encoding="utf-8")
+    (tmp_path / "app.py").write_text("print('v2')\n", encoding="utf-8")
+
+    sync = GitSync(tmp_path)
+    results = sync.commit_paths_if_needed(
+        "runtime only",
+        [
+            ".aster/audit.log.jsonl",
+            ".aster/last_launch_stdout.log",
+            ".aster/last_launch_stderr.log",
+        ],
+    )
+
+    assert any("git add -A -- .aster/audit.log.jsonl" in item for item in results)
+    assert any("git commit -m runtime only -> 0" in item for item in results)
+    head_files = _git(tmp_path, "show", "--name-only", "--pretty=format:", "HEAD")
+    assert ".aster/audit.log.jsonl" in head_files.stdout
+    assert "app.py" not in head_files.stdout
+    status = _git(tmp_path, "status", "--porcelain")
+    assert " M app.py" in status.stdout

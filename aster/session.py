@@ -20,8 +20,22 @@ class SessionStore:
     def load(self) -> list[SessionTurn]:
         if not self.file.exists():
             return []
-        data = json.loads(self.file.read_text(encoding="utf-8"))
-        return [SessionTurn(role=item["role"], content=item["content"]) for item in data[-self.limit :]]
+        try:
+            data = json.loads(self.file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, list):
+            return []
+        turns: list[SessionTurn] = []
+        for item in data[-self.limit :]:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            content = item.get("content")
+            if not isinstance(role, str) or not isinstance(content, str):
+                continue
+            turns.append(SessionTurn(role=role, content=content))
+        return turns
 
     def append(self, role: str, content: str) -> None:
         items = self.load()

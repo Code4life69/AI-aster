@@ -27,6 +27,12 @@ class OrchestrationResult:
 
 
 class AsterOrchestrator:
+    RUNTIME_LOG_PATHS = (
+        ".aster/audit.log.jsonl",
+        ".aster/last_launch_stdout.log",
+        ".aster/last_launch_stderr.log",
+    )
+
     def __init__(self, config: AsterConfig) -> None:
         self.config = config
         log_root = config.log_dir or (config.project_root / ".aster")
@@ -47,7 +53,20 @@ class AsterOrchestrator:
         self.applier = PatchApplier(config.project_root, self.logger, git_integration=config.git_integration)
         self.git = GitSync(config.project_root, remote_name=config.git_remote_name)
         self.api_transport = OpenAIResponsesTransport(config.preferred_model, config.openai_api_key_env)
-        self.browser_transport = BrowserChatGPTTransport(self.logger)
+        thread_registry_path = (
+            config.thread_registry_path
+            if config.thread_registry_path.is_absolute()
+            else config.project_root / config.thread_registry_path
+        )
+        self.browser_transport = BrowserChatGPTTransport(
+            self.logger,
+            strategy=config.browser_strategy,
+            thread_reuse_enabled=config.thread_reuse_enabled,
+            thread_registry_path=thread_registry_path,
+            verification_level=config.verification_level,
+            log_screenshots=config.log_screenshots,
+            max_recovery_attempts=config.max_recovery_attempts,
+        )
 
     def plan(self, goal: str, mode: str | None = None) -> OrchestrationResult:
         resolved_mode = mode or self.config.default_mode
@@ -132,7 +151,7 @@ class AsterOrchestrator:
                 "Committing and pushing the latest runtime logs to GitHub.",
                 "This keeps the remote repo updated with the newest audit and launch logs after each planning run.",
             )
-            runtime_sync_log = self._sync_repo_state("sync runtime logs after plan")
+            runtime_sync_log = self.sync_runtime_logs("sync runtime logs after plan")
         return OrchestrationResult(
             context=context,
             plan=plan,
@@ -189,6 +208,9 @@ class AsterOrchestrator:
         )
         return result
 
+    def sync_runtime_logs(self, message: str = "Aster runtime sync") -> list[str]:
+        return self._sync_repo_state(message, paths=list(self.RUNTIME_LOG_PATHS))
+
     def _generate(self, mode: str, messages: list[dict[str, str]]) -> str:
         if mode == "browser":
             if not self.config.browser_mode_enabled:
@@ -242,8 +264,11 @@ class AsterOrchestrator:
         summary = summary[:72] if summary else "apply patch plan"
         return f"{self.config.auto_commit_message_prefix}: {summary}"
 
-    def _sync_repo_state(self, commit_message: str) -> list[str]:
-        results = self.git.commit_all_if_needed(commit_message)
+    def _sync_repo_state(self, commit_message: str, paths: list[str] | None = None) -> list[str]:
+        if paths is None:
+            results = self.git.commit_all_if_needed(commit_message)
+        else:
+            results = self.git.commit_paths_if_needed(commit_message, paths)
         if self.config.sync_with_remote:
             results.extend(self.git.sync_push())
         return results

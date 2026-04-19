@@ -13,6 +13,8 @@ class _FakeApplier:
 class _FakeGit:
     def __init__(self) -> None:
         self.commit_messages: list[str] = []
+        self.runtime_commit_messages: list[str] = []
+        self.runtime_commit_paths: list[list[str]] = []
         self.push_calls = 0
         self.pull_calls = 0
 
@@ -23,6 +25,11 @@ class _FakeGit:
     def commit_all_if_needed(self, message: str) -> list[str]:
         self.commit_messages.append(message)
         return [f"commit {message}"]
+
+    def commit_paths_if_needed(self, message: str, paths: list[str]) -> list[str]:
+        self.runtime_commit_messages.append(message)
+        self.runtime_commit_paths.append(list(paths))
+        return [f"commit selected {message}"]
 
     def sync_push(self) -> list[str]:
         self.push_calls += 1
@@ -146,5 +153,6 @@ def test_plan_pushes_runtime_logs_after_generation(tmp_path: Path) -> None:
 
     assert result.plan.requires_more_files() is True
     assert orchestrator.git.pull_calls == 1
-    assert orchestrator.git.commit_messages[-1] == "sync runtime logs after plan"
+    assert orchestrator.git.runtime_commit_messages[-1] == "sync runtime logs after plan"
+    assert orchestrator.git.runtime_commit_paths[-1] == list(AsterOrchestrator.RUNTIME_LOG_PATHS)
     assert orchestrator.git.push_calls == 1

@@ -114,21 +114,13 @@ class PromptBuilder:
         mode: str = "api",
         max_chars: int | None = None,
     ) -> PromptPackage:
-        retry_message = (
-            "Your previous response was rejected because it was vague or not actionable.\n"
-            "Return JSON only with one or more exact operations.\n"
-            "Previous response:\n"
-            f"{prior_text[:4000]}"
-        )
-        adjusted_max = max_chars
         if mode == "browser":
-            base_limit = max_chars or BROWSER_PROMPT_CHAR_LIMIT
-            adjusted_max = max(6_000, base_limit - len(retry_message) - 60)
-        package = self.build(goal, context, history, mode=mode, max_chars=adjusted_max)
+            return self._build_browser_retry(goal, context, history, prior_text, max_chars=max_chars)
         retry_item = {
             "role": "user",
-            "content": retry_message,
+            "content": self._build_retry_message(prior_text),
         }
+        package = self.build(goal, context, history, mode=mode, max_chars=max_chars)
         messages = [*package.messages, retry_item]
         return PromptPackage(
             messages=messages,
@@ -136,6 +128,44 @@ class PromptBuilder:
             included_files=package.included_files,
             omitted_files=package.omitted_files,
             compacted=package.compacted,
+        )
+
+    def _build_browser_retry(
+        self,
+        goal: str,
+        context: CollectedContext,
+        history: list[SessionTurn],
+        prior_text: str,
+        *,
+        max_chars: int | None,
+    ) -> PromptPackage:
+        base_limit = max_chars or BROWSER_PROMPT_CHAR_LIMIT
+        retry_message = self._build_retry_message(prior_text, max_chars=min(4_000, max(600, base_limit // 3)))
+        retry_item = {"role": "user", "content": retry_message}
+        retry_rendered = self.estimate_rendered_length([retry_item])
+        package_budget = max(2_000, base_limit - retry_rendered - 2)
+        package = self.build(goal, context, history, mode="browser", max_chars=package_budget)
+        available_retry_chars = max(200, base_limit - self.estimate_rendered_length(package.messages) - len("USER:\n"))
+        retry_item = {
+            "role": "user",
+            "content": self._build_retry_message(prior_text, max_chars=available_retry_chars),
+        }
+        messages = [*package.messages, retry_item]
+        if self.estimate_rendered_length(messages) > base_limit:
+            package_budget = max(1_200, base_limit - self.estimate_rendered_length([retry_item]) - 2)
+            package = self.build(goal, context, history, mode="browser", max_chars=package_budget)
+            messages = [*package.messages, retry_item]
+        messages = self._shrink_messages_to_limit(
+            package.messages,
+            prior_text,
+            base_limit=base_limit,
+        )
+        return PromptPackage(
+            messages=messages,
+            approx_chars=self.estimate_rendered_length(messages),
+            included_files=package.included_files,
+            omitted_files=package.omitted_files,
+            compacted=True,
         )
 
     @staticmethod
@@ -302,3 +332,37 @@ class PromptBuilder:
             if used >= BROWSER_HISTORY_CHAR_LIMIT:
                 break
         return "\n".join(entries) or "[none]"
+
+    @staticmethod
+    def _build_retry_message(prior_text: str, max_chars: int = 4_000) -> str:
+        header = (
+            "Your previous response was rejected because it was vague or not actionable.\n"
+            "Return JSON only with one or more exact operations.\n"
+            "Previous response:\n"
+        )
+        available = max(0, max_chars - len(header))
+        excerpt = prior_text[:available]
+        if available < len(prior_text):
+            excerpt = excerpt.rstrip() + "...[TRUNCATED]"
+        return header + excerpt
+
+    def _shrink_messages_to_limit(
+        self,
+        base_messages: list[dict[str, str]],
+        prior_text: str,
+        *,
+        base_limit: int,
+    ) -> list[dict[str, str]]:
+        retry_limit = max(200, base_limit)
+        messages = [*base_messages, {"role": "user", "content": self._build_retry_message(prior_text, max_chars=retry_limit)}]
+        while self.estimate_rendered_length(messages) > base_limit and retry_limit > 200:
+            excess = self.estimate_rendered_length(messages) - base_limit
+            next_limit = max(200, retry_limit - excess - 24)
+            if next_limit >= retry_limit:
+                break
+            retry_limit = next_limit
+            messages = [
+                *base_messages,
+                {"role": "user", "content": self._build_retry_message(prior_text, max_chars=retry_limit)},
+            ]
+        return messages

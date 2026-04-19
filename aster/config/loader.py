@@ -3,16 +3,25 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from aster.browser_core.models import BrowserStrategy
+
 from .models import AsterConfig
 
 
 def load_config(project_root: Path, config_path: Path | None = None) -> AsterConfig:
     root = project_root.resolve()
     target = config_path or root / "aster.config.json"
-    config = AsterConfig(project_root=root, log_dir=root / ".aster")
+    config = AsterConfig(
+        project_root=root,
+        log_dir=root / ".aster",
+        thread_registry_path=root / ".aster" / "thread_registry.json",
+    )
     if not target.exists():
         return config
     data = json.loads(target.read_text(encoding="utf-8"))
+    thread_registry_raw = Path(str(data.get("thread_registry_path", config.thread_registry_path)))
+    if not thread_registry_raw.is_absolute():
+        thread_registry_raw = root / thread_registry_raw
     return AsterConfig(
         project_root=root,
         ignore_patterns=list(data.get("ignore_patterns", config.ignore_patterns)),
@@ -27,6 +36,12 @@ def load_config(project_root: Path, config_path: Path | None = None) -> AsterCon
         browser_launch_timeout_seconds=int(
             data.get("browser_launch_timeout_seconds", config.browser_launch_timeout_seconds)
         ),
+        browser_strategy=_parse_browser_strategy(data.get("browser_strategy", config.browser_strategy)),
+        thread_reuse_enabled=bool(data.get("thread_reuse_enabled", config.thread_reuse_enabled)),
+        thread_registry_path=thread_registry_raw,
+        verification_level=str(data.get("verification_level", config.verification_level)),
+        log_screenshots=bool(data.get("log_screenshots", config.log_screenshots)),
+        max_recovery_attempts=int(data.get("max_recovery_attempts", config.max_recovery_attempts)),
         auto_apply=bool(data.get("auto_apply", config.auto_apply)),
         git_integration=bool(data.get("git_integration", config.git_integration)),
         auto_commit_and_push=bool(data.get("auto_commit_and_push", config.auto_commit_and_push)),
@@ -48,3 +63,10 @@ def load_config(project_root: Path, config_path: Path | None = None) -> AsterCon
         history_limit=int(data.get("history_limit", config.history_limit)),
         log_dir=root / str(data.get("log_dir", ".aster")),
     )
+
+
+def _parse_browser_strategy(value: object) -> BrowserStrategy:
+    try:
+        return BrowserStrategy(str(value))
+    except ValueError:
+        return BrowserStrategy.PATCH_RUNNER

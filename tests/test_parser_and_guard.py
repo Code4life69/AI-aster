@@ -26,6 +26,49 @@ def test_parser_reads_operations() -> None:
     assert plan.operations[0].path == "src/app.py"
 
 
+def test_parser_accepts_fenced_json() -> None:
+    raw = """
+    some intro
+    ```json
+    {
+      "summary": "Update one file",
+      "notes": [],
+      "operations": [
+        {
+          "type": "EDIT FILE",
+          "path": "src/app.py",
+          "reason": "fix bug",
+          "content": "print('fixed')"
+        }
+      ]
+    }
+    ```
+    """
+    plan = ResponseParser().parse(raw)
+    assert plan.operations[0].path == "src/app.py"
+
+
+def test_parser_accepts_aster_patch_markers() -> None:
+    raw = """
+    ASTER_PATCH_BEGIN
+    {
+      "summary": "Update one file",
+      "notes": [],
+      "operations": [
+        {
+          "type": "EDIT FILE",
+          "path": "src/app.py",
+          "reason": "fix bug",
+          "content": "print('fixed')"
+        }
+      ]
+    }
+    ASTER_PATCH_END
+    """
+    plan = ResponseParser().parse(raw)
+    assert plan.operations[0].path == "src/app.py"
+
+
 def test_guard_blocks_escape_from_project(tmp_path: Path) -> None:
     raw = """
     {

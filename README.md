@@ -10,7 +10,7 @@ Aster is a local desktop coding orchestrator. You describe the change in plain E
 - Redacts common secrets before sending context externally.
 - Requires strict machine-parseable operations from the model.
 - Previews diffs before applying changes locally.
-- Creates backups before edits and can create a git checkpoint.
+- Creates backups before edits and can create a git checkpoint for the files about to change.
 - Stores session history for iterative follow-up requests.
 - Can sync with GitHub so the local repo stays current before planning, pushes tracked runtime logs after planning runs, and pushes approved code changes plus logs after apply runs.
 
@@ -18,6 +18,7 @@ Aster is a local desktop coding orchestrator. You describe the change in plain E
 
 ```text
 aster/
+  browser_core/
   config/
   context_collector/
   prompt_builder/
@@ -36,7 +37,7 @@ aster/
 
 ## Modes
 
-- Browser mode: default. Uses the Screen Reader automation stack to attach to a logged-in ChatGPT browser tab, or opens `https://chatgpt.com/` if no ChatGPT window is open yet.
+- Browser mode: default. Uses the Screen Reader automation stack to attach to a logged-in ChatGPT browser tab, or opens `https://chatgpt.com/` if no ChatGPT window is open yet. The browser architecture is being split into `patch_runner` and `conversation_operator` strategies; this pass adds the `browser_core` scaffolding and keeps current runtime behavior on the existing patch-runner flow.
 - API mode: optional. Disabled by default and only available if you explicitly turn it on in `aster.config.json`.
 
 ## GitHub sync
@@ -44,7 +45,7 @@ aster/
 If your project is connected to GitHub, Aster can:
 
 - `git fetch` and `git pull --ff-only` before building context.
-- `git add -A`, `git commit`, and `git push` after planning runs so tracked runtime logs are published.
+- `git add -A -- .aster/audit.log.jsonl .aster/last_launch_stdout.log .aster/last_launch_stderr.log`, `git commit`, and `git push` after planning runs so only tracked runtime logs are published.
 - `git add -A`, `git commit`, and `git push` after approved changes are applied.
 - publish `.aster/audit.log.jsonl`, `.aster/last_launch_stdout.log`, and `.aster/last_launch_stderr.log` to GitHub so remote diagnostics stay current.
 - initialize a local repo and set the remote if needed.

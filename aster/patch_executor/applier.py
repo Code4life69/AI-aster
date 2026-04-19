@@ -53,7 +53,7 @@ class PatchApplier:
         backup_root = self._create_backup(selected, dry_run=dry_run)
         results = [f"Backup: {backup_root}"]
         if not dry_run:
-            self._maybe_git_checkpoint()
+            self._maybe_git_checkpoint(selected)
         for op in selected:
             results.append(self._apply_operation(op, dry_run=dry_run))
         return results
@@ -73,10 +73,19 @@ class PatchApplier:
         self.logger.log("backup_created", {"backup_root": backup_root, "count": len(operations)})
         return backup_root
 
-    def _maybe_git_checkpoint(self) -> None:
+    def _maybe_git_checkpoint(self, operations: list[PatchOperation]) -> None:
         if not self.git_integration or not (self.project_root / ".git").exists():
             return
-        subprocess.run(["git", "add", "-A"], cwd=self.project_root, check=False, capture_output=True, text=True)
+        checkpoint_paths = self._checkpoint_paths(operations)
+        if not checkpoint_paths:
+            return
+        subprocess.run(
+            ["git", "add", "-A", "--", *checkpoint_paths],
+            cwd=self.project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
         subprocess.run(
             ["git", "commit", "-m", "Aster checkpoint before apply"],
             cwd=self.project_root,
@@ -84,6 +93,23 @@ class PatchApplier:
             capture_output=True,
             text=True,
         )
+
+    def _checkpoint_paths(self, operations: list[PatchOperation]) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for op in operations:
+            candidates = [op.path]
+            if op.type in {"RENAME FILE", "MOVE FILE"} and op.new_path:
+                candidates.append(op.new_path)
+            for candidate in candidates:
+                rel = candidate.replace("\\", "/")
+                if rel in seen:
+                    continue
+                full_path = self.project_root / candidate
+                if full_path.exists():
+                    paths.append(rel)
+                    seen.add(rel)
+        return paths
 
     def _apply_operation(self, op: PatchOperation, dry_run: bool) -> str:
         self.logger.log("apply_operation", {"type": op.type, "path": op.path, "dry_run": dry_run})

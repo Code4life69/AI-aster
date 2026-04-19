@@ -61,10 +61,31 @@ class GitSync:
         ]
         return results
 
+    def commit_paths_if_needed(self, message: str, paths: list[str]) -> list[str]:
+        if not self.is_repo():
+            return ["Git commit skipped: repository is not initialized locally."]
+        eligible_paths = self._existing_or_tracked_paths(paths)
+        if not eligible_paths:
+            return ["Git commit skipped: no eligible paths were provided."]
+        if not self.has_changes_in_paths(eligible_paths):
+            return ["Git commit skipped: no changes detected in selected paths."]
+        return [
+            self._run(["git", "add", "-A", "--", *eligible_paths]),
+            self._run(["git", "commit", "-m", message]),
+        ]
+
     def has_changes(self) -> bool:
         if not self.is_repo():
             return False
         result = self._completed(["git", "status", "--porcelain"])
+        if result.returncode != 0:
+            return False
+        return bool(result.stdout.strip())
+
+    def has_changes_in_paths(self, paths: list[str]) -> bool:
+        if not self.is_repo() or not paths:
+            return False
+        result = self._completed(["git", "status", "--porcelain", "--", *paths])
         if result.returncode != 0:
             return False
         return bool(result.stdout.strip())
@@ -78,6 +99,19 @@ class GitSync:
         if current == branch:
             return f"Git branch ready: {branch}"
         return f"Git branch preserved: current branch is {current}; requested branch was {branch}."
+
+    def _existing_or_tracked_paths(self, paths: list[str]) -> list[str]:
+        eligible: list[str] = []
+        for raw_path in paths:
+            candidate = Path(raw_path)
+            normalized = candidate.as_posix()
+            if (self.project_root / candidate).exists() or self._is_tracked_path(normalized):
+                eligible.append(normalized)
+        return eligible
+
+    def _is_tracked_path(self, path: str) -> bool:
+        result = self._completed(["git", "ls-files", "--error-unmatch", "--", path])
+        return result.returncode == 0
 
     def _run(self, command: list[str]) -> str:
         completed = self._completed(command)
