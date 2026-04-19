@@ -1,5 +1,13 @@
 from pathlib import Path
 
+from aster.browser_core.composer_controller import (
+    DEFAULT_COMPOSER_VERIFICATION_POLICY,
+    build_composer_state,
+    composer_has_user_text,
+    looks_like_browser_url_text,
+    prompt_confirmation_words,
+    prompt_insertion_confirmed,
+)
 from aster.browser_core.models import BrowserStrategy, ThreadRecord
 from aster.browser_core.page_classifier import classify_page
 from aster.browser_core.recovery_engine import (
@@ -146,6 +154,151 @@ def test_thread_registry_load_save_upsert_and_choose_strategy(tmp_path: Path) ->
     assert loaded.choose_strategy(reuse_enabled=False) == "create_new"
     assert loaded.choose_strategy(reuse_enabled=True, thread_id="thread-1") == "reuse_existing"
     assert loaded.choose_strategy(reuse_enabled=True, thread_id="missing") == "unknown"
+
+
+def test_build_composer_state_shapes_preview_and_button_flags() -> None:
+    state = build_composer_state(
+        {
+            "composer_edit_length": 40,
+            "composer_edit_preview": "Create a hello world file",
+            "send_prompt_present": True,
+            "send_prompt_enabled": True,
+            "show_in_text_field_present": False,
+        }
+    )
+
+    assert state.visible is True
+    assert state.preview_text == "Create a hello world file"
+    assert state.text_length == 40
+    assert state.send_button_present is True
+    assert state.send_button_enabled is True
+    assert state.show_in_text_field_present is False
+
+
+def test_composer_has_user_text_requires_real_non_url_text() -> None:
+    assert composer_has_user_text(
+        {
+            "composer_edit_length": 40,
+            "composer_edit_preview": "Create a hello world file",
+        }
+    ) is True
+    assert composer_has_user_text(
+        {
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        }
+    ) is False
+    assert composer_has_user_text(
+        {
+            "composer_edit_length": 120,
+            "composer_edit_preview": "https://google.com/search?q=create+hello+world",
+        }
+    ) is False
+
+
+def test_prompt_confirmation_words_prefers_specific_terms() -> None:
+    words = prompt_confirmation_words(
+        "SYSTEM: Return JSON only. User goal: create a hello world file named live_browser_test",
+        policy=DEFAULT_COMPOSER_VERIFICATION_POLICY,
+    )
+
+    assert "hello" in words
+    assert "world" in words
+    assert "live" in words
+    assert "test" in words
+    assert "json" not in words
+
+
+def test_prompt_insertion_confirmed_requires_real_composer_text_not_just_send_button() -> None:
+    inserted = prompt_insertion_confirmed(
+        lines=[],
+        prompt="create hello world",
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": True,
+            "send_prompt_enabled": True,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        },
+        policy=DEFAULT_COMPOSER_VERIFICATION_POLICY,
+    )
+
+    assert inserted is False
+
+
+def test_prompt_insertion_confirmed_accepts_real_composer_text() -> None:
+    inserted = prompt_insertion_confirmed(
+        lines=[],
+        prompt="create hello world",
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": True,
+            "send_prompt_enabled": True,
+            "composer_edit_length": 40,
+            "composer_edit_preview": "Create a hello world file",
+        },
+        policy=DEFAULT_COMPOSER_VERIFICATION_POLICY,
+    )
+
+    assert inserted is True
+
+
+def test_prompt_insertion_confirmed_rejects_browser_url_text_in_composer_preview() -> None:
+    inserted = prompt_insertion_confirmed(
+        lines=[],
+        prompt="create hello world",
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": True,
+            "send_prompt_enabled": True,
+            "composer_edit_length": 120,
+            "composer_edit_preview": "https://google.com/search?q=create+hello+world",
+        },
+        policy=DEFAULT_COMPOSER_VERIFICATION_POLICY,
+    )
+
+    assert inserted is False
+
+
+def test_prompt_insertion_confirmed_ignores_generic_template_words_in_ocr() -> None:
+    inserted = prompt_insertion_confirmed(
+        lines=[_Line("ChatGPT"), _Line("Return JSON only"), _Line("Project summary")],
+        prompt="SYSTEM: Return JSON only. User goal: create a hello world file named live_browser_test",
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": True,
+            "send_prompt_enabled": True,
+            "composer_edit_length": None,
+            "composer_edit_preview": "",
+        },
+        policy=DEFAULT_COMPOSER_VERIFICATION_POLICY,
+    )
+
+    assert inserted is False
+
+
+def test_prompt_insertion_confirmed_accepts_anchor_match_when_preview_is_partial() -> None:
+    anchor = build_turn_anchor("create a hello world file named live_browser_test")
+    inserted = prompt_insertion_confirmed(
+        lines=[],
+        prompt="create a hello world file named live_browser_test",
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": True,
+            "send_prompt_enabled": True,
+            "composer_edit_length": 21,
+            "composer_edit_preview": "hello world live test",
+        },
+        prompt_anchor=anchor,
+        policy=DEFAULT_COMPOSER_VERIFICATION_POLICY,
+    )
+
+    assert inserted is True
+
+
+def test_browser_url_text_detection_flags_search_urls() -> None:
+    assert looks_like_browser_url_text("https://google.com/search?q=hello") is True
+    assert looks_like_browser_url_text("Ask anything") is False
 
 
 def test_reply_tracker_prefers_patch_candidate_over_prompt_echo() -> None:

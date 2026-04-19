@@ -13,16 +13,15 @@ from typing import Any
 from aster.audit_logger import AuditLogger
 from aster.browser_core import (
     BrowserStrategy,
+    DEFAULT_COMPOSER_VERIFICATION_POLICY,
     PageClassification,
     RecoveryAction,
     ReplyTrackerPolicy,
     ThreadRegistry,
-    build_reply_capture_result,
     build_recovery_handlers,
     build_turn_anchor,
     choose_best_reply_candidate_for_policy,
     classify_page,
-    composer_has_user_text,
     extract_structured_block,
     decide_and_execute_recovery,
     decision_payload,
@@ -35,7 +34,7 @@ from aster.browser_core import (
     merge_reply_segment_sources,
     reply_detection_blocked,
     reply_looks_incomplete,
-    reply_matches_anchor,
+    prompt_insertion_confirmed,
     score_candidate_for_policy,
     segment_looks_like_prompt_echo_for_policy,
     serialize_anchor,
@@ -126,39 +125,6 @@ PROMPT_ECHO_MARKERS = (
     "one or more exact operations",
     "deterministic. final output rules for browser mode",
 )
-
-PROMPT_CONFIRMATION_STOPWORDS = {
-    "system",
-    "user",
-    "goal",
-    "project",
-    "summary",
-    "relevant",
-    "file",
-    "files",
-    "contents",
-    "content",
-    "conversation",
-    "history",
-    "constraints",
-    "output",
-    "exact",
-    "operations",
-    "browser",
-    "mode",
-    "return",
-    "json",
-    "only",
-    "path",
-    "reason",
-    "final",
-    "rules",
-    "chatgpt",
-    "prompt",
-    "package",
-    "included_files",
-    "omitted_files",
-}
 
 REPLY_TRACKER_POLICY = ReplyTrackerPolicy(
     browser_reply_noise=BROWSER_REPLY_NOISE,
@@ -858,7 +824,13 @@ class BrowserChatGPTTransport:
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             ui_state = self._ui_state(target)
-            if self._prompt_inserted(lines, prompt, ui_state, prompt_anchor=prompt_anchor):
+            if prompt_insertion_confirmed(
+                lines,
+                prompt,
+                ui_state,
+                prompt_anchor=prompt_anchor,
+                policy=DEFAULT_COMPOSER_VERIFICATION_POLICY,
+            ):
                 self._log(
                     "prompt_inserted_confirmed",
                     {"ui_state": ui_state, "ocr_preview": [line.text[:120] for line in lines[:6]]},
@@ -867,53 +839,6 @@ class BrowserChatGPTTransport:
             time.sleep(0.5)
         self._log("prompt_inserted_missing", {"ui_state": self._ui_state(target)})
         return False
-
-    def _prompt_inserted(self, lines, prompt: str, ui_state: dict[str, Any], *, prompt_anchor=None) -> bool:
-        visible_text = "\n".join(line.text.lower() for line in lines)
-        prompt_words = self._prompt_confirmation_words(prompt)
-        matched = sum(1 for word in prompt_words if word in visible_text)
-        if ui_state.get("show_in_text_field_present"):
-            return True
-        if self._composer_has_user_text(ui_state):
-            return True
-        if prompt_anchor is not None:
-            composer_preview = str(ui_state.get("composer_edit_preview", "") or "")
-            if reply_matches_anchor(
-                build_reply_capture_result(composer_preview, "composer", 0.0, looks_complete=False, anchor=prompt_anchor),
-                prompt_anchor,
-                min_confidence=0.45,
-            ):
-                return True
-            if reply_matches_anchor(
-                build_reply_capture_result(visible_text, "ocr", 0.0, looks_complete=False, anchor=prompt_anchor),
-                prompt_anchor,
-                min_confidence=0.45,
-            ):
-                return True
-        if matched >= 2:
-            return True
-        if "system" in visible_text and matched >= 1:
-            return True
-        return False
-
-    @staticmethod
-    def _composer_has_user_text(ui_state: dict[str, Any]) -> bool:
-        return composer_has_user_text(ui_state)
-
-    @staticmethod
-    def _prompt_confirmation_words(prompt: str) -> list[str]:
-        words: list[str] = []
-        seen: set[str] = set()
-        for word in re.findall(r"[a-z0-9]{4,}", prompt.lower()):
-            if word in PROMPT_CONFIRMATION_STOPWORDS:
-                continue
-            if word in seen:
-                continue
-            seen.add(word)
-            words.append(word)
-            if len(words) >= 12:
-                break
-        return words
 
     def _find_composer_edit(self, target):
         try:

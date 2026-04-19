@@ -1,4 +1,12 @@
-from .composer_controller import build_composer_state, composer_has_user_text, looks_like_browser_url_text
+from .composer_controller import (
+    DEFAULT_COMPOSER_VERIFICATION_POLICY,
+    ComposerVerificationPolicy,
+    build_composer_state,
+    composer_has_user_text,
+    looks_like_browser_url_text,
+    prompt_confirmation_words,
+    prompt_insertion_confirmed,
+)
 from .models import (
     BrowserStrategy,
     ComposerState,
@@ -57,6 +65,8 @@ from .turn_anchor import (
 __all__ = [
     "BrowserStrategy",
     "ComposerState",
+    "ComposerVerificationPolicy",
+    "DEFAULT_COMPOSER_VERIFICATION_POLICY",
     "PageClassification",
     "RecoveryAction",
     "RecoveryDecision",
@@ -74,6 +84,8 @@ __all__ = [
     "classify_page",
     "choose_best_reply_candidate_for_policy",
     "composer_has_user_text",
+    "prompt_confirmation_words",
+    "prompt_insertion_confirmed",
     "clean_captured_segment_for_policy",
     "decide_and_execute_recovery",
     "decide_recovery",
