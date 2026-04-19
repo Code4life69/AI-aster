@@ -33,6 +33,29 @@ def reply_matches_anchor(result: ReplyCaptureResult, anchor: TurnAnchor | None, 
     return anchor_matches(anchor, result.text, min_confidence=min_confidence)
 
 
+def reply_detection_blocked(ui_state: dict[str, object]) -> bool:
+    if ui_state.get("show_in_text_field_present"):
+        return True
+    return ui_state.get("send_prompt_enabled") is True
+
+
+def looks_like_reply_started_candidate(
+    text: str,
+    *,
+    ui_state: dict[str, object],
+    score_candidate: Callable[[str], float],
+    looks_like_substantive_candidate: Callable[[str], bool],
+    looks_like_code_candidate: Callable[[str], bool],
+) -> bool:
+    if score_candidate(text) >= 20.0:
+        return True
+    if looks_like_substantive_candidate(text):
+        return True
+    if ui_state.get("send_prompt_present") or not ui_state.get("stop_streaming_present"):
+        return False
+    return looks_like_code_candidate(text)
+
+
 def choose_best_reply_candidate(
     sources: dict[str, str],
     *,

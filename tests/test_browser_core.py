@@ -2,12 +2,25 @@ from pathlib import Path
 
 from aster.browser_core.models import BrowserStrategy, ThreadRecord
 from aster.browser_core.page_classifier import classify_page
-from aster.browser_core.recovery_engine import decide_recovery, decision_payload, execute_recovery
+from aster.browser_core.recovery_engine import (
+    build_recovery_handlers,
+    decide_and_execute_recovery,
+    decide_recovery,
+    decision_payload,
+    execute_recovery,
+)
 from aster.browser_core.reply_tracker import (
     choose_best_reply_candidate,
     extract_reply_from_ocr_lines,
+    looks_like_code_reply_candidate,
+    looks_like_reply_started_candidate,
+    looks_like_substantive_reply_candidate,
+    reply_detection_blocked,
+    reply_matches_anchor,
     score_candidate,
     segment_looks_like_prompt_echo,
+    should_ignore_candidate,
+    build_reply_capture_result,
 )
 from aster.browser_core.thread_router import ThreadRegistry
 from aster.browser_core.turn_anchor import (
@@ -130,6 +143,64 @@ def test_reply_tracker_prefers_patch_candidate_over_prompt_echo() -> None:
     assert best[0] == "uia"
 
 
+def test_reply_tracker_rejects_anchor_echo_candidate() -> None:
+    anchor = build_turn_anchor("create a hello world python file in live_browser_test")
+    candidate = "Please create a hello world python file in live_browser_test."
+    capture = build_reply_capture_result(candidate, "ocr", 10.0, looks_complete=False, anchor=anchor)
+
+    assert reply_matches_anchor(capture, anchor, min_confidence=0.45) is True
+
+
+def test_reply_started_candidate_uses_extracted_helpers() -> None:
+    started = looks_like_reply_started_candidate(
+        (
+            "def build_ui(self) -> None:\n"
+            "    frame = tk.Frame(self.root)\n"
+            "    frame.pack(fill='both', expand=True)\n"
+            "    self._status_label = tk.Label(frame, text='Ready to run browser capture')\n"
+            "    self._status_label.pack()\n"
+            "    return frame\n"
+        ),
+        ui_state={
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": True,
+        },
+        score_candidate=lambda text: score_candidate(
+            text,
+            is_patch_json=lambda candidate: False,
+            prompt_echo_markers=("user goal:",),
+            stop_streaming_hints=("stop streaming",),
+            penalty_markers=(),
+            operation_markers=("CREATE FILE",),
+        ),
+        looks_like_substantive_candidate=lambda text: looks_like_substantive_reply_candidate(
+            text,
+            browser_reply_noise=("ask anything",),
+            input_too_large_hints=("input too large",),
+            prompt_echo_markers=("user goal:",),
+            is_patch_json=lambda candidate: False,
+        ),
+        looks_like_code_candidate=looks_like_code_reply_candidate,
+    )
+
+    assert reply_detection_blocked(
+        {"show_in_text_field_present": False, "send_prompt_enabled": None}
+    ) is False
+    assert started is True
+
+
+def test_reply_tracker_should_ignore_prompt_echo_candidate() -> None:
+    ignored = should_ignore_candidate(
+        "User goal:\nBuild app\nRelevant file contents:\nPATH: app.py",
+        is_patch_json=lambda candidate: False,
+        prompt_echo_markers=("user goal:", "relevant file contents:", "path:"),
+    )
+
+    assert ignored is True
+
+
 def test_reply_tracker_extracts_ocr_reply_region_without_sidebar_noise() -> None:
     before_lines = [_Line("Ask anything")]
     sidebar_line = _Line("Search chats")
@@ -174,3 +245,17 @@ def test_recovery_engine_executes_mapped_handler() -> None:
     assert decision_payload(decision)["action"] == decision.action.value
     assert executed is True
     assert invoked == [decision.action.value]
+
+
+def test_recovery_engine_decide_and_execute_uses_handler_map() -> None:
+    invoked: list[str] = []
+
+    decision = decide_and_execute_recovery(
+        None,
+        attempts_used=0,
+        max_attempts=3,
+        handlers=build_recovery_handlers(rescan=lambda: invoked.append("rescan")),
+    )
+
+    assert decision.action.value == "rescan"
+    assert invoked == ["rescan"]

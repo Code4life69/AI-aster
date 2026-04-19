@@ -18,20 +18,22 @@ from aster.browser_core import (
     RecoveryAction,
     ThreadRegistry,
     build_reply_capture_result,
+    build_recovery_handlers,
     build_turn_anchor,
     choose_best_reply_candidate,
     clean_captured_segment,
     classify_page,
     composer_has_user_text,
-    decide_recovery,
+    decide_and_execute_recovery,
     decision_payload,
-    execute_recovery,
     extract_reply_from_ocr_lines,
     looks_like_browser_url_text,
     looks_like_chatgpt_page,
     looks_like_code_reply_candidate,
+    looks_like_reply_started_candidate,
     looks_like_substantive_reply_candidate,
     merge_text_segments,
+    reply_detection_blocked,
     reply_looks_incomplete,
     reply_matches_anchor,
     score_candidate,
@@ -490,13 +492,13 @@ class BrowserChatGPTTransport:
                     "traceback": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
                 },
             )
-            recovery = decide_recovery(
+            recovery = decide_and_execute_recovery(
                 self._last_page_classification,
                 attempts_used=1,
                 max_attempts=self.max_recovery_attempts,
+                handlers=build_recovery_handlers(rescan=lambda: None),
             )
             self._log("recovery_decision", decision_payload(recovery))
-            execute_recovery(recovery, handlers={RecoveryAction.RESCAN: lambda: None})
             self._activity(
                 "browser_failed",
                 "Browser mode failed before a valid patch block was captured.",
@@ -678,19 +680,17 @@ class BrowserChatGPTTransport:
 
     @staticmethod
     def _reply_detection_blocked(ui_state: dict[str, Any]) -> bool:
-        if ui_state.get("show_in_text_field_present"):
-            return True
-        return ui_state.get("send_prompt_enabled") is True
+        return reply_detection_blocked(ui_state)
 
     @classmethod
     def _looks_like_reply_started_candidate(cls, text: str, ui_state: dict[str, Any]) -> bool:
-        if cls._score_reply_candidate(text) >= 20.0:
-            return True
-        if cls._looks_like_substantive_reply_candidate(text):
-            return True
-        if ui_state.get("send_prompt_present") or not ui_state.get("stop_streaming_present"):
-            return False
-        return cls._looks_like_code_reply_candidate(text)
+        return looks_like_reply_started_candidate(
+            text,
+            ui_state=ui_state,
+            score_candidate=cls._score_reply_candidate,
+            looks_like_substantive_candidate=cls._looks_like_substantive_reply_candidate,
+            looks_like_code_candidate=cls._looks_like_code_reply_candidate,
+        )
 
     def _needs_send_retry(self, lines, prompt: str) -> bool:
         full = "\n".join(line.text.lower() for line in lines)
@@ -1077,10 +1077,20 @@ class BrowserChatGPTTransport:
     def _prepare_chatgpt_window(self, target, chatgpt_url: str, timeout_sec: float) -> None:
         ready = self._wait_for_chatgpt_ready(target, timeout_sec=min(timeout_sec, 12.0))
         if not ready:
-            recovery = decide_recovery(
+            recovery_handlers = build_recovery_handlers(
+                rescan=lambda: None,
+                refocus_composer=lambda: self._focus_composer(target, []),
+                # Dedicated thread reopen/reattach is still pending, so conservative recovery
+                # currently falls back to direct ChatGPT navigation inside the same window.
+                reopen_thread=lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
+                reload_page=lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
+                reopen_chatgpt=lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
+            )
+            recovery = decide_and_execute_recovery(
                 self._last_page_classification,
                 attempts_used=0,
                 max_attempts=self.max_recovery_attempts,
+                handlers=recovery_handlers,
             )
             self._log("recovery_decision", decision_payload(recovery))
             if recovery.action in {RecoveryAction.RELOAD_PAGE, RecoveryAction.REOPEN_CHATGPT}:
@@ -1090,17 +1100,6 @@ class BrowserChatGPTTransport:
                     "The initial browser window did not settle into a usable ChatGPT state, so Aster is forcing a direct navigation retry.",
                     details={"url": chatgpt_url, "recovery_action": recovery.action.value},
                 )
-            execute_recovery(
-                recovery,
-                handlers={
-                    RecoveryAction.RESCAN: lambda: None,
-                    RecoveryAction.REFOCUS_COMPOSER: lambda: self._focus_composer(target, []),
-                    # Dedicated reopen/reattach logic is still pending, so conservative recovery
-                    # currently falls back to a direct ChatGPT navigation inside the same window.
-                    RecoveryAction.RELOAD_PAGE: lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
-                    RecoveryAction.REOPEN_CHATGPT: lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
-                },
-            )
             ready = self._wait_for_chatgpt_ready(target, timeout_sec=timeout_sec)
         image = self._capture.capture_region(target.left, target.top, target.width, target.height)
         lines = self._ocr.extract(image)

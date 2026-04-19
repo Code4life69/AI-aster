@@ -70,3 +70,36 @@ def execute_recovery(
         return False
     handler()
     return True
+
+
+def build_recovery_handlers(
+    *,
+    rescan: Callable[[], object] | None = None,
+    refocus_composer: Callable[[], object] | None = None,
+    reopen_thread: Callable[[], object] | None = None,
+    reload_page: Callable[[], object] | None = None,
+    reopen_chatgpt: Callable[[], object] | None = None,
+) -> dict[RecoveryAction, Callable[[], object] | None]:
+    return {
+        RecoveryAction.RESCAN: rescan,
+        RecoveryAction.REFOCUS_COMPOSER: refocus_composer,
+        RecoveryAction.REOPEN_THREAD: reopen_thread,
+        RecoveryAction.RELOAD_PAGE: reload_page,
+        RecoveryAction.REOPEN_CHATGPT: reopen_chatgpt,
+    }
+
+
+def decide_and_execute_recovery(
+    classification: PageClassification | None,
+    *,
+    attempts_used: int,
+    max_attempts: int,
+    handlers: Mapping[RecoveryAction, Callable[[], object] | None],
+) -> RecoveryDecision:
+    decision = decide_recovery(
+        classification,
+        attempts_used=attempts_used,
+        max_attempts=max_attempts,
+    )
+    execute_recovery(decision, handlers=handlers)
+    return decision
