@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import atexit
+import os
 import re
 import subprocess
 import sys
+import textwrap
 import time
 import traceback
 import webbrowser
@@ -183,75 +186,210 @@ class BrowserResult:
 
 
 class _AutomationNotice:
+    _active_process: subprocess.Popen[str] | None = None
+    _active_owner_id: int | None = None
+    _exit_cleanup_registered = False
+
     def __init__(self, logger) -> None:
         self._logger = logger
-        self._process: subprocess.Popen[str] | None = None
+        self._owner_id = id(self)
+        if not _AutomationNotice._exit_cleanup_registered:
+            atexit.register(_AutomationNotice._cleanup_at_exit)
+            _AutomationNotice._exit_cleanup_registered = True
+
+    def _log(self, event: str, payload: dict[str, Any] | None = None) -> None:
+        if self._logger is None:
+            return
+        self._logger.log("browser_transport", {"event": event, **(payload or {})})
+
+    @staticmethod
+    def _process_payload(process: subprocess.Popen[str] | None) -> dict[str, Any]:
+        if process is None:
+            return {"pid": None, "returncode": None}
+        return {
+            "pid": getattr(process, "pid", None),
+            "returncode": process.poll(),
+        }
+
+    @staticmethod
+    def _process_running(process: subprocess.Popen[str] | None) -> bool:
+        return process is not None and process.poll() is None
+
+    @staticmethod
+    def _build_script(parent_pid: int) -> str:
+        return textwrap.dedent(
+            f"""
+            import ctypes
+            import tkinter as tk
+
+            PARENT_PID = {parent_pid}
+            PROCESS_SYNCHRONIZE = 0x00100000
+            WAIT_OBJECT_0 = 0x00000000
+            WAIT_TIMEOUT = 0x00000102
+
+            def _parent_alive(pid: int) -> bool:
+                if pid <= 0:
+                    return False
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(PROCESS_SYNCHRONIZE, False, pid)
+                if not handle:
+                    return False
+                try:
+                    status = kernel32.WaitForSingleObject(handle, 0)
+                    return status == WAIT_TIMEOUT
+                finally:
+                    kernel32.CloseHandle(handle)
+
+            root = tk.Tk()
+            root.title("Aster Using Your PC")
+            root.attributes("-topmost", True)
+            root.resizable(False, False)
+            root.configure(bg="#FFF3CD")
+            root.protocol("WM_DELETE_WINDOW", lambda: None)
+            frame = tk.Frame(root, bg="#FFF3CD", padx=18, pady=14)
+            frame.pack(fill="both", expand=True)
+            tk.Label(
+                frame,
+                text="Aster is using your keyboard and mouse right now.",
+                font=("Segoe UI", 12, "bold"),
+                bg="#FFF3CD",
+                fg="#5C3B00",
+                justify="left",
+                wraplength=340,
+            ).pack(anchor="w")
+            tk.Label(
+                frame,
+                text="Please do not type, click, or move the mouse until this notice disappears.",
+                font=("Segoe UI", 10),
+                bg="#FFF3CD",
+                fg="#5C3B00",
+                justify="left",
+                wraplength=340,
+                pady=8,
+            ).pack(anchor="w")
+            root.update_idletasks()
+            width = max(root.winfo_width(), 390)
+            height = max(root.winfo_height(), 120)
+            screen_width = root.winfo_screenwidth()
+            x = max(20, screen_width - width - 30)
+            y = 30
+            root.geometry(f"{{width}}x{{height}}+{{x}}+{{y}}")
+
+            def _poll_parent() -> None:
+                if not _parent_alive(PARENT_PID):
+                    root.destroy()
+                    return
+                root.after(1000, _poll_parent)
+
+            root.after(1000, _poll_parent)
+            root.mainloop()
+            """
+        )
+
+    @classmethod
+    def _clear_active_process(cls) -> None:
+        cls._active_process = None
+        cls._active_owner_id = None
+
+    @classmethod
+    def _cleanup_at_exit(cls) -> None:
+        cls._terminate_active_process(reason="atexit", logger=None, owner_id=None)
+
+    @classmethod
+    def _terminate_active_process(
+        cls,
+        *,
+        reason: str,
+        logger,
+        owner_id: int | None,
+    ) -> bool:
+        process = cls._active_process
+        if process is None:
+            return False
+        if owner_id is not None and cls._active_owner_id not in (None, owner_id):
+            return False
+        payload = {"reason": reason, **cls._process_payload(process)}
+        if process.poll() is not None:
+            if logger is not None:
+                logger.log("browser_transport", {"event": "automation_notice_stale_detected", **payload})
+                logger.log("browser_transport", {"event": "automation_notice_stale_cleaned_up", **payload})
+            cls._clear_active_process()
+            return True
+        if reason != "hide":
+            payload["owner_id"] = cls._active_owner_id
+            if logger is not None:
+                logger.log("browser_transport", {"event": "automation_notice_stale_detected", **payload})
+        try:
+            process.terminate()
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+            except Exception as kill_exc:
+                if logger is not None:
+                    logger.log(
+                        "browser_transport",
+                        {
+                            "event": "automation_notice_terminate_failure",
+                            "reason": reason,
+                            "error": str(kill_exc),
+                            "fallback_error": str(exc),
+                            **cls._process_payload(process),
+                        },
+                    )
+                return False
+        except Exception as exc:
+            if process.poll() is not None:
+                if logger is not None:
+                    logger.log("browser_transport", {"event": "automation_notice_stale_detected", **payload})
+                    logger.log("browser_transport", {"event": "automation_notice_stale_cleaned_up", **payload})
+                cls._clear_active_process()
+                return True
+            if logger is not None:
+                logger.log(
+                    "browser_transport",
+                    {
+                        "event": "automation_notice_terminate_failure",
+                        "reason": reason,
+                        "error": str(exc),
+                        **cls._process_payload(process),
+                    },
+                )
+            return False
+        payload = {"reason": reason, **cls._process_payload(process)}
+        if logger is not None:
+            event = "automation_notice_stale_cleaned_up" if reason != "hide" else "automation_notice_hide"
+            logger.log("browser_transport", {"event": event, **payload})
+        cls._clear_active_process()
+        return True
 
     def show(self) -> None:
-        if self._process is not None and self._process.poll() is None:
+        if self._process_running(type(self)._active_process) and type(self)._active_owner_id == self._owner_id:
             return
-        script = """
-import tkinter as tk
-
-root = tk.Tk()
-root.title("Aster Using Your PC")
-root.attributes("-topmost", True)
-root.resizable(False, False)
-root.configure(bg="#FFF3CD")
-root.protocol("WM_DELETE_WINDOW", lambda: None)
-frame = tk.Frame(root, bg="#FFF3CD", padx=18, pady=14)
-frame.pack(fill="both", expand=True)
-tk.Label(
-    frame,
-    text="Aster is using your keyboard and mouse right now.",
-    font=("Segoe UI", 12, "bold"),
-    bg="#FFF3CD",
-    fg="#5C3B00",
-    justify="left",
-    wraplength=340,
-).pack(anchor="w")
-tk.Label(
-    frame,
-    text="Please do not type, click, or move the mouse until this notice disappears.",
-    font=("Segoe UI", 10),
-    bg="#FFF3CD",
-    fg="#5C3B00",
-    justify="left",
-    wraplength=340,
-    pady=8,
-).pack(anchor="w")
-root.update_idletasks()
-width = max(root.winfo_width(), 390)
-height = max(root.winfo_height(), 120)
-screen_width = root.winfo_screenwidth()
-x = max(20, screen_width - width - 30)
-y = 30
-root.geometry(f"{width}x{height}+{x}+{y}")
-root.mainloop()
-"""
+        type(self)._terminate_active_process(reason="show_before_launch", logger=self._logger, owner_id=None)
+        script = self._build_script(os.getpid())
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
-            self._process = subprocess.Popen(
+            process = subprocess.Popen(
                 [sys.executable, "-c", script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
             )
+            type(self)._active_process = process
+            type(self)._active_owner_id = self._owner_id
             time.sleep(0.35)
+            self._log("automation_notice_show", self._process_payload(process))
         except Exception as exc:
-            self._process = None
+            type(self)._clear_active_process()
+            self._log("automation_notice_launch_failure", {"error": str(exc)})
             if self._logger is not None:
                 self._logger.log("browser_transport", {"event": "automation_notice_unavailable", "error": str(exc)})
+            return
 
     def hide(self) -> None:
-        if self._process is None:
-            return
-        try:
-            self._process.terminate()
-            self._process.wait(timeout=2.0)
-        except Exception:
-            pass
-        self._process = None
+        type(self)._terminate_active_process(reason="hide", logger=self._logger, owner_id=self._owner_id)
 
 
 class BrowserChatGPTTransport:
@@ -542,7 +680,6 @@ class BrowserChatGPTTransport:
             self._stop_runtime_log_heartbeat()
 
     def _show_automation_notice(self) -> None:
-        self._log("automation_notice_show", {})
         self._activity(
             "browser_takeover_notice",
             "Aster is about to use the keyboard and mouse.",
@@ -552,7 +689,6 @@ class BrowserChatGPTTransport:
 
     def _hide_automation_notice(self) -> None:
         self._automation_notice.hide()
-        self._log("automation_notice_hide", {})
 
     def _stabilize_and_send(self, target, before_lines, prompt: str) -> None:
         deadline = time.monotonic() + 35.0

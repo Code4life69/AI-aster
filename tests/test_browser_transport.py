@@ -1,3 +1,5 @@
+import subprocess
+
 from aster.browser_core.reply_tracker import (
     clean_captured_segment_for_policy,
     extract_structured_block,
@@ -11,6 +13,7 @@ from aster.browser_core.reply_tracker import (
 from aster.transport_browser.browser_transport import (
     BrowserChatGPTTransport,
     REPLY_TRACKER_POLICY,
+    _AutomationNotice,
     summarize_controls_near_composer_area,
     summarize_edit_candidates,
     summarize_named_button_candidates,
@@ -107,6 +110,178 @@ def test_summarize_edit_candidates_flags_below_threshold() -> None:
 
     assert summary["composer_candidate_below_threshold"] is True
     assert summary["top_candidates"][0]["above_threshold"] is False
+
+
+class _FakeAuditLogger:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def log(self, namespace: str, payload: dict[str, object]) -> None:
+        assert namespace == "browser_transport"
+        self.events.append(payload)
+
+
+class _FakeNoticeProcess:
+    _next_pid = 5000
+
+    def __init__(
+        self,
+        *,
+        running: bool = True,
+        terminate_error: Exception | None = None,
+        wait_timeout: bool = False,
+    ) -> None:
+        type(self)._next_pid += 1
+        self.pid = type(self)._next_pid
+        self.returncode = None if running else 0
+        self.terminate_error = terminate_error
+        self.wait_timeout = wait_timeout
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        if self.terminate_error is not None:
+            raise self.terminate_error
+        if not self.wait_timeout:
+            self.returncode = 0
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        if self.wait_timeout and self.returncode is None:
+            raise subprocess.TimeoutExpired("notice", timeout)
+        return self.returncode
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.returncode = -9
+
+
+def _reset_notice_state() -> None:
+    _AutomationNotice._active_process = None
+    _AutomationNotice._active_owner_id = None
+
+
+def _notice_events(logger: _FakeAuditLogger, event: str) -> list[dict[str, object]]:
+    return [payload for payload in logger.events if payload.get("event") == event]
+
+
+def test_automation_notice_script_watches_parent_pid() -> None:
+    script = _AutomationNotice._build_script(4321)
+
+    assert "PARENT_PID = 4321" in script
+    assert "def _poll_parent()" in script
+    assert "root.after(1000, _poll_parent)" in script
+
+
+def test_automation_notice_show_cleans_stale_dead_process_before_launch(monkeypatch) -> None:
+    _reset_notice_state()
+    logger = _FakeAuditLogger()
+    stale_process = _FakeNoticeProcess(running=False)
+    launched_process = _FakeNoticeProcess(running=True)
+    _AutomationNotice._active_process = stale_process
+    _AutomationNotice._active_owner_id = 111
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: launched_process)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+
+    notice = _AutomationNotice(logger)
+    notice.show()
+
+    assert _AutomationNotice._active_process is launched_process
+    assert _notice_events(logger, "automation_notice_stale_detected")
+    assert _notice_events(logger, "automation_notice_stale_cleaned_up")
+    assert _notice_events(logger, "automation_notice_show")
+    _reset_notice_state()
+
+
+def test_automation_notice_show_replaces_running_notice_from_other_owner(monkeypatch) -> None:
+    _reset_notice_state()
+    logger = _FakeAuditLogger()
+    original_process = _FakeNoticeProcess(running=True)
+    replacement_process = _FakeNoticeProcess(running=True)
+    first_notice = _AutomationNotice(logger)
+    second_notice = _AutomationNotice(logger)
+    _AutomationNotice._active_process = original_process
+    _AutomationNotice._active_owner_id = first_notice._owner_id
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: replacement_process)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+
+    second_notice.show()
+
+    assert original_process.terminate_calls == 1
+    assert _AutomationNotice._active_process is replacement_process
+    assert _AutomationNotice._active_owner_id == second_notice._owner_id
+    assert _notice_events(logger, "automation_notice_stale_detected")
+    assert _notice_events(logger, "automation_notice_stale_cleaned_up")
+    _reset_notice_state()
+
+
+def test_automation_notice_show_is_noop_for_same_owner(monkeypatch) -> None:
+    _reset_notice_state()
+    logger = _FakeAuditLogger()
+    active_process = _FakeNoticeProcess(running=True)
+    notice = _AutomationNotice(logger)
+    _AutomationNotice._active_process = active_process
+    _AutomationNotice._active_owner_id = notice._owner_id
+
+    def _unexpected_popen(*args, **kwargs):
+        raise AssertionError("show() should not relaunch an already-visible notice for the same owner")
+
+    monkeypatch.setattr(subprocess, "Popen", _unexpected_popen)
+    notice.show()
+
+    assert active_process.terminate_calls == 0
+    assert _AutomationNotice._active_process is active_process
+    assert not _notice_events(logger, "automation_notice_show")
+    _reset_notice_state()
+
+
+def test_automation_notice_hide_cleans_dead_process_handle() -> None:
+    _reset_notice_state()
+    logger = _FakeAuditLogger()
+    notice = _AutomationNotice(logger)
+    dead_process = _FakeNoticeProcess(running=False)
+    _AutomationNotice._active_process = dead_process
+    _AutomationNotice._active_owner_id = notice._owner_id
+
+    notice.hide()
+
+    assert _AutomationNotice._active_process is None
+    assert _notice_events(logger, "automation_notice_stale_detected")
+    assert _notice_events(logger, "automation_notice_stale_cleaned_up")
+    _reset_notice_state()
+
+
+def test_automation_notice_show_logs_launch_failure(monkeypatch) -> None:
+    _reset_notice_state()
+    logger = _FakeAuditLogger()
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("launch failed")))
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+
+    notice = _AutomationNotice(logger)
+    notice.show()
+
+    assert _notice_events(logger, "automation_notice_launch_failure")
+    assert _notice_events(logger, "automation_notice_unavailable")
+    assert _AutomationNotice._active_process is None
+    _reset_notice_state()
+
+
+def test_automation_notice_hide_logs_terminate_failure() -> None:
+    _reset_notice_state()
+    logger = _FakeAuditLogger()
+    notice = _AutomationNotice(logger)
+    stuck_process = _FakeNoticeProcess(running=True, terminate_error=PermissionError("access denied"))
+    _AutomationNotice._active_process = stuck_process
+    _AutomationNotice._active_owner_id = notice._owner_id
+
+    notice.hide()
+
+    assert _notice_events(logger, "automation_notice_terminate_failure")
+    assert _AutomationNotice._active_process is stuck_process
+    _reset_notice_state()
 
 
 class _FakeExecutor:
