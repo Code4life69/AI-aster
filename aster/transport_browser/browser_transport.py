@@ -280,6 +280,8 @@ class BrowserChatGPTTransport:
         self.log_screenshots = log_screenshots
         self.max_recovery_attempts = max_recovery_attempts
         self._last_page_classification: PageClassification | None = None
+        self._last_uia_control_diagnostics: dict[str, Any] | None = None
+        self._last_uia_diagnostic_signature = ""
 
     def _log(self, event: str, payload: dict[str, Any]) -> None:
         if self._logger is None:
@@ -725,6 +727,114 @@ class BrowserChatGPTTransport:
     def _click_named_button(self, target, phrase: str) -> bool:
         return self._click_named_control(target, phrase, control_types=("Button",))
 
+    def _log_uia_diagnostic(self, event: str, payload: dict[str, Any]) -> None:
+        signature = f"{event}:{payload}"
+        if signature == self._last_uia_diagnostic_signature:
+            return
+        self._last_uia_diagnostic_signature = signature
+        self._log(event, payload)
+
+    @staticmethod
+    def _control_rect_tuple(rect) -> tuple[int, int, int, int]:
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+    @classmethod
+    def _control_is_near_composer_area(cls, target, rect, control_type: str) -> bool:
+        rel_top = rect.top - target.top
+        rel_bottom = rect.bottom - target.top
+        rel_left = rect.left - target.left
+        if rel_bottom < target.height * 0.45:
+            return False
+        if rel_left < target.width * 0.12 and control_type not in {"Edit", "Button"}:
+            return False
+        return control_type in {"Edit", "Button", "Text", "Document", "Group"}
+
+    @classmethod
+    def _score_named_button_candidate(cls, target, rect, name: str, phrase: str) -> float:
+        normalized = _normalize(name)
+        phrase_normalized = _normalize(phrase)
+        rel_left = rect.left - target.left
+        rel_top = rect.top - target.top
+        width = max(0, rect.right - rect.left)
+        height = max(0, rect.bottom - rect.top)
+        score = 0.0
+        if phrase_normalized and phrase_normalized in normalized:
+            score += 140.0
+        if "send" in normalized:
+            score += 70.0
+        for token in re.findall(r"[a-z0-9]{3,}", phrase_normalized):
+            if token in normalized:
+                score += 30.0
+        if rel_top >= target.height * 0.55:
+            score += 25.0
+        if rel_left >= target.width * 0.72:
+            score += 25.0
+        if 18 <= height <= 72:
+            score += 10.0
+        if 20 <= width <= target.width * 0.22:
+            score += 10.0
+        if normalized in {"share", "show in text field", "stop streaming", "stop generating"}:
+            score -= 60.0
+        return score
+
+    def _build_uia_control_diagnostics(self, target, *, phrase: str = "send prompt") -> dict[str, Any]:
+        diagnostics: dict[str, Any] = {
+            "nearby_controls": [],
+            "button_candidates": summarize_named_button_candidates([]),
+            "edit_candidates": summarize_edit_candidates([]),
+        }
+        try:
+            window = Desktop(backend="uia").window(handle=target.handle)
+            nearby_controls: list[dict[str, Any]] = []
+            button_candidates: list[dict[str, Any]] = []
+            edit_candidates: list[dict[str, Any]] = []
+            for ctrl in window.descendants():
+                try:
+                    control_type = str(ctrl.element_info.control_type or "")
+                    rect = ctrl.rectangle()
+                    name = " ".join((ctrl.window_text() or "").split())
+                except Exception:
+                    continue
+                try:
+                    enabled = ctrl.is_enabled()
+                except Exception:
+                    enabled = None
+                rect_tuple = self._control_rect_tuple(rect)
+                raw = {
+                    "control_type": control_type,
+                    "name": name,
+                    "rect": rect_tuple,
+                    "enabled": enabled,
+                }
+                if self._control_is_near_composer_area(target, rect, control_type):
+                    nearby_controls.append(raw)
+                if control_type == "Button":
+                    match_score = self._score_named_button_candidate(target, rect, name, phrase)
+                    button_candidates.append(
+                        {
+                            **raw,
+                            "match_score": match_score,
+                            "exact_match": bool(phrase and _normalize(phrase) in _normalize(name)),
+                            "looks_send_like": match_score >= 55.0 and bool(name),
+                        }
+                    )
+                if control_type == "Edit":
+                    edit_candidates.append(
+                        {
+                            **raw,
+                            "score": self._score_composer_edit_candidate(target, rect, name),
+                        }
+                    )
+            diagnostics = {
+                "nearby_controls": summarize_controls_near_composer_area(nearby_controls),
+                "button_candidates": summarize_named_button_candidates(button_candidates),
+                "edit_candidates": summarize_edit_candidates(edit_candidates),
+            }
+        except Exception as exc:
+            diagnostics["inspection_error"] = str(exc)
+        self._last_uia_control_diagnostics = diagnostics
+        return diagnostics
+
     def _click_named_control(self, target, phrase: str, control_types: tuple[str, ...] | None = None) -> bool:
         try:
             window = Desktop(backend="uia").window(handle=target.handle)
@@ -738,14 +848,44 @@ class BrowserChatGPTTransport:
                     if control_type not in control_types:
                         continue
                 if phrase in name:
-                    if self._invoke_button(ctrl):
-                        self._log("button_invoke", {"phrase": phrase, "name": name, "method": "invoke"})
+                    try:
+                        if self._invoke_button(ctrl):
+                            self._log("button_invoke", {"phrase": phrase, "name": name, "method": "invoke"})
+                            return True
+                        ctrl.click_input()
+                        self._log("button_invoke", {"phrase": phrase, "name": name, "method": "click_input"})
                         return True
-                    ctrl.click_input()
-                    self._log("button_invoke", {"phrase": phrase, "name": name, "method": "click_input"})
-                    return True
-        except Exception:
+                    except Exception as exc:
+                        self._log_uia_diagnostic(
+                            "named_control_click_failed",
+                            {
+                                "phrase": phrase,
+                                "name": name,
+                                "control_types": list(control_types or ()),
+                                "error": str(exc),
+                                "uia_control_diagnostics": self._build_uia_control_diagnostics(target, phrase=phrase),
+                            },
+                        )
+                        return False
+        except Exception as exc:
+            self._log_uia_diagnostic(
+                "named_control_search_failed",
+                {
+                    "phrase": phrase,
+                    "control_types": list(control_types or ()),
+                    "error": str(exc),
+                    "uia_control_diagnostics": self._build_uia_control_diagnostics(target, phrase=phrase),
+                },
+            )
             return False
+        self._log_uia_diagnostic(
+            "named_control_search_failed",
+            {
+                "phrase": phrase,
+                "control_types": list(control_types or ()),
+                "uia_control_diagnostics": self._build_uia_control_diagnostics(target, phrase=phrase),
+            },
+        )
         return False
 
     def _populate_prompt_directly(self, target, prompt: str, *, prompt_anchor=None) -> bool:
@@ -855,6 +995,7 @@ class BrowserChatGPTTransport:
             window = Desktop(backend="uia").window(handle=target.handle)
             best = None
             best_score = float("-inf")
+            candidates: list[dict[str, Any]] = []
             for ctrl in window.descendants(control_type="Edit"):
                 try:
                     name = (ctrl.window_text() or "").strip().lower()
@@ -864,10 +1005,25 @@ class BrowserChatGPTTransport:
                 if "chatgpt.com" in name:
                     continue
                 score = self._score_composer_edit_candidate(target, rect, name)
+                candidates.append(
+                    {
+                        "name": name,
+                        "rect": self._control_rect_tuple(rect),
+                        "enabled": None,
+                        "score": score,
+                    }
+                )
                 if score > best_score:
                     best = ctrl
                     best_score = score
             if best_score < 0:
+                self._log_uia_diagnostic(
+                    "composer_edit_not_found",
+                    {
+                        "edit_candidates": summarize_edit_candidates(candidates),
+                        "uia_control_diagnostics": self._build_uia_control_diagnostics(target),
+                    },
+                )
                 return None
             return best
         except Exception:
@@ -1066,7 +1222,8 @@ class BrowserChatGPTTransport:
             ready = self._wait_for_chatgpt_ready(target, timeout_sec=timeout_sec)
         image = self._capture.capture_region(target.left, target.top, target.width, target.height)
         lines = self._ocr.extract(image)
-        analysis = self._analyze_screen(target, lines=lines)
+        final_ui_state = self._ui_state(target, include_uia_diagnostics=not ready)
+        analysis = self._analyze_screen(target, lines=lines, ui_state=final_ui_state)
         failure = self._page_readiness_failure_details(analysis)
         if failure["code"] == "wrong_page_detected":
             self._log("wrong_page_detected", self._page_readiness_log_payload(analysis, failure))
@@ -1144,7 +1301,8 @@ class BrowserChatGPTTransport:
                 )
                 return True
             time.sleep(0.6)
-        timeout_analysis = self._analyze_screen(target)
+        timeout_ui_state = self._ui_state(target, include_uia_diagnostics=True)
+        timeout_analysis = self._analyze_screen(target, ui_state=timeout_ui_state)
         failure = self._page_readiness_failure_details(timeout_analysis)
         self._log("window_ready_timeout", self._page_readiness_log_payload(timeout_analysis, failure))
         return False
@@ -1528,7 +1686,7 @@ class BrowserChatGPTTransport:
         failure: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         details = failure or self._page_readiness_failure_details(analysis)
-        return {
+        payload = {
             "failure_code": details["code"],
             "failure_reason": details["reason"],
             "window_title": str(analysis.ui_state.get("window_title", "") or ""),
@@ -1556,6 +1714,10 @@ class BrowserChatGPTTransport:
             "page_classification": self._screen_analysis_payload(analysis),
             "ui_state": analysis.ui_state,
         }
+        uia_diagnostics = analysis.ui_state.get("uia_control_diagnostics")
+        if isinstance(uia_diagnostics, dict):
+            payload["uia_control_diagnostics"] = uia_diagnostics
+        return payload
 
     @staticmethod
     def _page_readiness_error_message(failure: dict[str, Any]) -> str:
@@ -1674,7 +1836,7 @@ class BrowserChatGPTTransport:
             self._last_window_state = signature
             self._log("window_state", payload)
 
-    def _ui_state(self, target) -> dict[str, Any]:
+    def _ui_state(self, target, *, include_uia_diagnostics: bool = False) -> dict[str, Any]:
         state: dict[str, Any] = {
             "window_title": getattr(target, "title", ""),
             "send_prompt_present": False,
@@ -1707,9 +1869,124 @@ class BrowserChatGPTTransport:
                 except Exception:
                     state["composer_edit_length"] = "unknown"
                     state["composer_edit_preview"] = "unknown"
+            if include_uia_diagnostics:
+                state["uia_control_diagnostics"] = self._build_uia_control_diagnostics(target)
         except Exception as exc:
             state["inspection_error"] = str(exc)
         return state
+
+
+def summarize_controls_near_composer_area(
+    controls: list[dict[str, Any]],
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    priority = {"Edit": 0, "Button": 1, "Text": 2, "Document": 3, "Group": 4}
+
+    def sort_key(item: dict[str, Any]) -> tuple[float, float, float]:
+        rect = item.get("rect") or (0, 0, 0, 0)
+        return (
+            float(priority.get(str(item.get("control_type", "")), 9)),
+            float(rect[1]),
+            float(rect[0]),
+        )
+
+    summary: list[dict[str, Any]] = []
+    for item in sorted(controls, key=sort_key)[:limit]:
+        entry = {
+            "control_type": str(item.get("control_type", "")),
+            "name": str(item.get("name", ""))[:120],
+            "rect": _compact_rect(item.get("rect")),
+        }
+        enabled = item.get("enabled")
+        if enabled is not None:
+            entry["enabled"] = enabled
+        summary.append(entry)
+    return summary
+
+
+def summarize_named_button_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    limit: int = 6,
+) -> dict[str, Any]:
+    ordered = sorted(
+        candidates,
+        key=lambda item: (
+            -float(item.get("match_score", float("-inf"))),
+            0 if item.get("exact_match") else 1,
+            -int(bool(item.get("enabled"))),
+        ),
+    )
+    top_candidates: list[dict[str, Any]] = []
+    send_like_names: list[str] = []
+
+    for item in ordered[:limit]:
+        name = str(item.get("name", ""))[:120]
+        looks_send_like = bool(item.get("looks_send_like"))
+        if looks_send_like and name and name not in send_like_names:
+            send_like_names.append(name)
+        top_candidates.append(
+            {
+                "name": name,
+                "rect": _compact_rect(item.get("rect")),
+                "enabled": item.get("enabled"),
+                "match_score": round(float(item.get("match_score", 0.0)), 1),
+                "exact_match": bool(item.get("exact_match")),
+                "looks_send_like": looks_send_like,
+            }
+        )
+
+    return {
+        "top_candidates": top_candidates,
+        "exact_match_found": any(bool(item.get("exact_match")) for item in candidates),
+        "send_like_button_detected": any(bool(item.get("looks_send_like")) for item in candidates),
+        "send_like_button_with_different_label": any(
+            bool(item.get("looks_send_like")) and not bool(item.get("exact_match")) for item in candidates
+        ),
+        "send_like_button_names": send_like_names[:3],
+    }
+
+
+def summarize_edit_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    threshold: float = 0.0,
+    limit: int = 5,
+) -> dict[str, Any]:
+    ordered = sorted(candidates, key=lambda item: -float(item.get("score", float("-inf"))))
+    top_candidates: list[dict[str, Any]] = []
+
+    for item in ordered[:limit]:
+        score = float(item.get("score", 0.0))
+        top_candidates.append(
+            {
+                "name": str(item.get("name", ""))[:120],
+                "rect": _compact_rect(item.get("rect")),
+                "enabled": item.get("enabled"),
+                "score": round(score, 1),
+                "above_threshold": score >= threshold,
+            }
+        )
+
+    best_score = float(ordered[0].get("score", float("-inf"))) if ordered else None
+    return {
+        "top_candidates": top_candidates,
+        "best_score": round(best_score, 1) if best_score is not None else None,
+        "composer_candidate_below_threshold": bool(ordered) and best_score is not None and best_score < threshold,
+    }
+
+
+def _compact_rect(rect: Any) -> dict[str, int]:
+    if isinstance(rect, tuple) and len(rect) == 4:
+        left, top, right, bottom = rect
+        return {
+            "left": int(left),
+            "top": int(top),
+            "right": int(right),
+            "bottom": int(bottom),
+        }
+    return {"left": 0, "top": 0, "right": 0, "bottom": 0}
 
 
 def _normalize(text: str) -> str:

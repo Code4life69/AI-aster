@@ -8,7 +8,13 @@ from aster.browser_core.reply_tracker import (
     segment_looks_like_prompt_echo_for_policy,
     should_ignore_candidate_for_policy,
 )
-from aster.transport_browser.browser_transport import BrowserChatGPTTransport, REPLY_TRACKER_POLICY
+from aster.transport_browser.browser_transport import (
+    BrowserChatGPTTransport,
+    REPLY_TRACKER_POLICY,
+    summarize_controls_near_composer_area,
+    summarize_edit_candidates,
+    summarize_named_button_candidates,
+)
 
 
 def test_extract_structured_block_prefers_fenced_json() -> None:
@@ -42,6 +48,65 @@ def test_extract_structured_block_prefers_aster_markers() -> None:
     parsed = extract_structured_block(raw)
     assert parsed.startswith("{")
     assert '"CREATE FILE"' in parsed
+
+
+def test_summarize_controls_near_composer_area_limits_and_compacts() -> None:
+    summary = summarize_controls_near_composer_area(
+        [
+            {"control_type": "Text", "name": "Helper text", "rect": (40, 620, 240, 650), "enabled": True},
+            {"control_type": "Edit", "name": "Ask anything", "rect": (120, 680, 960, 760), "enabled": True},
+            {"control_type": "Button", "name": "Send prompt", "rect": (980, 700, 1030, 744), "enabled": True},
+        ],
+        limit=2,
+    )
+
+    assert len(summary) == 2
+    assert summary[0]["control_type"] == "Edit"
+    assert summary[0]["rect"]["top"] == 680
+    assert summary[1]["control_type"] == "Button"
+
+
+def test_summarize_named_button_candidates_flags_send_like_variant() -> None:
+    summary = summarize_named_button_candidates(
+        [
+            {
+                "name": "Submit message",
+                "rect": (980, 700, 1030, 744),
+                "enabled": True,
+                "match_score": 88.0,
+                "exact_match": False,
+                "looks_send_like": True,
+            },
+            {
+                "name": "Show in text field",
+                "rect": (860, 700, 970, 744),
+                "enabled": True,
+                "match_score": 12.0,
+                "exact_match": False,
+                "looks_send_like": False,
+            },
+        ]
+    )
+
+    assert summary["send_like_button_detected"] is True
+    assert summary["send_like_button_with_different_label"] is True
+    assert "Submit message" in summary["send_like_button_names"]
+
+
+def test_summarize_edit_candidates_flags_below_threshold() -> None:
+    summary = summarize_edit_candidates(
+        [
+            {
+                "name": "Search address bar",
+                "rect": (140, 80, 840, 120),
+                "enabled": True,
+                "score": -35.0,
+            }
+        ]
+    )
+
+    assert summary["composer_candidate_below_threshold"] is True
+    assert summary["top_candidates"][0]["above_threshold"] is False
 
 
 class _FakeExecutor:
@@ -428,6 +493,37 @@ def test_page_readiness_failure_classifies_composer_missing() -> None:
 
     assert failure["code"] == "composer_missing"
     assert "composer" in failure["reason"].lower()
+
+
+def test_page_readiness_payload_includes_uia_control_diagnostics_when_present() -> None:
+    transport = BrowserChatGPTTransport()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+
+    analysis = transport._analyze_screen(
+        _Target(),
+        lines=[_Line("Ask anything")],
+        ui_state={
+            "window_title": "ChatGPT - Google Chrome",
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "show_in_text_field_present": False,
+            "stop_streaming_present": False,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+            "uia_control_diagnostics": {
+                "nearby_controls": [{"control_type": "Edit", "name": "Ask anything"}],
+                "button_candidates": {"top_candidates": []},
+                "edit_candidates": {"top_candidates": []},
+            },
+        },
+    )
+
+    payload = transport._page_readiness_log_payload(analysis)
+
+    assert "uia_control_diagnostics" in payload
+    assert payload["uia_control_diagnostics"]["nearby_controls"][0]["control_type"] == "Edit"
 
 
 def test_page_readiness_failure_classifies_still_loading() -> None:
