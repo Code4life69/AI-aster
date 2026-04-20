@@ -15,6 +15,9 @@ def test_default_config_uses_browser_mode(tmp_path: Path) -> None:
     assert config.verification_level == "basic"
     assert config.log_screenshots is False
     assert config.max_recovery_attempts == 3
+    assert config.runtime_log_heartbeat_push_enabled is False
+    assert config.runtime_log_heartbeat_interval_seconds == 30
+    assert config.runtime_log_heartbeat_branch_only is True
     assert config.auto_commit_and_push is True
     assert config.approval_required_for_commands is True
     assert config.push_runtime_logs_after_plan is True
@@ -30,7 +33,10 @@ def test_config_loader_reads_new_browser_fields(tmp_path: Path) -> None:
   "thread_registry_path": ".aster/custom_threads.json",
   "verification_level": "strict",
   "log_screenshots": true,
-  "max_recovery_attempts": 5
+  "max_recovery_attempts": 5,
+  "runtime_log_heartbeat_push_enabled": true,
+  "runtime_log_heartbeat_interval_seconds": 45,
+  "runtime_log_heartbeat_branch_only": false
 }
 """.strip(),
         encoding="utf-8",
@@ -44,3 +50,6 @@ def test_config_loader_reads_new_browser_fields(tmp_path: Path) -> None:
     assert config.verification_level == "strict"
     assert config.log_screenshots is True
     assert config.max_recovery_attempts == 5
+    assert config.runtime_log_heartbeat_push_enabled is True
+    assert config.runtime_log_heartbeat_interval_seconds == 45
+    assert config.runtime_log_heartbeat_branch_only is False

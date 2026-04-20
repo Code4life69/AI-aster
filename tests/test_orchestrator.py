@@ -18,6 +18,7 @@ class _FakeGit:
         self.runtime_commit_paths: list[list[str]] = []
         self.push_calls = 0
         self.pull_calls = 0
+        self.branch = "feature/debug"
 
     def sync_pull(self) -> list[str]:
         self.pull_calls += 1
@@ -26,16 +27,26 @@ class _FakeGit:
     def commit_all_if_needed(self, message: str, exclude_paths: list[str] | None = None) -> list[str]:
         self.commit_messages.append(message)
         self.commit_exclude_paths.append(list(exclude_paths or []))
-        return [f"commit {message}"]
+        return [
+            "git add -A -- . -> 0: ",
+            f"git commit -m {message} -> 0: committed",
+        ]
 
     def commit_paths_if_needed(self, message: str, paths: list[str]) -> list[str]:
         self.runtime_commit_messages.append(message)
         self.runtime_commit_paths.append(list(paths))
-        return [f"commit selected {message}"]
+        joined_paths = " ".join(paths)
+        return [
+            f"git add -A -- {joined_paths} -> 0: ",
+            f"git commit -m {message} -> 0: committed",
+        ]
 
     def sync_push(self) -> list[str]:
         self.push_calls += 1
         return ["push"]
+
+    def current_branch(self) -> str:
+        return self.branch
 
 
 class _FakeBrowserResult:
@@ -160,3 +171,35 @@ def test_plan_pushes_runtime_logs_after_generation(tmp_path: Path) -> None:
     assert orchestrator.git.runtime_commit_messages[-1] == "sync runtime logs after plan"
     assert orchestrator.git.runtime_commit_paths[-1] == list(AsterOrchestrator.RUNTIME_LOG_PATHS)
     assert orchestrator.git.push_calls == 1
+
+
+def test_sync_runtime_logs_skips_push_when_no_runtime_log_changes_exist(tmp_path: Path) -> None:
+    class _NoChangeGit(_FakeGit):
+        def commit_paths_if_needed(self, message: str, paths: list[str]) -> list[str]:
+            self.runtime_commit_messages.append(message)
+            self.runtime_commit_paths.append(list(paths))
+            return ["Git commit skipped: no changes detected in selected paths."]
+
+    config = _config(tmp_path)
+    orchestrator = AsterOrchestrator(config)
+    orchestrator.git = _NoChangeGit()
+
+    results = orchestrator.sync_runtime_logs("debug heartbeat runtime logs")
+
+    assert orchestrator.git.runtime_commit_messages[-1] == "debug heartbeat runtime logs"
+    assert orchestrator.git.push_calls == 0
+    assert results == ["Git commit skipped: no changes detected in selected paths."]
+
+
+def test_orchestrator_wires_runtime_log_heartbeat_into_browser_transport(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.runtime_log_heartbeat_push_enabled = True
+    config.runtime_log_heartbeat_interval_seconds = 45
+    config.runtime_log_heartbeat_branch_only = False
+
+    orchestrator = AsterOrchestrator(config)
+
+    assert orchestrator.runtime_log_heartbeat.enabled is True
+    assert orchestrator.runtime_log_heartbeat.interval_seconds == 45
+    assert orchestrator.runtime_log_heartbeat.branch_only is False
+    assert orchestrator.browser_transport._runtime_log_heartbeat is orchestrator.runtime_log_heartbeat

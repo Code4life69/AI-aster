@@ -42,6 +42,18 @@ def load_config(project_root: Path, config_path: Path | None = None) -> AsterCon
         verification_level=str(data.get("verification_level", config.verification_level)),
         log_screenshots=bool(data.get("log_screenshots", config.log_screenshots)),
         max_recovery_attempts=int(data.get("max_recovery_attempts", config.max_recovery_attempts)),
+        runtime_log_heartbeat_push_enabled=bool(
+            data.get("runtime_log_heartbeat_push_enabled", config.runtime_log_heartbeat_push_enabled)
+        ),
+        runtime_log_heartbeat_interval_seconds=int(
+            data.get(
+                "runtime_log_heartbeat_interval_seconds",
+                config.runtime_log_heartbeat_interval_seconds,
+            )
+        ),
+        runtime_log_heartbeat_branch_only=bool(
+            data.get("runtime_log_heartbeat_branch_only", config.runtime_log_heartbeat_branch_only)
+        ),
         auto_apply=bool(data.get("auto_apply", config.auto_apply)),
         git_integration=bool(data.get("git_integration", config.git_integration)),
         auto_commit_and_push=bool(data.get("auto_commit_and_push", config.auto_commit_and_push)),

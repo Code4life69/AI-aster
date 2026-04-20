@@ -40,6 +40,7 @@ from aster.browser_core import (
     serialize_anchor,
     window_title_suggests_existing_chat,
 )
+from aster.runtime_log_heartbeat import RuntimeLogHeartbeatPusher
 
 
 BROWSER_REPLY_NOISE = (
@@ -266,6 +267,7 @@ class BrowserChatGPTTransport:
         verification_level: str = "basic",
         log_screenshots: bool = False,
         max_recovery_attempts: int = 3,
+        runtime_log_heartbeat: RuntimeLogHeartbeatPusher | None = None,
     ) -> None:
         self._executor = None
         self._capture = None
@@ -279,6 +281,7 @@ class BrowserChatGPTTransport:
         self.verification_level = verification_level
         self.log_screenshots = log_screenshots
         self.max_recovery_attempts = max_recovery_attempts
+        self._runtime_log_heartbeat = runtime_log_heartbeat
         self._last_page_classification: PageClassification | None = None
         self._last_uia_control_diagnostics: dict[str, Any] | None = None
         self._last_uia_diagnostic_signature = ""
@@ -300,6 +303,21 @@ class BrowserChatGPTTransport:
         if self._logger is None:
             return
         self._logger.activity(step, message, why, status=status, details=details)
+
+    def _start_runtime_log_heartbeat(self) -> None:
+        if self._runtime_log_heartbeat is None:
+            return
+        self._runtime_log_heartbeat.start_run()
+
+    def _stop_runtime_log_heartbeat(self) -> None:
+        if self._runtime_log_heartbeat is None:
+            return
+        self._runtime_log_heartbeat.stop_run()
+
+    def _tick_runtime_log_heartbeat(self, reason: str) -> None:
+        if self._runtime_log_heartbeat is None:
+            return
+        self._runtime_log_heartbeat.tick(reason=reason)
 
     def _ensure_runtime(self) -> None:
         if self._executor is not None:
@@ -388,6 +406,7 @@ class BrowserChatGPTTransport:
             details={"prompt_length": len(prompt)},
         )
         prompt_anchor = build_turn_anchor(prompt)
+        self._start_runtime_log_heartbeat()
         try:
             self.thread_registry.load()
         except Exception as exc:
@@ -519,6 +538,8 @@ class BrowserChatGPTTransport:
                 details={"error": str(exc)},
             )
             raise
+        finally:
+            self._stop_runtime_log_heartbeat()
 
     def _show_automation_notice(self) -> None:
         self._log("automation_notice_show", {})
@@ -538,6 +559,7 @@ class BrowserChatGPTTransport:
         showed_text = False
         send_attempt = 0
         while time.monotonic() < deadline:
+            self._tick_runtime_log_heartbeat("send_loop")
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             ui_state = self._ui_state(target)
@@ -971,6 +993,7 @@ class BrowserChatGPTTransport:
     def _wait_for_prompt_inserted(self, target, prompt: str, seconds: float, *, prompt_anchor=None) -> bool:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
+            self._tick_runtime_log_heartbeat("wait_for_prompt_inserted")
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             ui_state = self._ui_state(target)
@@ -1124,6 +1147,7 @@ class BrowserChatGPTTransport:
     def _wait_for_reply_start(self, target, before_lines, seconds: float) -> bool:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
+            self._tick_runtime_log_heartbeat("wait_for_reply_start")
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             ui_state = self._ui_state(target)
@@ -1174,6 +1198,7 @@ class BrowserChatGPTTransport:
         deadline = time.monotonic() + max(5.0, launch_timeout_sec)
         last_error = None
         while time.monotonic() < deadline:
+            self._tick_runtime_log_heartbeat("ensure_chatgpt_window")
             try:
                 target = self._executor.find_chatgpt_browser_window()
                 self._log("chatgpt_window_found_after_launch", {"title": target.title, "handle": target.handle})
@@ -1283,6 +1308,7 @@ class BrowserChatGPTTransport:
     def _wait_for_chatgpt_ready(self, target, timeout_sec: float) -> bool:
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline:
+            self._tick_runtime_log_heartbeat("wait_for_chatgpt_ready")
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             analysis = self._analyze_screen(target, lines=lines)
@@ -1321,6 +1347,7 @@ class BrowserChatGPTTransport:
         scanned_with_scroll = False
 
         while time.monotonic() < deadline:
+            self._tick_runtime_log_heartbeat("capture_reply_text")
             time.sleep(2.0 if attempt_index else 1.2)
             ui_state = self._ui_state(target)
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
@@ -1440,6 +1467,7 @@ class BrowserChatGPTTransport:
         previous_signature = ""
 
         for step in range(max_steps):
+            self._tick_runtime_log_heartbeat("capture_reply_text_by_scrolling")
             segment = self._capture_visible_reply_segment(target, before_lines, prompt)
             if segment_looks_like_prompt_echo_for_policy(segment, policy=REPLY_TRACKER_POLICY):
                 self._log(

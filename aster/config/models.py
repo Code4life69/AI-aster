@@ -50,6 +50,9 @@ class AsterConfig:
     verification_level: str = "basic"
     log_screenshots: bool = False
     max_recovery_attempts: int = 3
+    runtime_log_heartbeat_push_enabled: bool = False
+    runtime_log_heartbeat_interval_seconds: int = 30
+    runtime_log_heartbeat_branch_only: bool = True
     auto_apply: bool = False
     git_integration: bool = True
     auto_commit_and_push: bool = True

@@ -10,6 +10,7 @@ from aster.git_sync import GitSync
 from aster.patch_executor import PatchApplier
 from aster.prompt_builder import PATCH_PLAN_SCHEMA, PromptBuilder
 from aster.response_parser import ParsedPlan, ResponseParser
+from aster.runtime_log_heartbeat import RuntimeLogHeartbeatPusher
 from aster.safety_guard import SafetyGuard
 from aster.session import SessionStore
 from aster.transport_api import OpenAIResponsesTransport
@@ -53,6 +54,15 @@ class AsterOrchestrator:
         self.applier = PatchApplier(config.project_root, self.logger, git_integration=config.git_integration)
         self.git = GitSync(config.project_root, remote_name=config.git_remote_name)
         self.api_transport = OpenAIResponsesTransport(config.preferred_model, config.openai_api_key_env)
+        self.runtime_log_heartbeat = RuntimeLogHeartbeatPusher(
+            tracked_paths=self.RUNTIME_LOG_PATHS,
+            enabled=config.runtime_log_heartbeat_push_enabled,
+            interval_seconds=config.runtime_log_heartbeat_interval_seconds,
+            branch_only=config.runtime_log_heartbeat_branch_only,
+            sync_runtime_logs=lambda message: self.sync_runtime_logs(message),
+            current_branch=lambda: self.git.current_branch(),
+            log_event=lambda event, payload: self.logger.log("browser_transport", {"event": event, **payload}),
+        )
         thread_registry_path = (
             config.thread_registry_path
             if config.thread_registry_path.is_absolute()
@@ -66,6 +76,7 @@ class AsterOrchestrator:
             verification_level=config.verification_level,
             log_screenshots=config.log_screenshots,
             max_recovery_attempts=config.max_recovery_attempts,
+            runtime_log_heartbeat=self.runtime_log_heartbeat,
         )
 
     def plan(self, goal: str, mode: str | None = None) -> OrchestrationResult:
@@ -269,9 +280,13 @@ class AsterOrchestrator:
             results = self.git.commit_all_if_needed(commit_message, exclude_paths=list(self.RUNTIME_LOG_PATHS))
         else:
             results = self.git.commit_paths_if_needed(commit_message, paths)
-        if self.config.sync_with_remote:
+        if self.config.sync_with_remote and self._results_include_successful_commit(results):
             results.extend(self.git.sync_push())
         return results
+
+    @staticmethod
+    def _results_include_successful_commit(results: list[str]) -> bool:
+        return any("git commit -m " in item and "-> 0:" in item for item in results)
 
     def _generate_with_prompt_retries(
         self,
