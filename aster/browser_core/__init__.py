@@ -50,6 +50,7 @@ from .reply_tracker import (
     score_candidate_for_policy,
     segment_looks_like_prompt_echo,
     segment_looks_like_prompt_echo_for_policy,
+    summarize_reply_wait_iteration,
     should_ignore_candidate_for_policy,
     should_ignore_candidate,
 )
@@ -115,5 +116,6 @@ __all__ = [
     "serialize_anchor",
     "should_ignore_candidate_for_policy",
     "should_ignore_candidate",
+    "summarize_reply_wait_iteration",
     "window_title_suggests_existing_chat",
 ]

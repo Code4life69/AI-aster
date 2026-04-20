@@ -121,6 +121,65 @@ def choose_best_reply_candidate(
     return best
 
 
+def summarize_reply_wait_iteration(
+    *,
+    elapsed_sec: float,
+    ui_state: dict[str, object],
+    ocr_text: str,
+    uia_text: str,
+    current_candidate: tuple[str, str, float] | None,
+    previous_best_text: str = "",
+    previous_ocr_text: str = "",
+    previous_uia_text: str = "",
+    stable_structured_hits: int = 0,
+    scrolling_attempted: bool = False,
+) -> dict[str, object]:
+    ui_state_summary = {
+        "show_in_text_field_present": bool(ui_state.get("show_in_text_field_present")),
+        "send_prompt_present": bool(ui_state.get("send_prompt_present")),
+        "send_prompt_enabled": ui_state.get("send_prompt_enabled"),
+        "stop_streaming_present": bool(ui_state.get("stop_streaming_present")),
+    }
+    best_source = ""
+    best_text = ""
+    best_score: float | None = None
+    if current_candidate is not None:
+        best_source, best_text, best_score = current_candidate
+    best_text_changed = _normalize(best_text) != _normalize(previous_best_text)
+    ocr_text_changed = _normalize(ocr_text) != _normalize(previous_ocr_text)
+    uia_text_changed = _normalize(uia_text) != _normalize(previous_uia_text)
+    candidate_looks_complete = looks_like_patch_plan_json(best_text) if best_text else False
+    candidate_looks_incomplete = reply_looks_incomplete(best_text) if best_text else False
+    return {
+        "elapsed_sec": round(elapsed_sec, 1),
+        "wait_substate": _classify_reply_wait_substate(
+            ui_state_summary=ui_state_summary,
+            best_text=best_text,
+            best_text_changed=best_text_changed,
+            ocr_text_changed=ocr_text_changed,
+            uia_text_changed=uia_text_changed,
+            candidate_looks_complete=candidate_looks_complete,
+            candidate_looks_incomplete=candidate_looks_incomplete,
+            stable_structured_hits=stable_structured_hits,
+            scrolling_attempted=scrolling_attempted,
+        ),
+        "ui_state_summary": ui_state_summary,
+        "stop_streaming_present": ui_state_summary["stop_streaming_present"],
+        "send_prompt_present": ui_state_summary["send_prompt_present"],
+        "send_prompt_enabled": ui_state_summary["send_prompt_enabled"],
+        "best_candidate_source": best_source,
+        "best_candidate_score": round(best_score, 1) if best_score is not None else None,
+        "best_candidate_length": len(best_text),
+        "best_text_changed": best_text_changed,
+        "ocr_text_changed": ocr_text_changed,
+        "uia_text_changed": uia_text_changed,
+        "candidate_looks_incomplete": candidate_looks_incomplete,
+        "candidate_looks_complete": candidate_looks_complete,
+        "stable_structured_hits": stable_structured_hits,
+        "scrolling_attempted": scrolling_attempted,
+    }
+
+
 def extract_reply_from_ocr_lines_for_policy(
     before_lines,
     after_lines,
@@ -460,3 +519,47 @@ def _line_text(line) -> str:
 
 def _normalize(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def _classify_reply_wait_substate(
+    *,
+    ui_state_summary: dict[str, object],
+    best_text: str,
+    best_text_changed: bool,
+    ocr_text_changed: bool,
+    uia_text_changed: bool,
+    candidate_looks_complete: bool,
+    candidate_looks_incomplete: bool,
+    stable_structured_hits: int,
+    scrolling_attempted: bool,
+) -> str:
+    show_in_text_field_present = bool(ui_state_summary.get("show_in_text_field_present"))
+    send_prompt_enabled = ui_state_summary.get("send_prompt_enabled") is True
+    stop_streaming_present = bool(ui_state_summary.get("stop_streaming_present"))
+    any_growth = best_text_changed or ocr_text_changed or uia_text_changed
+
+    if show_in_text_field_present:
+        return "blocked_show_in_text_field"
+    if stop_streaming_present and send_prompt_enabled:
+        return "conflicting_send_and_stream_state"
+    if send_prompt_enabled:
+        return "candidate_seen_but_send_still_available" if best_text else "send_still_available"
+    if not best_text:
+        if stop_streaming_present:
+            return "streaming_without_candidate_growth" if not any_growth else "waiting_for_first_candidate"
+        return "stale_capture_no_candidate" if not any_growth else "waiting_for_first_candidate"
+    if candidate_looks_complete:
+        if stop_streaming_present:
+            return "structured_reply_waiting_for_stream_end"
+        if stable_structured_hits > 0:
+            return "structured_reply_stable"
+        return "structured_reply_detected"
+    if candidate_looks_incomplete:
+        if not stop_streaming_present and not scrolling_attempted:
+            return "incomplete_reply_ready_for_scroll"
+        if not any_growth:
+            return "incomplete_reply_stalled"
+        return "incomplete_reply_waiting_for_completion"
+    if stop_streaming_present:
+        return "reply_growing" if any_growth else "streaming_without_visible_growth"
+    return "candidate_waiting_for_completion" if any_growth else "candidate_stale"

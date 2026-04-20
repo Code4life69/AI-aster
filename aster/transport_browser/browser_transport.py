@@ -41,6 +41,7 @@ from aster.browser_core import (
     score_candidate_for_policy,
     segment_looks_like_prompt_echo_for_policy,
     serialize_anchor,
+    summarize_reply_wait_iteration,
     window_title_suggests_existing_chat,
 )
 from aster.runtime_log_heartbeat import RuntimeLogHeartbeatPusher
@@ -1474,6 +1475,7 @@ class BrowserChatGPTTransport:
         return looks_like_chatgpt_page(lines, ui_state)
 
     def _capture_reply_text(self, target, before_lines, prompt: str, timeout_sec: float, *, prompt_anchor=None) -> str:
+        started_at = time.monotonic()
         deadline = time.monotonic() + timeout_sec
         best_text = ""
         best_score = float("-inf")
@@ -1481,6 +1483,10 @@ class BrowserChatGPTTransport:
         stable_structured_hits = 0
         attempt_index = 0
         scanned_with_scroll = False
+        previous_candidate_text = ""
+        previous_ocr_text = ""
+        previous_uia_text = ""
+        last_wait_diagnostics: dict[str, Any] | None = None
 
         while time.monotonic() < deadline:
             self._tick_runtime_log_heartbeat("capture_reply_text")
@@ -1498,6 +1504,20 @@ class BrowserChatGPTTransport:
                 policy=REPLY_TRACKER_POLICY,
                 prompt_anchor=prompt_anchor,
             )
+            diagnostics = summarize_reply_wait_iteration(
+                elapsed_sec=time.monotonic() - started_at,
+                ui_state=ui_state,
+                ocr_text=ocr_text,
+                uia_text=uia_text,
+                current_candidate=current_best,
+                previous_best_text=previous_candidate_text,
+                previous_ocr_text=previous_ocr_text,
+                previous_uia_text=previous_uia_text,
+                stable_structured_hits=stable_structured_hits,
+                scrolling_attempted=scanned_with_scroll,
+            )
+            self._log("reply_wait_heartbeat", diagnostics)
+            last_wait_diagnostics = diagnostics
             if current_best is not None:
                 source, candidate, score = current_best
                 if score > best_score or (score == best_score and len(candidate) > len(best_text)):
@@ -1526,6 +1546,21 @@ class BrowserChatGPTTransport:
                     and score >= 180.0
                     and reply_looks_incomplete(candidate)
                 ):
+                    self._log(
+                        "reply_wait_scroll_requested",
+                        summarize_reply_wait_iteration(
+                            elapsed_sec=time.monotonic() - started_at,
+                            ui_state=ui_state,
+                            ocr_text=ocr_text,
+                            uia_text=uia_text,
+                            current_candidate=current_best,
+                            previous_best_text=previous_candidate_text,
+                            previous_ocr_text=previous_ocr_text,
+                            previous_uia_text=previous_uia_text,
+                            stable_structured_hits=stable_structured_hits,
+                            scrolling_attempted=True,
+                        ),
+                    )
                     scrolled = self._capture_reply_text_by_scrolling(target, before_lines, prompt, max_steps=10)
                     if scrolled.strip():
                         self._log(
@@ -1548,8 +1583,21 @@ class BrowserChatGPTTransport:
                             if looks_like_patch_plan_json(candidate):
                                 return candidate
                     scanned_with_scroll = True
+            previous_candidate_text = current_best[1] if current_best is not None else ""
+            previous_ocr_text = ocr_text
+            previous_uia_text = uia_text
             attempt_index += 1
 
+        if last_wait_diagnostics is not None:
+            self._log(
+                "reply_wait_timeout",
+                {
+                    **last_wait_diagnostics,
+                    "elapsed_sec": round(time.monotonic() - started_at, 1),
+                    "best_overall_score": round(best_score, 1) if best_text else None,
+                    "best_overall_length": len(best_text),
+                },
+            )
         if looks_like_patch_plan_json(best_text):
             return best_text
 

@@ -41,6 +41,7 @@ from aster.browser_core.reply_tracker import (
     segment_looks_like_prompt_echo_for_policy,
     should_ignore_candidate,
     should_ignore_candidate_for_policy,
+    summarize_reply_wait_iteration,
     build_reply_capture_result,
 )
 from aster.browser_core.thread_router import ThreadRegistry
@@ -523,6 +524,96 @@ def test_reply_tracker_policy_cleans_and_merges_reply_segments() -> None:
     assert "User goal" not in merged
     assert "Share" not in merged
     assert '"operations"' in merged
+
+
+def test_summarize_reply_wait_iteration_flags_stale_capture_without_candidate() -> None:
+    summary = summarize_reply_wait_iteration(
+        elapsed_sec=18.4,
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        ocr_text="",
+        uia_text="",
+        current_candidate=None,
+        previous_best_text="",
+        previous_ocr_text="",
+        previous_uia_text="",
+    )
+
+    assert summary["wait_substate"] == "stale_capture_no_candidate"
+    assert summary["best_candidate_source"] == ""
+    assert summary["ocr_text_changed"] is False
+    assert summary["uia_text_changed"] is False
+
+
+def test_summarize_reply_wait_iteration_flags_streaming_without_growth() -> None:
+    summary = summarize_reply_wait_iteration(
+        elapsed_sec=22.0,
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": True,
+        },
+        ocr_text="",
+        uia_text="",
+        current_candidate=None,
+        previous_best_text="",
+        previous_ocr_text="",
+        previous_uia_text="",
+    )
+
+    assert summary["wait_substate"] == "streaming_without_candidate_growth"
+    assert summary["stop_streaming_present"] is True
+
+
+def test_summarize_reply_wait_iteration_flags_incomplete_reply_ready_for_scroll() -> None:
+    summary = summarize_reply_wait_iteration(
+        elapsed_sec=27.1,
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        ocr_text='{"summary":"ok","operations":[',
+        uia_text="",
+        current_candidate=("ocr", '{"summary":"ok","operations":[', 205.0),
+        previous_best_text="",
+        previous_ocr_text="",
+        previous_uia_text="",
+        scrolling_attempted=False,
+    )
+
+    assert summary["wait_substate"] == "incomplete_reply_ready_for_scroll"
+    assert summary["best_candidate_source"] == "ocr"
+    assert summary["candidate_looks_incomplete"] is True
+    assert summary["best_text_changed"] is True
+
+
+def test_summarize_reply_wait_iteration_flags_conflicting_send_and_stream_state() -> None:
+    summary = summarize_reply_wait_iteration(
+        elapsed_sec=31.8,
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": True,
+            "send_prompt_enabled": True,
+            "stop_streaming_present": True,
+        },
+        ocr_text="working",
+        uia_text="working",
+        current_candidate=("uia", "working", 15.0),
+        previous_best_text="",
+        previous_ocr_text="",
+        previous_uia_text="",
+    )
+
+    assert summary["wait_substate"] == "conflicting_send_and_stream_state"
+    assert summary["send_prompt_present"] is True
+    assert summary["send_prompt_enabled"] is True
 
 
 def test_reply_tracker_policy_detects_prompt_echo_and_incomplete_reply() -> None:
