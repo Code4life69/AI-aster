@@ -18,6 +18,7 @@ from aster.transport_browser.browser_transport import (
     summarize_edit_candidates,
     summarize_named_button_candidates,
 )
+from aster.browser_core.turn_anchor import build_turn_anchor
 
 
 def test_extract_structured_block_prefers_fenced_json() -> None:
@@ -503,6 +504,95 @@ def test_capture_reply_text_can_reject_selected_raw_code_candidate(monkeypatch) 
     assert timeout_events
     assert timeout_events[-1]["acceptance_tier"] == "blocked_or_ambiguous"
     assert "Raw code appeared" in str(timeout_events[-1]["rejection_reason"])
+
+
+def test_capture_reply_text_does_not_require_anchor_when_thread_was_not_reused(monkeypatch) -> None:
+    transport = BrowserChatGPTTransport(thread_reuse_enabled=True)
+    transport._executor = _FakeExecutor("")
+    transport._capture = _FakeCaptureService()
+    transport._ocr = _FakeOCR()
+    transport._ui_state = lambda target: {
+        "show_in_text_field_present": False,
+        "send_prompt_present": False,
+        "send_prompt_enabled": None,
+        "stop_streaming_present": False,
+    }
+    transport._raise_for_browser_error = lambda lines, ui_state, stage: None
+    reply_text = '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"weather.py","reason":"add","content":"print(1)"}]}'
+    replies = iter([("", reply_text), ("", reply_text)])
+    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: next(replies)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.monotonic", _MonotonicClock())
+
+    class _Target:
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    reply = transport._capture_reply_text(
+        _Target(),
+        before_lines=[],
+        prompt="create a hello world python file in live_browser_test",
+        timeout_sec=4.0,
+        prompt_anchor=build_turn_anchor("create a hello world python file in live_browser_test"),
+        thread_reused_for_capture=False,
+    )
+
+    assert looks_like_patch_plan_json(reply) is True
+    assert "weather.py" in reply
+
+
+def test_capture_reply_text_requires_anchor_only_when_thread_was_reused(monkeypatch) -> None:
+    logger = _FakeAuditLogger()
+    transport = BrowserChatGPTTransport(logger=logger, thread_reuse_enabled=True)
+    transport._executor = _FakeExecutor("")
+    transport._capture = _FakeCaptureService()
+    transport._ocr = _FakeOCR()
+    transport._ui_state = lambda target: {
+        "show_in_text_field_present": False,
+        "send_prompt_present": False,
+        "send_prompt_enabled": None,
+        "stop_streaming_present": False,
+    }
+    transport._raise_for_browser_error = lambda lines, ui_state, stage: None
+    reply_text = '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"weather.py","reason":"add","content":"print(1)"}]}'
+    replies = iter([("", reply_text), ("", reply_text)])
+    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: next(replies)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.monotonic", _MonotonicClock())
+
+    class _Target:
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    reply = transport._capture_reply_text(
+        _Target(),
+        before_lines=[],
+        prompt="create a hello world python file in live_browser_test",
+        timeout_sec=4.0,
+        prompt_anchor=build_turn_anchor("create a hello world python file in live_browser_test"),
+        thread_reused_for_capture=True,
+    )
+
+    assert reply == ""
+    timeout_events = _notice_events(logger, "reply_wait_timeout")
+    assert timeout_events
+    assert timeout_events[-1]["acceptance_tier"] == "blocked_or_ambiguous"
+    assert "Anchor confidence is too low" in str(timeout_events[-1]["rejection_reason"])
+
+
+def test_ensure_fresh_chat_thread_reports_fresh_capture_state() -> None:
+    transport = BrowserChatGPTTransport(thread_reuse_enabled=True)
+    transport._window_title_suggests_existing_thread = lambda title: False
+    transport._reset_to_new_chat_if_possible = lambda target, timeout_sec: True
+
+    class _Target:
+        title = "Untitled - Google Chrome"
+
+    assert transport._ensure_fresh_chat_thread(_Target(), "https://chatgpt.com/", 5.0) is False
 
 
 def test_capture_reply_text_blocks_one_shot_scrolled_structured_candidate(monkeypatch) -> None:

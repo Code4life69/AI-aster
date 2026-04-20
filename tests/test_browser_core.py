@@ -541,6 +541,30 @@ def test_evaluate_reply_acceptance_accepts_anchored_structured_reply() -> None:
     assert acceptance.acceptance_tier == "anchored_structured"
 
 
+def test_evaluate_reply_acceptance_does_not_require_anchor_for_fresh_chat_capture() -> None:
+    anchor = build_turn_anchor("create a hello world python file in live_browser_test")
+    acceptance = evaluate_reply_acceptance(
+        (
+            "uia",
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"weather.py","reason":"add","content":"print(\\"rain\\")"}]}',
+            300.0,
+        ),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        prompt_anchor=anchor,
+        require_anchor=False,
+        stable_structured_hits=1,
+    )
+
+    assert acceptance.accepted is True
+    assert acceptance.acceptance_tier == "visible_structured_short"
+
+
 def test_evaluate_reply_acceptance_blocks_live_send_state() -> None:
     acceptance = evaluate_reply_acceptance(
         (
@@ -604,6 +628,60 @@ def test_evaluate_reply_acceptance_blocks_raw_code_without_schema_keys() -> None
 
     assert acceptance.accepted is False
     assert "Raw code appeared" in acceptance.rejection_reason
+
+
+def test_evaluate_reply_acceptance_classifies_partial_patch_block_as_incomplete_structured() -> None:
+    acceptance = evaluate_reply_acceptance(
+        (
+            "uia",
+            'ASTER_PATCH_BEGIN\n{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py"',
+            333.0,
+        ),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        scrolling_attempted=False,
+    )
+
+    assert acceptance.accepted is False
+    assert acceptance.acceptance_tier == "partial_structured_reply"
+    assert "incomplete structured patch reply" in acceptance.rejection_reason
+    assert acceptance.should_scroll is True
+
+
+def test_evaluate_reply_acceptance_keeps_scroll_intent_for_longer_partial_structured_candidate() -> None:
+    acceptance = evaluate_reply_acceptance(
+        (
+            "uia",
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":["partial"],"operations":[{"type":"CREATE FILE","path":"calculator_app.py","reason":"add","content":"import tkinter as tk\\n'
+            "from tkinter import ttk\\n"
+            "class CalculatorApp:\\n"
+            "    def __init__(self) -> None:\\n"
+            "        self.root = tk.Tk()\\n"
+            "        self.root.resizable(False, False)\\n"
+            '        self.display_var = tk.StringVar(value=\\"0\\")\\n'
+            '        ttk.Button(self.root, text=\\"7\\").grid(row=0, column=0)\\n',
+            368.0,
+        ),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        scrolling_attempted=False,
+    )
+
+    assert acceptance.accepted is False
+    assert acceptance.acceptance_tier == "partial_structured_reply"
+    assert "Raw code appeared" not in acceptance.rejection_reason
+    assert acceptance.should_scroll is True
 
 
 def test_evaluate_reply_acceptance_blocks_low_anchor_confidence_when_required() -> None:

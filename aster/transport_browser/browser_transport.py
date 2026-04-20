@@ -569,7 +569,7 @@ class BrowserChatGPTTransport:
             target = self._ensure_chatgpt_window(chatgpt_url=chatgpt_url, launch_timeout_sec=launch_timeout_sec)
             self._show_automation_notice()
             try:
-                self._prepare_chatgpt_window(
+                thread_reused_for_capture = self._prepare_chatgpt_window(
                     target,
                     chatgpt_url=chatgpt_url,
                     timeout_sec=min(20.0, max(8.0, launch_timeout_sec)),
@@ -631,6 +631,7 @@ class BrowserChatGPTTransport:
                     prompt,
                     timeout_sec=timeout_sec,
                     prompt_anchor=prompt_anchor,
+                    thread_reused_for_capture=thread_reused_for_capture,
                 )
                 parsed = extract_structured_block(reply)
                 self._log(
@@ -1357,7 +1358,7 @@ class BrowserChatGPTTransport:
             "Open ChatGPT, sign in if needed, then try again."
         ) from last_error
 
-    def _prepare_chatgpt_window(self, target, chatgpt_url: str, timeout_sec: float) -> None:
+    def _prepare_chatgpt_window(self, target, chatgpt_url: str, timeout_sec: float) -> bool:
         ready = self._wait_for_chatgpt_ready(target, timeout_sec=min(timeout_sec, 12.0))
         if not ready:
             recovery_handlers = build_recovery_handlers(
@@ -1393,8 +1394,7 @@ class BrowserChatGPTTransport:
             self._log("wrong_page_detected", self._page_readiness_log_payload(analysis, failure))
             raise RuntimeError(self._page_readiness_error_message(failure))
         if ready:
-            self._ensure_fresh_chat_thread(target, chatgpt_url=chatgpt_url, timeout_sec=min(10.0, timeout_sec))
-            return
+            return self._ensure_fresh_chat_thread(target, chatgpt_url=chatgpt_url, timeout_sec=min(10.0, timeout_sec))
         self._log("chatgpt_page_not_ready", self._page_readiness_log_payload(analysis, failure))
         raise RuntimeError(self._page_readiness_error_message(failure))
 
@@ -1407,11 +1407,11 @@ class BrowserChatGPTTransport:
         pyautogui.press("enter")
         time.sleep(0.8)
 
-    def _ensure_fresh_chat_thread(self, target, chatgpt_url: str, timeout_sec: float) -> None:
+    def _ensure_fresh_chat_thread(self, target, chatgpt_url: str, timeout_sec: float) -> bool:
         title = str(getattr(target, "title", "") or "")
         if not self._window_title_suggests_existing_thread(title):
             self._reset_to_new_chat_if_possible(target, timeout_sec=timeout_sec)
-            return
+            return False
         self._log("stale_thread_title_detected", {"title": title})
         self._activity(
             "browser_stale_thread",
@@ -1420,10 +1420,11 @@ class BrowserChatGPTTransport:
             details={"window_title": title},
         )
         if self._reset_to_new_chat_if_possible(target, timeout_sec=timeout_sec):
-            return
+            return False
         self._log("stale_thread_reset_via_navigation", {"title": title, "url": chatgpt_url})
         self._navigate_browser_to_chatgpt(target, chatgpt_url)
         self._wait_for_chatgpt_ready(target, timeout_sec=max(3.0, timeout_sec))
+        return False
 
     def _reset_to_new_chat_if_possible(self, target, timeout_sec: float) -> bool:
         clicked = self._click_named_button(target, "new chat")
@@ -1476,7 +1477,16 @@ class BrowserChatGPTTransport:
     def _looks_like_chatgpt_page(lines, ui_state: dict[str, Any]) -> bool:
         return looks_like_chatgpt_page(lines, ui_state)
 
-    def _capture_reply_text(self, target, before_lines, prompt: str, timeout_sec: float, *, prompt_anchor=None) -> str:
+    def _capture_reply_text(
+        self,
+        target,
+        before_lines,
+        prompt: str,
+        timeout_sec: float,
+        *,
+        prompt_anchor=None,
+        thread_reused_for_capture: bool = False,
+    ) -> str:
         started_at = time.monotonic()
         deadline = time.monotonic() + timeout_sec
         best_text = ""
@@ -1517,7 +1527,7 @@ class BrowserChatGPTTransport:
                 ui_state=ui_state,
                 policy=REPLY_TRACKER_POLICY,
                 prompt_anchor=prompt_anchor,
-                require_anchor=self.thread_reuse_enabled,
+                require_anchor=thread_reused_for_capture,
                 stable_structured_hits=current_stable_hits,
                 scrolling_attempted=scanned_with_scroll,
             )
@@ -1610,7 +1620,7 @@ class BrowserChatGPTTransport:
                                 ui_state=ui_state,
                                 policy=REPLY_TRACKER_POLICY,
                                 prompt_anchor=prompt_anchor,
-                                require_anchor=self.thread_reuse_enabled,
+                                require_anchor=thread_reused_for_capture,
                                 stable_structured_hits=scroll_stable_hits,
                                 scrolling_attempted=True,
                             )
@@ -1661,7 +1671,7 @@ class BrowserChatGPTTransport:
             ui_state=last_ui_state,
             policy=REPLY_TRACKER_POLICY,
             prompt_anchor=prompt_anchor,
-            require_anchor=self.thread_reuse_enabled,
+            require_anchor=thread_reused_for_capture,
             stable_structured_hits=stable_structured_hits,
             scrolling_attempted=scanned_with_scroll,
             timed_out=True,
@@ -1702,7 +1712,7 @@ class BrowserChatGPTTransport:
             ui_state=last_ui_state,
             policy=REPLY_TRACKER_POLICY,
             prompt_anchor=prompt_anchor,
-            require_anchor=self.thread_reuse_enabled,
+            require_anchor=thread_reused_for_capture,
             stable_structured_hits=stable_structured_hits,
             scrolling_attempted=scanned_with_scroll,
             timed_out=True,

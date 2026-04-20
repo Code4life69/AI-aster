@@ -10,6 +10,14 @@ from .turn_anchor import anchor_match_confidence, anchor_matches
 
 
 VISIBLE_STRUCTURED_SHORT_MAX_CHARS = 1200
+STRUCTURED_SCHEMA_HINTS = (
+    '"summary"',
+    '"notes"',
+    '"operations"',
+    '"type"',
+    '"path"',
+    '"reason"',
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +195,10 @@ def evaluate_reply_acceptance(
         looks_complete=looks_complete,
         anchor=prompt_anchor,
     )
+    structure_state = _reply_candidate_structure_state(
+        cleaned,
+        is_patch_json=looks_like_patch_plan_json,
+    )
 
     if _ui_state_blocks_final_acceptance(ui_state):
         return ReplyAcceptanceResult(
@@ -215,7 +227,16 @@ def evaluate_reply_acceptance(
             requires_more_observation=not timed_out,
             should_scroll=False,
         )
-    if looks_like_code_reply_candidate(cleaned) and not looks_complete:
+    if structure_state == "partial_structured":
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier="partial_structured_reply",
+            acceptance_reason="",
+            rejection_reason="The selected candidate looks like an incomplete structured patch reply and needs more capture.",
+            requires_more_observation=not timed_out,
+            should_scroll=not scrolling_attempted and source != "scrolled",
+        )
+    if structure_state == "raw_code" and not looks_complete:
         return ReplyAcceptanceResult(
             accepted=False,
             acceptance_tier="blocked_or_ambiguous",
@@ -738,6 +759,31 @@ def _structured_reply_quality(
     if '"operations"' in cleaned and "{" in cleaned:
         return 1
     return 0
+
+
+def _reply_candidate_structure_state(
+    text: str,
+    *,
+    is_patch_json: Callable[[str], bool],
+) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return "empty"
+    if is_patch_json(cleaned):
+        return "complete_structured"
+    lowered = _normalize(cleaned)
+    has_begin_marker = "aster patch begin" in lowered or "aster_patch_begin" in lowered
+    has_end_marker = "aster patch end" in lowered or "aster_patch_end" in lowered
+    schema_hits = sum(1 for hint in STRUCTURED_SCHEMA_HINTS if hint in cleaned)
+    if has_begin_marker and (schema_hits > 0 or not has_end_marker or reply_looks_incomplete(cleaned)):
+        return "partial_structured"
+    if schema_hits >= 2 and "{" in cleaned:
+        return "partial_structured"
+    if '"operations"' in cleaned and "{" in cleaned:
+        return "partial_structured"
+    if looks_like_code_reply_candidate(cleaned):
+        return "raw_code"
+    return "unstructured"
 
 
 def _reply_acceptance_tier(
