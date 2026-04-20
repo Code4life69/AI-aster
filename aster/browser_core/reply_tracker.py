@@ -116,9 +116,41 @@ def choose_best_reply_candidate(
             )
             if prompt_anchor is not None and reply_matches_anchor(capture, prompt_anchor) and not capture.looks_complete:
                 continue
-            if best is None or score > best[2] or (score == best[2] and len(candidate) > len(best[1])):
-                best = (source, candidate, score)
+            best = select_preferred_reply_candidate(
+                best,
+                (source, candidate, score),
+                extract_structured_block=extract_structured_block,
+                is_patch_json=is_patch_json,
+            )
     return best
+
+
+def select_preferred_reply_candidate(
+    current_best: tuple[str, str, float] | None,
+    incoming_candidate: tuple[str, str, float] | None,
+    *,
+    extract_structured_block: Callable[[str], str],
+    is_patch_json: Callable[[str], bool],
+) -> tuple[str, str, float] | None:
+    if incoming_candidate is None:
+        return current_best
+    if current_best is None:
+        return incoming_candidate
+    current_priority = _reply_candidate_priority(
+        current_best[1],
+        current_best[2],
+        extract_structured_block=extract_structured_block,
+        is_patch_json=is_patch_json,
+    )
+    incoming_priority = _reply_candidate_priority(
+        incoming_candidate[1],
+        incoming_candidate[2],
+        extract_structured_block=extract_structured_block,
+        is_patch_json=is_patch_json,
+    )
+    if incoming_priority > current_priority:
+        return incoming_candidate
+    return current_best
 
 
 def summarize_reply_wait_iteration(
@@ -519,6 +551,55 @@ def _line_text(line) -> str:
 
 def _normalize(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def _reply_candidate_priority(
+    text: str,
+    score: float,
+    *,
+    extract_structured_block: Callable[[str], str],
+    is_patch_json: Callable[[str], bool],
+) -> tuple[int, int, float, int, int, int]:
+    structured_quality = _structured_reply_quality(
+        text,
+        extract_structured_block=extract_structured_block,
+        is_patch_json=is_patch_json,
+    )
+    structured_block = extract_structured_block(text).strip()
+    effective_text = structured_block if structured_quality >= 3 and structured_block else text.strip()
+    complete_structured = 1 if structured_quality >= 3 else 0
+    clean_structured_json = 1 if complete_structured and effective_text == text.strip() else 0
+    return (
+        structured_quality,
+        clean_structured_json,
+        score,
+        len(effective_text),
+        complete_structured,
+        len(text.strip()),
+    )
+
+
+def _structured_reply_quality(
+    text: str,
+    *,
+    extract_structured_block: Callable[[str], str],
+    is_patch_json: Callable[[str], bool],
+) -> int:
+    cleaned = text.strip()
+    if not cleaned:
+        return 0
+    if is_patch_json(cleaned):
+        return 3
+    lowered = _normalize(cleaned)
+    has_begin_marker = "aster patch begin" in lowered or "aster_patch_begin" in lowered
+    has_end_marker = "aster patch end" in lowered or "aster_patch_end" in lowered
+    if has_begin_marker and has_end_marker:
+        return 2
+    if has_begin_marker:
+        return 1
+    if '"operations"' in cleaned and "{" in cleaned:
+        return 1
+    return 0
 
 
 def _classify_reply_wait_substate(

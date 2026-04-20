@@ -37,6 +37,7 @@ from aster.browser_core.reply_tracker import (
     reply_looks_incomplete,
     score_candidate,
     score_candidate_for_policy,
+    select_preferred_reply_candidate,
     segment_looks_like_prompt_echo,
     segment_looks_like_prompt_echo_for_policy,
     should_ignore_candidate,
@@ -341,6 +342,78 @@ def test_reply_tracker_policy_prefers_patch_candidate_over_prompt_echo() -> None
 
     assert best is not None
     assert best[0] == "uia"
+
+
+def test_select_preferred_reply_candidate_preserves_structured_candidate_over_code_blob() -> None:
+    structured = (
+        "uia",
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}',
+        305.0,
+    )
+    code_blob = (
+        "ocr",
+        "self.root.resizable(False, False)\n"
+        "self.display_var = tk.StringVar(value='0')\n"
+        "for label in ('7', '8', '9', '/'):\n"
+        "    ttk.Button(frame, text=label).grid(sticky='nsew')\n"
+        "return frame\n",
+        420.0,
+    )
+
+    preferred = select_preferred_reply_candidate(
+        structured,
+        code_blob,
+        extract_structured_block=extract_structured_block,
+        is_patch_json=looks_like_patch_plan_json,
+    )
+
+    assert preferred == structured
+
+
+def test_select_preferred_reply_candidate_allows_stronger_later_structured_candidate() -> None:
+    initial = (
+        "uia",
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}',
+        300.0,
+    )
+    stronger = (
+        "ocr",
+        '{"summary":"ok","notes":["verified"],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"},{"type":"RUN COMMANDS","path":".","reason":"verify","commands":["pytest"]}]}',
+        330.0,
+    )
+
+    preferred = select_preferred_reply_candidate(
+        initial,
+        stronger,
+        extract_structured_block=extract_structured_block,
+        is_patch_json=looks_like_patch_plan_json,
+    )
+
+    assert preferred == stronger
+
+
+def test_select_preferred_reply_candidate_rejects_malformed_patch_wrapper_against_parseable_json() -> None:
+    structured = (
+        "uia",
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}',
+        280.0,
+    )
+    malformed = (
+        "ocr",
+        "ASTER_PATCH_BEGIN on its own line\n"
+        "Create a standalone GUI calculator program with buttons.\n"
+        "Operations should include CREATE FILE and RUN COMMANDS.\n",
+        430.0,
+    )
+
+    preferred = select_preferred_reply_candidate(
+        structured,
+        malformed,
+        extract_structured_block=extract_structured_block,
+        is_patch_json=looks_like_patch_plan_json,
+    )
+
+    assert preferred == structured
 
 
 def test_reply_tracker_extracts_structured_block_from_markers() -> None:

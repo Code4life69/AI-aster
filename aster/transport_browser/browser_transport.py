@@ -39,6 +39,7 @@ from aster.browser_core import (
     reply_looks_incomplete,
     prompt_insertion_confirmed,
     score_candidate_for_policy,
+    select_preferred_reply_candidate,
     segment_looks_like_prompt_echo_for_policy,
     serialize_anchor,
     summarize_reply_wait_iteration,
@@ -1520,7 +1521,13 @@ class BrowserChatGPTTransport:
             last_wait_diagnostics = diagnostics
             if current_best is not None:
                 source, candidate, score = current_best
-                if score > best_score or (score == best_score and len(candidate) > len(best_text)):
+                preferred = select_preferred_reply_candidate(
+                    (source, best_text, best_score) if best_text else None,
+                    current_best,
+                    extract_structured_block=extract_structured_block,
+                    is_patch_json=looks_like_patch_plan_json,
+                )
+                if preferred == current_best and (candidate != best_text or score != best_score):
                     best_text = candidate
                     best_score = score
                     self._log(
@@ -1577,7 +1584,13 @@ class BrowserChatGPTTransport:
                         )
                         if best_from_scroll is not None:
                             _, candidate, score = best_from_scroll
-                            if score > best_score or (score == best_score and len(candidate) > len(best_text)):
+                            preferred = select_preferred_reply_candidate(
+                                ("best", best_text, best_score) if best_text else None,
+                                best_from_scroll,
+                                extract_structured_block=extract_structured_block,
+                                is_patch_json=looks_like_patch_plan_json,
+                            )
+                            if preferred == best_from_scroll and (candidate != best_text or score != best_score):
                                 best_text = candidate
                                 best_score = score
                             if looks_like_patch_plan_json(candidate):

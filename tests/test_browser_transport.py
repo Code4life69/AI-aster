@@ -292,6 +292,25 @@ class _FakeExecutor:
         return self.reply
 
 
+class _FakeCaptureService:
+    def capture_region(self, *args, **kwargs):
+        return object()
+
+
+class _FakeOCR:
+    def extract(self, image):
+        return []
+
+
+class _MonotonicClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        self.value += 1.0
+        return self.value
+
+
 class _Line:
     def __init__(self, text: str) -> None:
         self.text = text
@@ -389,6 +408,53 @@ def test_reply_detection_accepts_streaming_state_even_without_text_candidate() -
     )
 
     assert started is True
+
+
+def test_capture_reply_text_timeout_preserves_best_structured_candidate(monkeypatch) -> None:
+    transport = BrowserChatGPTTransport()
+    transport._executor = _FakeExecutor("")
+    transport._capture = _FakeCaptureService()
+    transport._ocr = _FakeOCR()
+    transport._logger = None
+    transport._ui_state = lambda target: {
+        "show_in_text_field_present": False,
+        "send_prompt_present": False,
+        "send_prompt_enabled": None,
+        "stop_streaming_present": False,
+    }
+    transport._raise_for_browser_error = lambda lines, ui_state, stage: None
+    replies = iter(
+        [
+            (
+                "",
+                "ASTER_PATCH_BEGIN\n"
+                '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"calculator.py","reason":"add","content":"print(1)"}]}\n'
+                "ASTER_PATCH_END",
+            ),
+            (
+                "self.root.resizable(False, False)\n"
+                "self.display_var = tk.StringVar(value='0')\n"
+                "for label in ('7', '8', '9', '/'):\n"
+                "    ttk.Button(frame, text=label).grid(sticky='nsew')\n",
+                "",
+            ),
+        ]
+    )
+    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: next(replies)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.monotonic", _MonotonicClock())
+
+    class _Target:
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    reply = transport._capture_reply_text(_Target(), before_lines=[], prompt="create calculator", timeout_sec=4.0)
+
+    assert looks_like_patch_plan_json(reply) is True
+    assert '"operations"' in extract_structured_block(reply)
+    assert "calculator.py" in reply
 
 
 def test_reply_detection_rejects_code_like_reply_while_send_button_is_still_visible() -> None:
