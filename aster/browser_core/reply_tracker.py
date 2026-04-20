@@ -5,8 +5,11 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
-from .models import ReplyCaptureResult, TurnAnchor
+from .models import ReplyAcceptanceResult, ReplyCaptureResult, TurnAnchor
 from .turn_anchor import anchor_match_confidence, anchor_matches
+
+
+VISIBLE_STRUCTURED_SHORT_MAX_CHARS = 1200
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +154,141 @@ def select_preferred_reply_candidate(
     if incoming_priority > current_priority:
         return incoming_candidate
     return current_best
+
+
+def evaluate_reply_acceptance(
+    candidate: tuple[str, str, float] | None,
+    *,
+    ui_state: dict[str, object],
+    policy: ReplyTrackerPolicy,
+    prompt_anchor: TurnAnchor | None = None,
+    require_anchor: bool = False,
+    stable_structured_hits: int = 0,
+    scrolling_attempted: bool = False,
+    timed_out: bool = False,
+) -> ReplyAcceptanceResult:
+    if candidate is None:
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier="blocked_or_ambiguous",
+            acceptance_reason="",
+            rejection_reason="No reply candidate is available yet.",
+            requires_more_observation=not timed_out,
+            should_scroll=False,
+        )
+
+    source, text, score = candidate
+    cleaned = text.strip()
+    looks_complete = looks_like_patch_plan_json(cleaned)
+    capture = build_reply_capture_result(
+        cleaned,
+        source,
+        score,
+        looks_complete=looks_complete,
+        anchor=prompt_anchor,
+    )
+
+    if _ui_state_blocks_final_acceptance(ui_state):
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier="blocked_or_ambiguous",
+            acceptance_reason="",
+            rejection_reason="Composer/send controls still look live or ambiguous.",
+            requires_more_observation=not timed_out,
+            should_scroll=False,
+        )
+    if segment_looks_like_prompt_echo_for_policy(cleaned, policy=policy):
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier="blocked_or_ambiguous",
+            acceptance_reason="",
+            rejection_reason="Prompt-echo markers were detected in the candidate text.",
+            requires_more_observation=not timed_out,
+            should_scroll=False,
+        )
+    if require_anchor and prompt_anchor is not None and not reply_matches_anchor(capture, prompt_anchor, min_confidence=0.72):
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier="blocked_or_ambiguous",
+            acceptance_reason="",
+            rejection_reason="Anchor confidence is too low for a reused-thread capture.",
+            requires_more_observation=not timed_out,
+            should_scroll=False,
+        )
+    if looks_like_code_reply_candidate(cleaned) and not looks_complete:
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier="blocked_or_ambiguous",
+            acceptance_reason="",
+            rejection_reason="Raw code appeared without the required structured schema keys.",
+            requires_more_observation=not timed_out,
+            should_scroll=False,
+        )
+    if not looks_complete:
+        should_scroll = bool(
+            reply_looks_incomplete(cleaned)
+            and not scrolling_attempted
+            and source != "scrolled"
+        )
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier="blocked_or_ambiguous",
+            acceptance_reason="",
+            rejection_reason="The selected candidate is not yet a complete structured patch reply.",
+            requires_more_observation=not timed_out,
+            should_scroll=should_scroll,
+        )
+
+    tier = _reply_acceptance_tier(
+        cleaned,
+        source=source,
+        prompt_anchor=prompt_anchor,
+        require_anchor=require_anchor,
+    )
+    if tier == "scrolled_structured" and stable_structured_hits < 1:
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier=tier,
+            acceptance_reason="",
+            rejection_reason="Scrolled structured capture needs another confirming observation before it can be trusted.",
+            requires_more_observation=not timed_out,
+            should_scroll=False,
+        )
+    if tier == "visible_structured_long" and stable_structured_hits < 1:
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier=tier,
+            acceptance_reason="",
+            rejection_reason="Long structured replies need another matching observation before final acceptance.",
+            requires_more_observation=not timed_out,
+            should_scroll=False,
+        )
+    if tier in {"visible_structured_short", "anchored_structured"} and stable_structured_hits < 1 and not timed_out:
+        return ReplyAcceptanceResult(
+            accepted=False,
+            acceptance_tier=tier,
+            acceptance_reason="",
+            rejection_reason="Structured reply needs one more matching observation before acceptance.",
+            requires_more_observation=True,
+            should_scroll=False,
+        )
+
+    reasons = {
+        "visible_structured_short": "Short visible structured reply met the acceptance gate.",
+        "visible_structured_long": "Long visible structured reply repeated and met the stronger acceptance gate.",
+        "scrolled_structured": "Scrolled structured reply repeated and met the stronger acceptance gate.",
+        "anchored_structured": "Structured reply matched the current turn anchor and met the acceptance gate.",
+    }
+    if timed_out and tier in {"visible_structured_short", "anchored_structured"} and stable_structured_hits < 1:
+        reasons[tier] = "Best structured reply was still clean at timeout and is safe to accept."
+    return ReplyAcceptanceResult(
+        accepted=True,
+        acceptance_tier=tier,
+        acceptance_reason=reasons[tier],
+        rejection_reason="",
+        requires_more_observation=False,
+        should_scroll=False,
+    )
 
 
 def summarize_reply_wait_iteration(
@@ -600,6 +738,30 @@ def _structured_reply_quality(
     if '"operations"' in cleaned and "{" in cleaned:
         return 1
     return 0
+
+
+def _reply_acceptance_tier(
+    text: str,
+    *,
+    source: str,
+    prompt_anchor: TurnAnchor | None,
+    require_anchor: bool,
+) -> str:
+    if source == "scrolled":
+        return "scrolled_structured"
+    if require_anchor and prompt_anchor is not None:
+        return "anchored_structured"
+    if len(text.strip()) <= VISIBLE_STRUCTURED_SHORT_MAX_CHARS:
+        return "visible_structured_short"
+    return "visible_structured_long"
+
+
+def _ui_state_blocks_final_acceptance(ui_state: dict[str, object]) -> bool:
+    if ui_state.get("show_in_text_field_present"):
+        return True
+    if ui_state.get("send_prompt_present"):
+        return True
+    return ui_state.get("send_prompt_enabled") is True
 
 
 def _classify_reply_wait_substate(

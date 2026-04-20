@@ -22,6 +22,7 @@ from aster.browser_core.reply_tracker import (
     choose_best_reply_candidate,
     choose_best_reply_candidate_for_policy,
     clean_captured_segment_for_policy,
+    evaluate_reply_acceptance,
     extract_structured_block,
     extract_reply_from_ocr_lines,
     extract_reply_from_ocr_lines_for_policy,
@@ -414,6 +415,219 @@ def test_select_preferred_reply_candidate_rejects_malformed_patch_wrapper_agains
     )
 
     assert preferred == structured
+
+
+def test_evaluate_reply_acceptance_accepts_short_visible_structured_reply() -> None:
+    acceptance = evaluate_reply_acceptance(
+        (
+            "uia",
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}',
+            305.0,
+        ),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        stable_structured_hits=1,
+    )
+
+    assert acceptance.accepted is True
+    assert acceptance.acceptance_tier == "visible_structured_short"
+
+
+def test_evaluate_reply_acceptance_requires_more_observation_for_long_visible_structured_reply() -> None:
+    long_structured = (
+        "uia",
+        '{"summary":"ok","notes":[],"operations":[' + ",".join(
+            '{"type":"CREATE FILE","path":"file%d.py","reason":"add","content":"print(%d)"}' % (index, index)
+            for index in range(25)
+        ) + "]}",
+        420.0,
+    )
+
+    pending = evaluate_reply_acceptance(
+        long_structured,
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        stable_structured_hits=0,
+    )
+    accepted = evaluate_reply_acceptance(
+        long_structured,
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        stable_structured_hits=1,
+    )
+
+    assert pending.accepted is False
+    assert pending.acceptance_tier == "visible_structured_long"
+    assert pending.requires_more_observation is True
+    assert accepted.accepted is True
+    assert accepted.acceptance_tier == "visible_structured_long"
+
+
+def test_evaluate_reply_acceptance_requires_more_observation_for_scrolled_structured_reply() -> None:
+    candidate = (
+        "scrolled",
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}',
+        330.0,
+    )
+
+    pending = evaluate_reply_acceptance(
+        candidate,
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        stable_structured_hits=0,
+        scrolling_attempted=True,
+    )
+    accepted = evaluate_reply_acceptance(
+        candidate,
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        stable_structured_hits=1,
+        scrolling_attempted=True,
+    )
+
+    assert pending.accepted is False
+    assert pending.acceptance_tier == "scrolled_structured"
+    assert pending.requires_more_observation is True
+    assert accepted.accepted is True
+    assert accepted.acceptance_tier == "scrolled_structured"
+
+
+def test_evaluate_reply_acceptance_accepts_anchored_structured_reply() -> None:
+    anchor = build_turn_anchor("create a hello world python file in live_browser_test")
+    acceptance = evaluate_reply_acceptance(
+        (
+            "uia",
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"live_browser_test/app.py","reason":"add","content":"print(\\"hello world\\")"}]}',
+            312.0,
+        ),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        prompt_anchor=anchor,
+        require_anchor=True,
+        stable_structured_hits=1,
+    )
+
+    assert acceptance.accepted is True
+    assert acceptance.acceptance_tier == "anchored_structured"
+
+
+def test_evaluate_reply_acceptance_blocks_live_send_state() -> None:
+    acceptance = evaluate_reply_acceptance(
+        (
+            "uia",
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}',
+            305.0,
+        ),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": True,
+            "send_prompt_enabled": True,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        stable_structured_hits=1,
+    )
+
+    assert acceptance.accepted is False
+    assert acceptance.acceptance_tier == "blocked_or_ambiguous"
+    assert "Composer/send controls" in acceptance.rejection_reason
+
+
+def test_evaluate_reply_acceptance_blocks_prompt_echo() -> None:
+    acceptance = evaluate_reply_acceptance(
+        (
+            "ocr",
+            "User goal:\nBuild app\nRelevant file contents:\nPATH: app.py",
+            250.0,
+        ),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+    )
+
+    assert acceptance.accepted is False
+    assert "Prompt-echo markers" in acceptance.rejection_reason
+
+
+def test_evaluate_reply_acceptance_blocks_raw_code_without_schema_keys() -> None:
+    acceptance = evaluate_reply_acceptance(
+        (
+            "ocr",
+            "self.root.resizable(False, False)\n"
+            "self.display_var = tk.StringVar(value='0')\n"
+            "for label in ('7', '8', '9', '/'):\n"
+            "    ttk.Button(frame, text=label).grid(sticky='nsew')\n",
+            410.0,
+        ),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+    )
+
+    assert acceptance.accepted is False
+    assert "Raw code appeared" in acceptance.rejection_reason
+
+
+def test_evaluate_reply_acceptance_blocks_low_anchor_confidence_when_required() -> None:
+    anchor = build_turn_anchor("create a hello world python file in live_browser_test")
+    acceptance = evaluate_reply_acceptance(
+        (
+            "uia",
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"weather.py","reason":"add","content":"print(\\"rain\\")"}]}',
+            300.0,
+        ),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+        },
+        policy=TEST_REPLY_POLICY,
+        prompt_anchor=anchor,
+        require_anchor=True,
+        stable_structured_hits=1,
+    )
+
+    assert acceptance.accepted is False
+    assert "Anchor confidence is too low" in acceptance.rejection_reason
 
 
 def test_reply_tracker_extracts_structured_block_from_markers() -> None:

@@ -93,6 +93,16 @@ class ReplyCaptureResult:
 
 
 @dataclass(slots=True)
+class ReplyAcceptanceResult:
+    accepted: bool
+    acceptance_tier: str
+    acceptance_reason: str
+    rejection_reason: str
+    requires_more_observation: bool
+    should_scroll: bool
+
+
+@dataclass(slots=True)
 class RecoveryDecision:
     action: RecoveryAction
     reason: str

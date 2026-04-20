@@ -25,6 +25,7 @@ from aster.browser_core import (
     build_turn_anchor,
     choose_best_reply_candidate_for_policy,
     classify_page,
+    evaluate_reply_acceptance,
     extract_structured_block,
     decide_and_execute_recovery,
     decision_payload,
@@ -1479,6 +1480,7 @@ class BrowserChatGPTTransport:
         started_at = time.monotonic()
         deadline = time.monotonic() + timeout_sec
         best_text = ""
+        best_source = ""
         best_score = float("-inf")
         last_structured = ""
         stable_structured_hits = 0
@@ -1488,11 +1490,13 @@ class BrowserChatGPTTransport:
         previous_ocr_text = ""
         previous_uia_text = ""
         last_wait_diagnostics: dict[str, Any] | None = None
+        last_ui_state: dict[str, Any] = {}
 
         while time.monotonic() < deadline:
             self._tick_runtime_log_heartbeat("capture_reply_text")
             time.sleep(2.0 if attempt_index else 1.2)
             ui_state = self._ui_state(target)
+            last_ui_state = ui_state
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             self._raise_for_browser_error(lines, ui_state, stage="reply_capture")
@@ -1505,6 +1509,18 @@ class BrowserChatGPTTransport:
                 policy=REPLY_TRACKER_POLICY,
                 prompt_anchor=prompt_anchor,
             )
+            current_stable_hits = stable_structured_hits
+            if current_best is not None and looks_like_patch_plan_json(current_best[1]):
+                current_stable_hits = stable_structured_hits + 1 if current_best[1] == last_structured else 0
+            acceptance = evaluate_reply_acceptance(
+                current_best,
+                ui_state=ui_state,
+                policy=REPLY_TRACKER_POLICY,
+                prompt_anchor=prompt_anchor,
+                require_anchor=self.thread_reuse_enabled,
+                stable_structured_hits=current_stable_hits,
+                scrolling_attempted=scanned_with_scroll,
+            )
             diagnostics = summarize_reply_wait_iteration(
                 elapsed_sec=time.monotonic() - started_at,
                 ui_state=ui_state,
@@ -1514,9 +1530,10 @@ class BrowserChatGPTTransport:
                 previous_best_text=previous_candidate_text,
                 previous_ocr_text=previous_ocr_text,
                 previous_uia_text=previous_uia_text,
-                stable_structured_hits=stable_structured_hits,
+                stable_structured_hits=current_stable_hits,
                 scrolling_attempted=scanned_with_scroll,
             )
+            diagnostics.update(self._reply_acceptance_log_payload(acceptance))
             self._log("reply_wait_heartbeat", diagnostics)
             last_wait_diagnostics = diagnostics
             if current_best is not None:
@@ -1529,6 +1546,7 @@ class BrowserChatGPTTransport:
                 )
                 if preferred == current_best and (candidate != best_text or score != best_score):
                     best_text = candidate
+                    best_source = source
                     best_score = score
                     self._log(
                         "reply_candidate_selected",
@@ -1545,38 +1563,38 @@ class BrowserChatGPTTransport:
                     else:
                         last_structured = candidate
                         stable_structured_hits = 0
-                    if stable_structured_hits >= 1 and not self._response_still_streaming(ui_state):
-                        return candidate
-                if (
-                    not scanned_with_scroll
-                    and not self._response_still_streaming(ui_state)
-                    and score >= 180.0
-                    and reply_looks_incomplete(candidate)
-                ):
+                if acceptance.accepted:
+                    self._log(
+                        "reply_candidate_accepted",
+                        {
+                            "source": source,
+                            "score": score,
+                            "length": len(candidate),
+                            **self._reply_acceptance_log_payload(acceptance),
+                        },
+                    )
+                    return candidate
+                if acceptance.should_scroll and not scanned_with_scroll and not self._response_still_streaming(ui_state):
                     self._log(
                         "reply_wait_scroll_requested",
-                        summarize_reply_wait_iteration(
-                            elapsed_sec=time.monotonic() - started_at,
-                            ui_state=ui_state,
-                            ocr_text=ocr_text,
-                            uia_text=uia_text,
-                            current_candidate=current_best,
-                            previous_best_text=previous_candidate_text,
-                            previous_ocr_text=previous_ocr_text,
-                            previous_uia_text=previous_uia_text,
-                            stable_structured_hits=stable_structured_hits,
-                            scrolling_attempted=True,
-                        ),
+                        {
+                            **summarize_reply_wait_iteration(
+                                elapsed_sec=time.monotonic() - started_at,
+                                ui_state=ui_state,
+                                ocr_text=ocr_text,
+                                uia_text=uia_text,
+                                current_candidate=current_best,
+                                previous_best_text=previous_candidate_text,
+                                previous_ocr_text=previous_ocr_text,
+                                previous_uia_text=previous_uia_text,
+                                stable_structured_hits=stable_structured_hits,
+                                scrolling_attempted=True,
+                            ),
+                            **self._reply_acceptance_log_payload(acceptance),
+                        },
                     )
                     scrolled = self._capture_reply_text_by_scrolling(target, before_lines, prompt, max_steps=10)
                     if scrolled.strip():
-                        self._log(
-                            "reply_scrolled_capture",
-                            {
-                                "length": len(scrolled),
-                                "preview": scrolled[:240],
-                            },
-                        )
                         best_from_scroll = choose_best_reply_candidate_for_policy(
                             {"scrolled": scrolled},
                             policy=REPLY_TRACKER_POLICY,
@@ -1584,16 +1602,52 @@ class BrowserChatGPTTransport:
                         )
                         if best_from_scroll is not None:
                             _, candidate, score = best_from_scroll
+                            scroll_stable_hits = stable_structured_hits
+                            if looks_like_patch_plan_json(candidate):
+                                scroll_stable_hits = stable_structured_hits + 1 if candidate == last_structured else 0
+                            scroll_acceptance = evaluate_reply_acceptance(
+                                best_from_scroll,
+                                ui_state=ui_state,
+                                policy=REPLY_TRACKER_POLICY,
+                                prompt_anchor=prompt_anchor,
+                                require_anchor=self.thread_reuse_enabled,
+                                stable_structured_hits=scroll_stable_hits,
+                                scrolling_attempted=True,
+                            )
+                            self._log(
+                                "reply_scrolled_capture",
+                                {
+                                    "length": len(scrolled),
+                                    "preview": scrolled[:240],
+                                    **self._reply_acceptance_log_payload(scroll_acceptance),
+                                },
+                            )
                             preferred = select_preferred_reply_candidate(
-                                ("best", best_text, best_score) if best_text else None,
+                                (best_source or "best", best_text, best_score) if best_text else None,
                                 best_from_scroll,
                                 extract_structured_block=extract_structured_block,
                                 is_patch_json=looks_like_patch_plan_json,
                             )
                             if preferred == best_from_scroll and (candidate != best_text or score != best_score):
                                 best_text = candidate
+                                best_source = "scrolled"
                                 best_score = score
                             if looks_like_patch_plan_json(candidate):
+                                if candidate == last_structured:
+                                    stable_structured_hits += 1
+                                else:
+                                    last_structured = candidate
+                                    stable_structured_hits = 0
+                            if scroll_acceptance.accepted:
+                                self._log(
+                                    "reply_candidate_accepted",
+                                    {
+                                        "source": "scrolled",
+                                        "score": score,
+                                        "length": len(candidate),
+                                        **self._reply_acceptance_log_payload(scroll_acceptance),
+                                    },
+                                )
                                 return candidate
                     scanned_with_scroll = True
             previous_candidate_text = current_best[1] if current_best is not None else ""
@@ -1601,17 +1655,30 @@ class BrowserChatGPTTransport:
             previous_uia_text = uia_text
             attempt_index += 1
 
+        timeout_candidate = (best_source or "best", best_text, best_score) if best_text else None
+        timeout_acceptance = evaluate_reply_acceptance(
+            timeout_candidate,
+            ui_state=last_ui_state,
+            policy=REPLY_TRACKER_POLICY,
+            prompt_anchor=prompt_anchor,
+            require_anchor=self.thread_reuse_enabled,
+            stable_structured_hits=stable_structured_hits,
+            scrolling_attempted=scanned_with_scroll,
+            timed_out=True,
+        )
         if last_wait_diagnostics is not None:
             self._log(
                 "reply_wait_timeout",
                 {
                     **last_wait_diagnostics,
+                    **self._reply_acceptance_log_payload(timeout_acceptance),
                     "elapsed_sec": round(time.monotonic() - started_at, 1),
+                    "best_overall_source": best_source or None,
                     "best_overall_score": round(best_score, 1) if best_text else None,
                     "best_overall_length": len(best_text),
                 },
             )
-        if looks_like_patch_plan_json(best_text):
+        if timeout_candidate is not None and timeout_acceptance.accepted:
             return best_text
 
         fallback = self._executor.read_chatgpt_browser_reply(
@@ -1623,18 +1690,36 @@ class BrowserChatGPTTransport:
             timeout_sec=min(8.0, max(2.0, timeout_sec / 4.0)),
         )
         fallback_block = extract_structured_block(fallback)
+        fallback_candidate = None
         if looks_like_patch_plan_json(fallback_block):
+            fallback_candidate = (
+                "screen_reader_fallback",
+                fallback_block,
+                score_candidate_for_policy(fallback_block, policy=REPLY_TRACKER_POLICY),
+            )
+        fallback_acceptance = evaluate_reply_acceptance(
+            fallback_candidate,
+            ui_state=last_ui_state,
+            policy=REPLY_TRACKER_POLICY,
+            prompt_anchor=prompt_anchor,
+            require_anchor=self.thread_reuse_enabled,
+            stable_structured_hits=stable_structured_hits,
+            scrolling_attempted=scanned_with_scroll,
+            timed_out=True,
+        )
+        if fallback_candidate is not None and fallback_acceptance.accepted:
             self._log(
                 "reply_candidate_selected",
                 {
                     "source": "screen_reader_fallback",
-                    "score": score_candidate_for_policy(fallback_block, policy=REPLY_TRACKER_POLICY),
+                    "score": fallback_candidate[2],
                     "length": len(fallback_block),
                     "preview": fallback_block[:240],
+                    **self._reply_acceptance_log_payload(fallback_acceptance),
                 },
             )
             return fallback_block
-        return best_text or fallback or ""
+        return ""
 
     def _capture_visible_reply_sources(self, target, before_lines, prompt: str, lines=None) -> tuple[str, str]:
         after_lines = lines
@@ -1767,6 +1852,17 @@ class BrowserChatGPTTransport:
     @staticmethod
     def _response_still_streaming(ui_state: dict[str, Any]) -> bool:
         return bool(ui_state.get("stop_streaming_present"))
+
+    @staticmethod
+    def _reply_acceptance_log_payload(acceptance) -> dict[str, Any]:
+        return {
+            "accepted": acceptance.accepted,
+            "acceptance_tier": acceptance.acceptance_tier,
+            "acceptance_reason": acceptance.acceptance_reason,
+            "rejection_reason": acceptance.rejection_reason,
+            "requires_more_observation": acceptance.requires_more_observation,
+            "should_scroll": acceptance.should_scroll,
+        }
 
     def _analyze_screen(self, target, lines=None, ui_state: dict[str, Any] | None = None) -> PageClassification:
         if lines is None:

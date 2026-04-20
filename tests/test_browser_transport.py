@@ -120,6 +120,9 @@ class _FakeAuditLogger:
         assert namespace == "browser_transport"
         self.events.append(payload)
 
+    def activity(self, *args, **kwargs) -> None:
+        return None
+
 
 class _FakeNoticeProcess:
     _next_pid = 5000
@@ -455,6 +458,95 @@ def test_capture_reply_text_timeout_preserves_best_structured_candidate(monkeypa
     assert looks_like_patch_plan_json(reply) is True
     assert '"operations"' in extract_structured_block(reply)
     assert "calculator.py" in reply
+
+
+def test_capture_reply_text_can_reject_selected_raw_code_candidate(monkeypatch) -> None:
+    logger = _FakeAuditLogger()
+    transport = BrowserChatGPTTransport(logger=logger)
+    transport._executor = _FakeExecutor("")
+    transport._capture = _FakeCaptureService()
+    transport._ocr = _FakeOCR()
+    transport._ui_state = lambda target: {
+        "show_in_text_field_present": False,
+        "send_prompt_present": False,
+        "send_prompt_enabled": None,
+        "stop_streaming_present": False,
+    }
+    transport._raise_for_browser_error = lambda lines, ui_state, stage: None
+    replies = iter(
+        [
+            (
+                "self.root.resizable(False, False)\n"
+                "self.display_var = tk.StringVar(value='0')\n"
+                "for label in ('7', '8', '9', '/'):\n"
+                "    ttk.Button(frame, text=label).grid(sticky='nsew')\n",
+                "",
+            ),
+            ("", ""),
+        ]
+    )
+    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: next(replies)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.monotonic", _MonotonicClock())
+
+    class _Target:
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    reply = transport._capture_reply_text(_Target(), before_lines=[], prompt="create calculator", timeout_sec=4.0)
+
+    assert reply == ""
+    assert _notice_events(logger, "reply_candidate_selected")
+    timeout_events = _notice_events(logger, "reply_wait_timeout")
+    assert timeout_events
+    assert timeout_events[-1]["acceptance_tier"] == "blocked_or_ambiguous"
+    assert "Raw code appeared" in str(timeout_events[-1]["rejection_reason"])
+
+
+def test_capture_reply_text_blocks_one_shot_scrolled_structured_candidate(monkeypatch) -> None:
+    logger = _FakeAuditLogger()
+    transport = BrowserChatGPTTransport(logger=logger)
+    transport._executor = _FakeExecutor("")
+    transport._capture = _FakeCaptureService()
+    transport._ocr = _FakeOCR()
+    transport._ui_state = lambda target: {
+        "show_in_text_field_present": False,
+        "send_prompt_present": False,
+        "send_prompt_enabled": None,
+        "stop_streaming_present": False,
+    }
+    transport._raise_for_browser_error = lambda lines, ui_state, stage: None
+    replies = iter(
+        [
+            (
+                "",
+                'ASTER_PATCH_BEGIN\n{"summary":"ok","notes":[],"operations":[',
+            ),
+            ("", ""),
+        ]
+    )
+    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: next(replies)
+    transport._capture_reply_text_by_scrolling = lambda target, before_lines, prompt, max_steps: (
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}'
+    )
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.monotonic", _MonotonicClock())
+
+    class _Target:
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    reply = transport._capture_reply_text(_Target(), before_lines=[], prompt="create app", timeout_sec=4.0)
+
+    assert reply == ""
+    scroll_events = _notice_events(logger, "reply_scrolled_capture")
+    assert scroll_events
+    assert scroll_events[-1]["acceptance_tier"] == "scrolled_structured"
+    assert scroll_events[-1]["accepted"] is False
 
 
 def test_reply_detection_rejects_code_like_reply_while_send_button_is_still_visible() -> None:
