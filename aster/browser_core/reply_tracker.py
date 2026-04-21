@@ -31,6 +31,35 @@ STRONG_SCROLLED_CONTAMINATION_MARKERS = (
     "conversation history:",
     "final output rules for browser mode:",
 )
+SCROLLED_PAGE_CHROME_MARKERS = (
+    "search chats",
+    "new chat",
+    "projects",
+    "explore gpts",
+    "library",
+    "chatgpt can make mistakes",
+    "what are you working on",
+)
+SCROLLED_PAGE_NAVIGATION_LINES = {
+    "code",
+    "issues",
+    "pull requests",
+    "actions",
+    "projects",
+    "security",
+    "insights",
+    "share",
+}
+SCROLLED_TEST_OUTPUT_PATTERNS = (
+    r"^={3,}",
+    r"^platform .+ -- python ",
+    r"^rootdir:",
+    r"^plugins:",
+    r"^collected \d+ items?",
+    r"^short test summary info",
+    r"^.+::.+\s+(passed|failed|error|skipped)\b",
+    r"^(passed|failed|errors?) in \d",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,7 +517,7 @@ def merge_scrolled_reply_with_anchor(anchor_text: str, scrolled_segment: str, *,
 def merge_scrolled_reply_segments(anchor_text: str, segments: list[str], *, policy: ReplyTrackerPolicy) -> str:
     merged = clean_captured_segment_for_policy(anchor_text, policy=policy)
     for segment in segments:
-        assessment = assess_scrolled_segment_addition(merged, segment, policy=policy)
+        assessment = assess_scrolled_segment_addition(merged, segment, policy=policy, seed_text=anchor_text)
         if assessment["contributed"]:
             merged = str(assessment["merged_text"])
     return merged
@@ -549,6 +578,7 @@ def assess_scrolled_segment_addition(
     segment: str,
     *,
     policy: ReplyTrackerPolicy,
+    seed_text: str = "",
 ) -> dict[str, object]:
     current_clean = clean_captured_segment_for_policy(current_merged, policy=policy)
     before_progress = structured_completion_progress(current_clean)
@@ -565,6 +595,14 @@ def assess_scrolled_segment_addition(
         "meaningful_completion_progress": False,
         "before_progress": before_progress,
         "after_progress": before_progress,
+        "region_integrity_score": 0,
+        "region_reasons": [],
+        "continuity_against_seed": 0,
+        "continuity_against_current": 0,
+        "region_consistent": False,
+        "unrelated_page_content": False,
+        "unrelated_page_hits": [],
+        "drift_detected": False,
     }
     if not segment_clean:
         result["skip_reason"] = "empty_segment"
@@ -603,12 +641,40 @@ def assess_scrolled_segment_addition(
             and bool(after_progress["parseable"])
         )
     )
+    integrity = _assess_scrolled_region_integrity(
+        current_text=current_clean,
+        segment_text=segment_clean,
+        ordered_merge=ordered_merge,
+        seed_text=seed_text,
+        before_progress=before_progress,
+        after_progress=after_progress,
+    )
+    result["region_integrity_score"] = integrity["region_integrity_score"]
+    result["region_reasons"] = integrity["region_reasons"]
+    result["continuity_against_seed"] = integrity["continuity_against_seed"]
+    result["continuity_against_current"] = integrity["continuity_against_current"]
+    result["region_consistent"] = integrity["region_consistent"]
+    result["unrelated_page_content"] = integrity["unrelated_page_content"]
+    result["unrelated_page_hits"] = integrity["unrelated_page_hits"]
+    result["drift_detected"] = integrity["drift_detected"]
 
     if _normalize(ordered_merge) == _normalize(current_clean):
         result["skip_reason"] = "duplicate_overlap"
         return result
     if current_clean and _scrolled_anchor_consistency(current_clean, ordered_merge) <= 0:
         result["skip_reason"] = "lost_structured_seed"
+        return result
+    if "duplicate_patch_start" in integrity["region_reasons"]:
+        result["skip_reason"] = "reply_region_drift"
+        return result
+    if integrity["unrelated_page_content"] and not integrity["region_consistent"]:
+        result["skip_reason"] = "unrelated_page_content"
+        return result
+    if integrity["drift_detected"]:
+        result["skip_reason"] = "reply_region_drift"
+        return result
+    if current_clean and int(integrity["region_integrity_score"]) <= 0:
+        result["skip_reason"] = "low_region_integrity"
         return result
     if novelty_count <= 0 and result["growth_chars"] <= 0 and not result["meaningful_completion_progress"]:
         result["skip_reason"] = "no_new_structured_content"
@@ -1031,6 +1097,120 @@ def _completion_progress_numeric_score(progress: dict[str, object]) -> int:
     return score
 
 
+def _assess_scrolled_region_integrity(
+    *,
+    current_text: str,
+    segment_text: str,
+    ordered_merge: str,
+    seed_text: str,
+    before_progress: dict[str, object],
+    after_progress: dict[str, object],
+) -> dict[str, object]:
+    current_clean = current_text.strip()
+    seed_clean = seed_text.strip() or current_clean
+    segment_clean = segment_text.strip()
+    normalized_segment = _normalize(segment_clean)
+    current_consistency = _scrolled_anchor_consistency(current_clean, segment_clean) if current_clean else 0
+    seed_consistency = _scrolled_anchor_consistency(seed_clean, segment_clean) if seed_clean else 0
+    merged_current_consistency = _scrolled_anchor_consistency(current_clean, ordered_merge) if current_clean else 0
+    merged_seed_consistency = _scrolled_anchor_consistency(seed_clean, ordered_merge) if seed_clean else 0
+    tail_overlap = _suffix_prefix_overlap(_normalize(current_clean or seed_clean), normalized_segment)
+    unrelated_page_hits = _scrolled_unrelated_page_hits(segment_clean)
+    duplicate_patch_start = bool(before_progress["has_begin_marker"] and _has_begin_marker(segment_clean))
+    segment_structure_state = _reply_candidate_structure_state(
+        segment_clean,
+        is_patch_json=looks_like_patch_plan_json,
+    )
+    completion_progress = bool(
+        (not bool(before_progress["has_end_marker"]) and bool(after_progress["has_end_marker"]))
+        or (not bool(before_progress["parseable"]) and bool(after_progress["parseable"]))
+        or int(after_progress["schema_hits"]) > int(before_progress["schema_hits"])
+        or int(after_progress["operation_items"]) > int(before_progress["operation_items"])
+    )
+    structured_continuation = bool(
+        current_consistency > 0
+        or seed_consistency > 0
+        or tail_overlap >= 24
+        or completion_progress
+    )
+
+    score = 0
+    reasons: list[str] = []
+    if current_consistency > 0:
+        score += current_consistency * 4
+        reasons.append("current_reply_continuity")
+    if seed_consistency > 0:
+        score += seed_consistency * 3
+        reasons.append("seed_reply_continuity")
+    if merged_current_consistency > 0:
+        score += merged_current_consistency * 2
+        reasons.append("merged_reply_continuity")
+    if merged_seed_consistency > 0:
+        score += merged_seed_consistency * 2
+        reasons.append("merged_seed_continuity")
+    if tail_overlap >= 24:
+        score += min(4, max(1, tail_overlap // 32))
+        reasons.append("tail_overlap")
+    if structured_continuation:
+        score += 5
+        reasons.append("structured_continuation")
+    if segment_structure_state in {"partial_structured", "complete_structured"} and structured_continuation:
+        score += 3
+        reasons.append("structured_segment")
+    if not bool(before_progress["has_end_marker"]) and bool(after_progress["has_end_marker"]):
+        score += 4
+        reasons.append("gains_patch_end")
+    if not bool(before_progress["parseable"]) and bool(after_progress["parseable"]):
+        score += 6
+        reasons.append("gains_parseable_json")
+    if int(after_progress["schema_hits"]) > int(before_progress["schema_hits"]):
+        score += 2
+        reasons.append("adds_schema_keys")
+    if int(after_progress["operation_items"]) > int(before_progress["operation_items"]):
+        score += 2
+        reasons.append("adds_operations")
+
+    if duplicate_patch_start:
+        score -= 12
+        if unrelated_page_hits:
+            score -= 8
+            score = min(score, -1)
+        reasons.append("duplicate_patch_start")
+    if unrelated_page_hits:
+        score -= 4 + min(len(unrelated_page_hits), 3) * 2
+        reasons.append("unrelated_page_content")
+    if current_clean and segment_structure_state in {"raw_code", "unstructured"} and not structured_continuation:
+        score -= 5
+        reasons.append("weak_region_continuity")
+
+    drift_detected = bool(
+        current_clean
+        and (
+            (duplicate_patch_start and current_consistency <= 0 and seed_consistency <= 0)
+            or (unrelated_page_hits and current_consistency <= 0 and seed_consistency <= 0 and not completion_progress)
+        )
+    )
+    if drift_detected:
+        score -= 6
+        reasons.append("reply_region_drift")
+
+    deduped_reasons: list[str] = []
+    for reason in reasons:
+        if reason not in deduped_reasons:
+            deduped_reasons.append(reason)
+
+    return {
+        "region_integrity_score": score,
+        "region_reasons": deduped_reasons,
+        "continuity_against_seed": seed_consistency,
+        "continuity_against_current": current_consistency,
+        "region_consistent": score > 0 and not drift_detected,
+        "unrelated_page_content": bool(unrelated_page_hits),
+        "unrelated_page_hits": unrelated_page_hits,
+        "drift_detected": drift_detected,
+    }
+
+
 def _structured_reply_quality(
     text: str,
     *,
@@ -1080,6 +1260,69 @@ def _scrolled_anchor_consistency(anchor_text: str, candidate_text: str) -> int:
     candidate_lines = {_normalize(line) for line in candidate_clean.splitlines() if line.strip()}
     overlap = sum(1 for line in anchor_lines[:8] if line in candidate_lines)
     return min(overlap, 2)
+
+
+def _suffix_prefix_overlap(current_text: str, segment_text: str, *, max_chars: int = 240) -> int:
+    current = current_text.strip()
+    segment = segment_text.strip()
+    if not current or not segment:
+        return 0
+    max_overlap = min(len(current), len(segment), max_chars)
+    for count in range(max_overlap, 0, -1):
+        if current[-count:] == segment[:count]:
+            return count
+    return 0
+
+
+def _has_begin_marker(text: str) -> bool:
+    lowered = _normalize(text)
+    return "aster patch begin" in lowered or "aster_patch_begin" in lowered
+
+
+def _scrolled_unrelated_page_hits(text: str) -> list[str]:
+    hits: list[str] = []
+    lowered = _normalize(text)
+    for marker in SCROLLED_PAGE_CHROME_MARKERS:
+        if marker in lowered and marker not in hits:
+            hits.append(marker)
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        normalized_line = _normalize(line)
+        if not line:
+            continue
+        if normalized_line in SCROLLED_PAGE_NAVIGATION_LINES and normalized_line not in hits:
+            hits.append(normalized_line)
+        if _looks_like_repo_listing_line(line) and "repo_listing" not in hits:
+            hits.append("repo_listing")
+        if _looks_like_test_output_line(line) and "test_output" not in hits:
+            hits.append("test_output")
+    return hits
+
+
+def _looks_like_repo_listing_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if any(char in stripped for char in '{}[]"=:,'):
+        return False
+    return bool(
+        re.fullmatch(r"[\w./\\-]+\.(py|pyi|md|txt|json|toml|yaml|yml|ini|cfg)", stripped, flags=re.IGNORECASE)
+        or re.fullmatch(r"[\w./\\-]+/", stripped)
+        or re.fullmatch(r"(tests?|docs?|src|scripts?)([/\\][\w./\\-]+)?", stripped, flags=re.IGNORECASE)
+    )
+
+
+def _looks_like_test_output_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if any(char in stripped for char in '{}[]"') and '"type"' in stripped:
+        return False
+    for pattern in SCROLLED_TEST_OUTPUT_PATTERNS:
+        if re.search(pattern, stripped, flags=re.IGNORECASE):
+            return True
+    return False
 
 
 def _reply_candidate_structure_state(

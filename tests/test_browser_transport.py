@@ -678,6 +678,49 @@ def test_capture_reply_text_by_scrolling_keeps_structured_anchor_over_prompt_con
     assert "ASTER_PATCH_END" in reply
 
 
+def test_capture_reply_text_by_scrolling_rejects_unrelated_page_drift_with_region_diagnostics(monkeypatch) -> None:
+    logger = _FakeAuditLogger()
+    transport = BrowserChatGPTTransport(logger=logger)
+    transport._tick_runtime_log_heartbeat = lambda *_args, **_kwargs: None
+    transport._activity = lambda *_args, **_kwargs: None
+    transport._scroll_reply_to_bottom = lambda target: None
+    transport._scroll_reply_up = lambda target: None
+    segments = iter(
+        [
+            "tests/test_calc.py\ncollected 4 items\nshort test summary info\n",
+            'from tkinter import ttk\\nprint(\\"ok\\")"}]}\nASTER_PATCH_END',
+            "",
+        ]
+    )
+    transport._capture_visible_reply_segment = lambda target, before_lines, prompt: next(segments)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+
+    class _Target:
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    reply = transport._capture_reply_text_by_scrolling(
+        _Target(),
+        before_lines=[],
+        prompt="create app",
+        max_steps=3,
+        structured_anchor_text=(
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+        ),
+    )
+
+    assert looks_like_patch_plan_json(reply) is True
+    skipped = _notice_events(logger, "reply_scroll_segment_skipped")
+    assert skipped
+    assert skipped[0]["skip_reason"] in {"unrelated_page_content", "reply_region_drift", "low_region_integrity"}
+    assert skipped[0]["unrelated_page_content"] is True
+    assert skipped[0]["region_integrity_score"] <= 0
+    assert skipped[0]["drift_detected"] is True or skipped[0]["unrelated_page_hits"]
+
+
 def test_capture_reply_text_by_scrolling_assembles_ordered_segments_into_parseable_json(monkeypatch) -> None:
     logger = _FakeAuditLogger()
     transport = BrowserChatGPTTransport(logger=logger)
@@ -714,6 +757,10 @@ def test_capture_reply_text_by_scrolling_assembles_ordered_segments_into_parseab
     )
 
     assert looks_like_patch_plan_json(reply) is True
+    scroll_events = _notice_events(logger, "reply_scroll_segment")
+    assert scroll_events
+    assert "region_integrity_score" in scroll_events[-1]
+    assert "continuity_against_seed" in scroll_events[-1]
     skipped = _notice_events(logger, "reply_scroll_segment_skipped")
     assert skipped
     assert skipped[0]["skip_reason"] in {"duplicate_overlap", "no_new_structured_content"}

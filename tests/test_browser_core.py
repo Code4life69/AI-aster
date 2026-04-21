@@ -988,6 +988,45 @@ def test_assess_scrolled_segment_addition_skips_duplicate_tail_segment() -> None
     assert assessment["skip_reason"] in {"duplicate_overlap", "no_new_structured_content"}
 
 
+def test_assess_scrolled_segment_addition_rejects_unrelated_page_content_during_scroll_merge() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    unrelated = (
+        "tests/test_calc.py\n"
+        "collected 4 items\n"
+        "short test summary info\n"
+        'ASTER_PATCH_BEGIN\n{"summary":"noise","notes":[],"operations":[{"type":"RUN COMMANDS","path":".","reason":"verify","commands":["pytest"]}]}\nASTER_PATCH_END'
+    )
+
+    assessment = assess_scrolled_segment_addition(anchor, unrelated, policy=TEST_REPLY_POLICY, seed_text=anchor)
+
+    assert assessment["contributed"] is False
+    assert assessment["skip_reason"] in {"unrelated_page_content", "reply_region_drift", "low_region_integrity"}
+    assert assessment["unrelated_page_content"] is True
+    assert "test_output" in assessment["unrelated_page_hits"] or "repo_listing" in assessment["unrelated_page_hits"]
+
+
+def test_assess_scrolled_segment_addition_requires_region_integrity_not_just_completion_score() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    drift_segment = (
+        "tests/test_calc.py\n"
+        "collected 4 items\n"
+        'ASTER_PATCH_BEGIN\n{"summary":"other","notes":[],"operations":[{"type":"CREATE FILE","path":"tests/test_calc.py","reason":"add","content":"def test_ok():\\n    assert 1 == 1"}]}\nASTER_PATCH_END'
+    )
+
+    assessment = assess_scrolled_segment_addition(anchor, drift_segment, policy=TEST_REPLY_POLICY, seed_text=anchor)
+
+    assert assessment["after_progress"]["completion_score"] >= assessment["before_progress"]["completion_score"]
+    assert assessment["contributed"] is False
+    assert assessment["region_integrity_score"] <= 0
+    assert assessment["skip_reason"] in {"unrelated_page_content", "reply_region_drift", "low_region_integrity"}
+
+
 def test_merge_scrolled_reply_segments_combines_ordered_segments_into_parseable_json() -> None:
     anchor = (
         "ASTER_PATCH_BEGIN\n"
@@ -1003,6 +1042,22 @@ def test_merge_scrolled_reply_segments_combines_ordered_segments_into_parseable_
     assert looks_like_patch_plan_json(merged) is True
 
 
+def test_merge_scrolled_reply_segments_preserves_structured_seed_over_unrelated_page_drift() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    segments = [
+        "tests/test_calc.py\ncollected 4 items\nshort test summary info\n",
+        'from tkinter import ttk\\nprint(\\"ok\\")"}]}\nASTER_PATCH_END',
+    ]
+
+    merged = merge_scrolled_reply_segments(anchor, segments, policy=TEST_REPLY_POLICY)
+
+    assert looks_like_patch_plan_json(merged) is True
+    assert "tests/test_calc.py" not in merged
+
+
 def test_assess_scrolled_segment_addition_allows_completion_progress_with_small_fragment() -> None:
     anchor = (
         "ASTER_PATCH_BEGIN\n"
@@ -1010,12 +1065,14 @@ def test_assess_scrolled_segment_addition_allows_completion_progress_with_small_
     )
     closing_fragment = 'from tkinter import ttk\\nprint(\\"ok\\")"}]}\nASTER_PATCH_END'
 
-    assessment = assess_scrolled_segment_addition(anchor, closing_fragment, policy=TEST_REPLY_POLICY)
+    assessment = assess_scrolled_segment_addition(anchor, closing_fragment, policy=TEST_REPLY_POLICY, seed_text=anchor)
 
     assert assessment["contributed"] is True
     assert assessment["meaningful_completion_progress"] is True
     assert assessment["completion_score_delta"] > 0
     assert assessment["after_progress"]["parseable"] is True
+    assert assessment["region_integrity_score"] > 0
+    assert assessment["region_consistent"] is True
 
 
 def test_structured_completion_progress_prefers_balanced_parseable_growth_over_raw_length() -> None:
