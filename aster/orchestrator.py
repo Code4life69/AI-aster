@@ -15,6 +15,7 @@ from aster.safety_guard import SafetyGuard
 from aster.session import SessionStore
 from aster.transport_api import OpenAIResponsesTransport
 from aster.transport_browser import BrowserChatGPTTransport
+from aster.visual_action_memory import VisualActionDebugSession, VisualRegionMemoryStore
 
 
 @dataclass(slots=True)
@@ -63,6 +64,25 @@ class AsterOrchestrator:
             current_branch=lambda: self.git.current_branch(),
             log_event=lambda event, payload: self.logger.log("browser_transport", {"event": event, **payload}),
         )
+        visual_trace_dir = (
+            config.visual_action_trace_dir
+            if config.visual_action_trace_dir.is_absolute()
+            else config.project_root / config.visual_action_trace_dir
+        )
+        visual_memory_path = (
+            config.visual_action_memory_path
+            if config.visual_action_memory_path.is_absolute()
+            else config.project_root / config.visual_action_memory_path
+        )
+        visual_action_debug = VisualActionDebugSession(
+            root_dir=visual_trace_dir,
+            enabled=config.visual_action_trace_enabled,
+            checkpoint_interval_seconds=config.visual_action_trace_checkpoint_interval_seconds,
+            max_checkpoints_per_key=config.visual_action_trace_max_checkpoints_per_key,
+        )
+        visual_region_memory = VisualRegionMemoryStore(visual_memory_path)
+        if config.visual_action_memory_enabled:
+            visual_region_memory.load()
         thread_registry_path = (
             config.thread_registry_path
             if config.thread_registry_path.is_absolute()
@@ -77,6 +97,9 @@ class AsterOrchestrator:
             log_screenshots=config.log_screenshots,
             max_recovery_attempts=config.max_recovery_attempts,
             runtime_log_heartbeat=self.runtime_log_heartbeat,
+            visual_action_debug=visual_action_debug,
+            visual_region_memory=visual_region_memory,
+            visual_action_memory_enabled=config.visual_action_memory_enabled,
         )
 
     def plan(self, goal: str, mode: str | None = None) -> OrchestrationResult:

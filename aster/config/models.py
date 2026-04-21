@@ -50,6 +50,12 @@ class AsterConfig:
     verification_level: str = "basic"
     log_screenshots: bool = False
     max_recovery_attempts: int = 3
+    visual_action_trace_enabled: bool = False
+    visual_action_trace_dir: Path = Path(".aster/visual_trace")
+    visual_action_memory_enabled: bool = True
+    visual_action_memory_path: Path = Path(".aster/visual_region_memory.json")
+    visual_action_trace_checkpoint_interval_seconds: int = 15
+    visual_action_trace_max_checkpoints_per_key: int = 2
     runtime_log_heartbeat_push_enabled: bool = False
     runtime_log_heartbeat_interval_seconds: int = 30
     runtime_log_heartbeat_branch_only: bool = True

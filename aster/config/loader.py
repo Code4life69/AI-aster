@@ -15,6 +15,8 @@ def load_config(project_root: Path, config_path: Path | None = None) -> AsterCon
         project_root=root,
         log_dir=root / ".aster",
         thread_registry_path=root / ".aster" / "thread_registry.json",
+        visual_action_trace_dir=root / ".aster" / "visual_trace",
+        visual_action_memory_path=root / ".aster" / "visual_region_memory.json",
     )
     if not target.exists():
         return config
@@ -22,6 +24,12 @@ def load_config(project_root: Path, config_path: Path | None = None) -> AsterCon
     thread_registry_raw = Path(str(data.get("thread_registry_path", config.thread_registry_path)))
     if not thread_registry_raw.is_absolute():
         thread_registry_raw = root / thread_registry_raw
+    visual_trace_dir_raw = Path(str(data.get("visual_action_trace_dir", config.visual_action_trace_dir)))
+    if not visual_trace_dir_raw.is_absolute():
+        visual_trace_dir_raw = root / visual_trace_dir_raw
+    visual_memory_path_raw = Path(str(data.get("visual_action_memory_path", config.visual_action_memory_path)))
+    if not visual_memory_path_raw.is_absolute():
+        visual_memory_path_raw = root / visual_memory_path_raw
     return AsterConfig(
         project_root=root,
         ignore_patterns=list(data.get("ignore_patterns", config.ignore_patterns)),
@@ -42,6 +50,26 @@ def load_config(project_root: Path, config_path: Path | None = None) -> AsterCon
         verification_level=str(data.get("verification_level", config.verification_level)),
         log_screenshots=bool(data.get("log_screenshots", config.log_screenshots)),
         max_recovery_attempts=int(data.get("max_recovery_attempts", config.max_recovery_attempts)),
+        visual_action_trace_enabled=bool(
+            data.get("visual_action_trace_enabled", config.visual_action_trace_enabled)
+        ),
+        visual_action_trace_dir=visual_trace_dir_raw,
+        visual_action_memory_enabled=bool(
+            data.get("visual_action_memory_enabled", config.visual_action_memory_enabled)
+        ),
+        visual_action_memory_path=visual_memory_path_raw,
+        visual_action_trace_checkpoint_interval_seconds=int(
+            data.get(
+                "visual_action_trace_checkpoint_interval_seconds",
+                config.visual_action_trace_checkpoint_interval_seconds,
+            )
+        ),
+        visual_action_trace_max_checkpoints_per_key=int(
+            data.get(
+                "visual_action_trace_max_checkpoints_per_key",
+                config.visual_action_trace_max_checkpoints_per_key,
+            )
+        ),
         runtime_log_heartbeat_push_enabled=bool(
             data.get("runtime_log_heartbeat_push_enabled", config.runtime_log_heartbeat_push_enabled)
         ),
