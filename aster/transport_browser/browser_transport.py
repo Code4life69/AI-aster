@@ -52,6 +52,13 @@ from aster.browser_core import (
     window_title_suggests_existing_chat,
 )
 from aster.runtime_log_heartbeat import RuntimeLogHeartbeatPusher
+from aster.visual_action_memory import (
+    VisualActionDebugSession,
+    VisualRegionMemoryStore,
+    build_visual_manifest_entry,
+    denormalize_region,
+    normalize_region,
+)
 
 
 BROWSER_REPLY_NOISE = (
@@ -431,6 +438,9 @@ class BrowserChatGPTTransport:
         log_screenshots: bool = False,
         max_recovery_attempts: int = 3,
         runtime_log_heartbeat: RuntimeLogHeartbeatPusher | None = None,
+        visual_action_debug: VisualActionDebugSession | None = None,
+        visual_region_memory: VisualRegionMemoryStore | None = None,
+        visual_action_memory_enabled: bool = True,
     ) -> None:
         self._executor = None
         self._capture = None
@@ -449,6 +459,10 @@ class BrowserChatGPTTransport:
         self._last_uia_control_diagnostics: dict[str, Any] | None = None
         self._last_uia_diagnostic_signature = ""
         self._last_reply_capture_snapshot = _ReplyCaptureSnapshot()
+        self._visual_action_debug = visual_action_debug
+        self._visual_region_memory = visual_region_memory
+        self._visual_action_memory_enabled = visual_action_memory_enabled
+        self._visual_action_run_id = ""
 
     def _log(self, event: str, payload: dict[str, Any]) -> None:
         if self._logger is None:
@@ -482,6 +496,435 @@ class BrowserChatGPTTransport:
         if self._runtime_log_heartbeat is None:
             return
         self._runtime_log_heartbeat.tick(reason=reason)
+
+    @staticmethod
+    def _window_rect(target) -> tuple[int, int, int, int]:
+        return (
+            int(getattr(target, "left", 0)),
+            int(getattr(target, "top", 0)),
+            int(getattr(target, "left", 0) + getattr(target, "width", 0)),
+            int(getattr(target, "top", 0) + getattr(target, "height", 0)),
+        )
+
+    @staticmethod
+    def _rect_from_center(center_x: int, center_y: int, *, radius_x: int = 28, radius_y: int = 20) -> tuple[int, int, int, int]:
+        return (
+            int(center_x - radius_x),
+            int(center_y - radius_y),
+            int(center_x + radius_x),
+            int(center_y + radius_y),
+        )
+
+    @staticmethod
+    def _safe_cursor_position() -> tuple[int, int] | None:
+        if pyautogui is None:
+            return None
+        try:
+            pos = pyautogui.position()
+            if hasattr(pos, "x") and hasattr(pos, "y"):
+                return (int(pos.x), int(pos.y))
+            if isinstance(pos, tuple) and len(pos) >= 2:
+                return (int(pos[0]), int(pos[1]))
+        except Exception:
+            return None
+        return None
+
+    def _visual_page_state(self) -> str:
+        analysis = self._last_page_classification
+        if analysis is None:
+            return ""
+        if analysis.composer_visible and analysis.looks_like_chatgpt:
+            return "chatgpt_composer_visible"
+        if analysis.looks_like_chatgpt:
+            return "chatgpt_visible"
+        return "browser_unknown"
+
+    def _visual_page_summary(self) -> dict[str, Any]:
+        analysis = self._last_page_classification
+        if analysis is None:
+            return {}
+        return {
+            "ready_score": round(analysis.ready_score, 1),
+            "looks_like_chatgpt": analysis.looks_like_chatgpt,
+            "composer_visible": analysis.composer_visible,
+            "send_button_present": analysis.send_button_present,
+            "stop_streaming_present": analysis.stop_streaming_present,
+            "wrong_page_signals_present": analysis.wrong_page_signals_present,
+        }
+
+    @staticmethod
+    def _visual_ui_summary(ui_state: dict[str, Any] | None) -> dict[str, Any]:
+        if not ui_state:
+            return {}
+        keys = (
+            "send_prompt_present",
+            "send_prompt_enabled",
+            "show_in_text_field_present",
+            "stop_streaming_present",
+            "composer_edit_length",
+            "composer_edit_preview",
+            "window_title",
+        )
+        return {key: ui_state.get(key) for key in keys if key in ui_state}
+
+    @staticmethod
+    def _visual_ocr_summary(lines) -> list[str]:
+        if not lines:
+            return []
+        return [str(getattr(line, "text", line))[:120] for line in list(lines)[:5]]
+
+    def _start_visual_action_run(self) -> None:
+        if self._visual_action_debug is None:
+            self._visual_action_run_id = ""
+            return
+        self._visual_action_run_id = self._visual_action_debug.start_run()
+        self._log(
+            "visual_action_trace_started",
+            {
+                "run_id": self._visual_action_run_id,
+                "trace_enabled": self._visual_action_debug.enabled,
+                "memory_enabled": self._visual_action_memory_enabled,
+            },
+        )
+
+    def _capture_visual_window(self, target):
+        if self._capture is None:
+            return None
+        try:
+            return self._capture.capture_region(target.left, target.top, target.width, target.height)
+        except Exception:
+            return None
+
+    def _visual_memory_hint(
+        self,
+        *,
+        intent: str,
+        target,
+        ui_state: dict[str, Any] | None = None,
+        lines=None,
+    ):
+        if not self._visual_action_memory_enabled or self._visual_region_memory is None:
+            return None
+        hint = self._visual_region_memory.select_hint(
+            intent=intent,
+            window_title=str(getattr(target, "title", "")),
+            page_state=self._visual_page_state(),
+            uia_hints=tuple(
+                item for item in [
+                    str((ui_state or {}).get("composer_edit_preview", "")).strip(),
+                    "send" if (ui_state or {}).get("send_prompt_present") else "",
+                    "streaming" if (ui_state or {}).get("stop_streaming_present") else "",
+                ] if item
+            ),
+            ocr_hints=tuple(self._visual_ocr_summary(lines)[:3]),
+        )
+        if hint is None:
+            self._log("visual_memory_miss", {"intent": intent, "window_title": str(getattr(target, "title", ""))})
+            return None
+        self._log(
+            "visual_memory_hit",
+            {
+                "intent": intent,
+                "confidence": round(hint.confidence, 3),
+                "score": round(hint.score, 3),
+                "title_match": hint.title_match,
+                "page_state_match": hint.page_state_match,
+            },
+        )
+        confidence_event = (
+            "action_region_confidence_confirmed"
+            if hint.confidence >= 0.45 or hint.score >= 0.6
+            else "action_region_confidence_low"
+        )
+        self._log(
+            confidence_event,
+            {
+                "intent": intent,
+                "confidence": round(hint.confidence, 3),
+                "score": round(hint.score, 3),
+            },
+        )
+        return hint
+
+    def _visual_memory_update(
+        self,
+        *,
+        intent: str,
+        target,
+        action_type: str,
+        rect: tuple[int, int, int, int],
+        ui_state: dict[str, Any] | None = None,
+        lines=None,
+    ) -> None:
+        if not self._visual_action_memory_enabled or self._visual_region_memory is None:
+            return
+        entry = self._visual_region_memory.remember_success(
+            intent=intent,
+            region=normalize_region(rect, self._window_rect(target)),
+            window_title_pattern=str(getattr(target, "title", "")),
+            page_state=self._visual_page_state(),
+            action_type=action_type,
+            uia_hints=tuple(
+                item for item in [
+                    str((ui_state or {}).get("composer_edit_preview", "")).strip(),
+                    "send" if (ui_state or {}).get("send_prompt_present") else "",
+                    "streaming" if (ui_state or {}).get("stop_streaming_present") else "",
+                ] if item
+            ),
+            ocr_hints=tuple(self._visual_ocr_summary(lines)[:3]),
+        )
+        self._visual_region_memory.save()
+        self._log(
+            "visual_memory_updated",
+            {
+                "intent": intent,
+                "confidence": round(entry.confidence, 3),
+                "success_count": entry.success_count,
+            },
+        )
+
+    def _visual_memory_invalidate(self, *, intent: str, target, reason_weight: float = 0.25) -> None:
+        if not self._visual_action_memory_enabled or self._visual_region_memory is None:
+            return
+        entry = self._visual_region_memory.invalidate(
+            intent=intent,
+            window_title_pattern=str(getattr(target, "title", "")),
+            page_state=self._visual_page_state(),
+            reason_weight=reason_weight,
+        )
+        if entry is None:
+            return
+        self._visual_region_memory.save()
+        self._log(
+            "visual_memory_invalidated",
+            {
+                "intent": intent,
+                "confidence": round(entry.confidence, 3),
+                "failure_count": entry.failure_count,
+            },
+        )
+
+    def _begin_visual_action(
+        self,
+        *,
+        target,
+        action_type: str,
+        target_intent: str,
+        ui_state: dict[str, Any] | None = None,
+        lines=None,
+        target_rect: tuple[int, int, int, int] | None = None,
+        candidate_rects: list[tuple[int, int, int, int]] | None = None,
+        confidence_before: float | None = None,
+        used_remembered_region: bool = False,
+    ) -> dict[str, Any] | None:
+        if self._visual_action_debug is None or not self._visual_action_debug.enabled:
+            return None
+        step = self._visual_action_debug.next_step(action_type)
+        cursor_before = self._safe_cursor_position()
+        image = self._capture_visual_window(target)
+        pre_path = self._visual_action_debug.save_stage_image(step, "pre", image)
+        context = {
+            "step": step,
+            "action_type": action_type,
+            "target_intent": target_intent,
+            "window_title": str(getattr(target, "title", "")),
+            "cursor_before": cursor_before,
+            "cursor_during": None,
+            "cursor_after": None,
+            "target_rect": target_rect,
+            "candidate_rects": candidate_rects or [],
+            "ui_summary": self._visual_ui_summary(ui_state),
+            "ocr_summary": self._visual_ocr_summary(lines),
+            "page_summary": self._visual_page_summary(),
+            "confidence_before": confidence_before,
+            "confidence_after": None,
+            "used_remembered_region": used_remembered_region,
+            "updated_remembered_region": False,
+            "screenshot_paths": {
+                "pre": str(pre_path) if pre_path is not None else None,
+                "during": None,
+                "post": None,
+            },
+        }
+        self._log(
+            "visual_action_trace_started",
+            {
+                "run_id": step.run_id,
+                "step_id": step.step_id,
+                "action_type": action_type,
+                "target_intent": target_intent,
+                "used_remembered_region": used_remembered_region,
+            },
+        )
+        return context
+
+    def _capture_visual_action_stage(
+        self,
+        context: dict[str, Any] | None,
+        *,
+        target,
+        stage: str,
+        ui_state: dict[str, Any] | None = None,
+        lines=None,
+        action_outcome: str = "",
+        confidence_after: float | None = None,
+        updated_remembered_region: bool = False,
+    ) -> None:
+        if context is None or self._visual_action_debug is None:
+            return
+        image = self._capture_visual_window(target)
+        path = self._visual_action_debug.save_stage_image(context["step"], stage, image)
+        if stage == "during":
+            context["cursor_during"] = self._safe_cursor_position()
+        if stage == "post":
+            context["cursor_after"] = self._safe_cursor_position()
+        context["ui_summary"] = self._visual_ui_summary(ui_state)
+        context["ocr_summary"] = self._visual_ocr_summary(lines)
+        context["page_summary"] = self._visual_page_summary()
+        context["confidence_after"] = confidence_after
+        context["updated_remembered_region"] = updated_remembered_region
+        if path is not None:
+            context["screenshot_paths"][stage] = str(path)
+        entry = build_visual_manifest_entry(
+            run_id=context["step"].run_id,
+            step_id=context["step"].step_id,
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            stage=stage,
+            action_type=context["action_type"],
+            target_intent=context["target_intent"],
+            window_title=context["window_title"],
+            cursor_before=context["cursor_before"],
+            cursor_during=context["cursor_during"],
+            cursor_after=context["cursor_after"],
+            target_rect=context["target_rect"],
+            candidate_rects=context["candidate_rects"],
+            ui_summary=context["ui_summary"],
+            ocr_summary=context["ocr_summary"],
+            page_summary=context["page_summary"],
+            screenshot_paths=context["screenshot_paths"],
+            action_outcome=action_outcome,
+            confidence_before=context["confidence_before"],
+            confidence_after=context["confidence_after"],
+            used_remembered_region=context["used_remembered_region"],
+            updated_remembered_region=context["updated_remembered_region"],
+        )
+        self._visual_action_debug.append_manifest_entry(context["step"], entry)
+        self._log(
+            "visual_action_trace_captured",
+            {
+                "run_id": context["step"].run_id,
+                "step_id": context["step"].step_id,
+                "stage": stage,
+                "action_type": context["action_type"],
+                "target_intent": context["target_intent"],
+                "screenshot_path": context["screenshot_paths"].get(stage),
+                "action_outcome": action_outcome,
+            },
+        )
+
+    @staticmethod
+    def _rect_center(rect: tuple[int, int, int, int] | None) -> tuple[int, int] | None:
+        if rect is None:
+            return None
+        left, top, right, bottom = rect
+        return (int((left + right) / 2), int((top + bottom) / 2))
+
+    @staticmethod
+    def _rect_distance(
+        left_rect: tuple[int, int, int, int] | None,
+        right_rect: tuple[int, int, int, int] | None,
+    ) -> float:
+        left_center = BrowserChatGPTTransport._rect_center(left_rect)
+        right_center = BrowserChatGPTTransport._rect_center(right_rect)
+        if left_center is None or right_center is None:
+            return float("inf")
+        return abs(left_center[0] - right_center[0]) + abs(left_center[1] - right_center[1])
+
+    def _hint_rect(self, hint, target) -> tuple[int, int, int, int] | None:
+        if hint is None:
+            return None
+        return denormalize_region(hint.region, self._window_rect(target))
+
+    @staticmethod
+    def _visual_intent_from_phrase(phrase: str) -> str:
+        normalized = _normalize(phrase)
+        if normalized == "send prompt":
+            return "send_button_area"
+        if normalized == "new chat":
+            return "new_chat_button"
+        return f"named_control:{normalized.replace(' ', '_')}"
+
+    @staticmethod
+    def _default_composer_rect(target) -> tuple[int, int, int, int]:
+        return (
+            int(target.left + target.width * 0.24),
+            int(target.top + target.height * 0.79),
+            int(target.left + target.width * 0.91),
+            int(target.top + target.height * 0.94),
+        )
+
+    @staticmethod
+    def _default_send_button_rect(target) -> tuple[int, int, int, int]:
+        center_x = int(target.left + target.width * 0.95)
+        center_y = int(target.top + target.height * 0.93)
+        return BrowserChatGPTTransport._rect_from_center(center_x, center_y, radius_x=26, radius_y=22)
+
+    @staticmethod
+    def _default_reply_region_rect(target) -> tuple[int, int, int, int]:
+        return (
+            int(target.left + target.width * 0.38),
+            int(target.top + target.height * 0.20),
+            int(target.left + target.width * 0.94),
+            int(target.top + target.height * 0.74),
+        )
+
+    def _run_visual_recovery_action(
+        self,
+        *,
+        target,
+        action_name: str,
+        target_intent: str,
+        callback,
+    ) -> None:
+        ui_state = self._ui_state(target)
+        if target_intent == "composer_area":
+            target_rect = self._default_composer_rect(target)
+        elif target_intent in {"reply_region", "page_rescan"}:
+            target_rect = self._default_reply_region_rect(target)
+        else:
+            target_rect = self._default_send_button_rect(target)
+        context = self._begin_visual_action(
+            target=target,
+            action_type="recovery_action",
+            target_intent=target_intent,
+            ui_state=ui_state,
+            target_rect=target_rect,
+        )
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="during",
+            ui_state=ui_state,
+            action_outcome=f"recovery_started:{action_name}",
+        )
+        try:
+            callback()
+        except Exception as exc:
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="post",
+                ui_state=self._ui_state(target),
+                action_outcome=f"recovery_failed:{action_name}:{exc}",
+            )
+            raise
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome=f"recovery_completed:{action_name}",
+        )
 
     def _ensure_runtime(self) -> None:
         if self._executor is not None:
@@ -571,6 +1014,7 @@ class BrowserChatGPTTransport:
         )
         prompt_anchor = build_turn_anchor(prompt)
         self._last_reply_capture_snapshot = _ReplyCaptureSnapshot()
+        self._start_visual_action_run()
         self._start_runtime_log_heartbeat()
         try:
             self.thread_registry.load()
@@ -907,19 +1351,109 @@ class BrowserChatGPTTransport:
         return "ask anything" in full
 
     def _click_send_button(self, target) -> None:
+        ui_state = self._ui_state(target)
+        hint = self._visual_memory_hint(intent="send_button_area", target=target, ui_state=ui_state)
+        hint_rect = self._hint_rect(hint, target)
+        fallback_rect = hint_rect or self._default_send_button_rect(target)
+        context = self._begin_visual_action(
+            target=target,
+            action_type="click_action",
+            target_intent="send_button_area",
+            ui_state=ui_state,
+            target_rect=fallback_rect,
+            candidate_rects=[fallback_rect] if fallback_rect is not None else [],
+            confidence_before=hint.confidence if hint is not None else None,
+            used_remembered_region=hint is not None,
+        )
         if self._click_named_button(target, "send prompt"):
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="during",
+                ui_state=self._ui_state(target),
+                action_outcome="delegated_named_send_click",
+                confidence_after=hint.confidence if hint is not None else None,
+            )
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="post",
+                ui_state=self._ui_state(target),
+                action_outcome="send_click_completed",
+                confidence_after=hint.confidence if hint is not None else None,
+            )
             return
         self._focus_window(target)
-        x = int(target.left + target.width * 0.95)
-        y = int(target.top + target.height * 0.93)
-        self._log("send_button_coordinate_click", {"x": x, "y": y})
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="during",
+            ui_state=ui_state,
+            action_outcome="coordinate_send_click_start",
+            confidence_after=hint.confidence if hint is not None else None,
+        )
+        click_center = self._rect_center(fallback_rect) or (
+            int(target.left + target.width * 0.95),
+            int(target.top + target.height * 0.93),
+        )
+        x, y = click_center
+        self._log("send_button_coordinate_click", {"x": x, "y": y, "used_remembered_region": hint is not None})
         pyautogui.click(x, y)
+        target_rect = self._rect_from_center(x, y, radius_x=26, radius_y=22)
+        self._visual_memory_update(
+            intent="send_button_area",
+            target=target,
+            action_type="click_action",
+            rect=target_rect,
+            ui_state=self._ui_state(target),
+        )
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome="coordinate_send_click_completed",
+            confidence_after=1.0 if hint is not None else None,
+            updated_remembered_region=True,
+        )
 
-    def _click_line(self, target, line) -> None:
-        self._focus_window(target)
+    def _click_line(self, target, line, *, target_intent: str = "click_target", action_type: str = "click_action") -> None:
         x = int(target.left + line.center[0])
         y = int(target.top + line.center[1])
+        target_rect = self._rect_from_center(x, y)
+        context = self._begin_visual_action(
+            target=target,
+            action_type=action_type,
+            target_intent=target_intent,
+            target_rect=target_rect,
+            candidate_rects=[target_rect],
+        )
+        self._focus_window(target)
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="during",
+            ui_state=self._ui_state(target),
+            action_outcome="click_line_start",
+        )
         pyautogui.click(x, y)
+        if target_intent in {"composer_area", "reply_region"}:
+            self._visual_memory_update(
+                intent=target_intent,
+                target=target,
+                action_type=action_type,
+                rect=target_rect,
+                ui_state=self._ui_state(target),
+                lines=[line],
+            )
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome="click_line_completed",
+            updated_remembered_region=target_intent in {"composer_area", "reply_region"},
+        )
 
     def _click_named_button(self, target, phrase: str) -> bool:
         return self._click_named_control(target, phrase, control_types=("Button",))
@@ -1033,8 +1567,24 @@ class BrowserChatGPTTransport:
         return diagnostics
 
     def _click_named_control(self, target, phrase: str, control_types: tuple[str, ...] | None = None) -> bool:
+        ui_state = self._ui_state(target)
+        memory_intent = self._visual_intent_from_phrase(phrase)
+        hint = self._visual_memory_hint(intent=memory_intent, target=target, ui_state=ui_state)
+        hint_rect = self._hint_rect(hint, target)
+        candidate_rects: list[tuple[int, int, int, int]] = []
+        context = self._begin_visual_action(
+            target=target,
+            action_type="named_control_click",
+            target_intent=memory_intent,
+            ui_state=ui_state,
+            target_rect=hint_rect,
+            candidate_rects=candidate_rects,
+            confidence_before=hint.confidence if hint is not None else None,
+            used_remembered_region=hint is not None,
+        )
         try:
             window = Desktop(backend="uia").window(handle=target.handle)
+            candidates: list[dict[str, Any]] = []
             for ctrl in window.descendants():
                 name = (ctrl.window_text() or "").strip().lower()
                 if control_types is not None:
@@ -1046,25 +1596,32 @@ class BrowserChatGPTTransport:
                         continue
                 if phrase in name:
                     try:
-                        if self._invoke_button(ctrl):
-                            self._log("button_invoke", {"phrase": phrase, "name": name, "method": "invoke"})
-                            return True
-                        ctrl.click_input()
-                        self._log("button_invoke", {"phrase": phrase, "name": name, "method": "click_input"})
-                        return True
-                    except Exception as exc:
-                        self._log_uia_diagnostic(
-                            "named_control_click_failed",
-                            {
-                                "phrase": phrase,
-                                "name": name,
-                                "control_types": list(control_types or ()),
-                                "error": str(exc),
-                                "uia_control_diagnostics": self._build_uia_control_diagnostics(target, phrase=phrase),
-                            },
-                        )
-                        return False
+                        rect = self._control_rect_tuple(ctrl.rectangle())
+                    except Exception:
+                        rect = None
+                    base_score = 0.0
+                    if rect is not None and control_types == ("Button",):
+                        rect_obj = ctrl.rectangle()
+                        base_score = self._score_named_button_candidate(target, rect_obj, name, phrase)
+                    distance = self._rect_distance(rect, hint_rect)
+                    candidates.append(
+                        {
+                            "control": ctrl,
+                            "name": name,
+                            "rect": rect,
+                            "base_score": base_score,
+                            "hint_distance": distance,
+                        }
+                    )
         except Exception as exc:
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="post",
+                ui_state=self._ui_state(target),
+                action_outcome=f"named_control_search_failed:{phrase}",
+                confidence_after=hint.confidence if hint is not None else None,
+            )
             self._log_uia_diagnostic(
                 "named_control_search_failed",
                 {
@@ -1075,19 +1632,142 @@ class BrowserChatGPTTransport:
                 },
             )
             return False
+        if candidates:
+            candidate_rects.extend(
+                rect for rect in (item.get("rect") for item in candidates[:8]) if isinstance(rect, tuple)
+            )
+            if context is not None:
+                context["candidate_rects"] = list(candidate_rects)
+        ordered = sorted(
+            candidates,
+            key=lambda item: (
+                0 if item["hint_distance"] != float("inf") else 1,
+                item["hint_distance"],
+                -float(item["base_score"]),
+                item["name"],
+            ),
+        )
+        if not ordered:
+            if hint is not None:
+                self._visual_memory_invalidate(intent=memory_intent, target=target, reason_weight=0.18)
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="post",
+                ui_state=self._ui_state(target),
+                action_outcome=f"named_control_not_found:{phrase}",
+                confidence_after=hint.confidence if hint is not None else None,
+            )
+            self._log_uia_diagnostic(
+                "named_control_search_failed",
+                {
+                    "phrase": phrase,
+                    "control_types": list(control_types or ()),
+                    "uia_control_diagnostics": self._build_uia_control_diagnostics(target, phrase=phrase),
+                },
+            )
+            return False
+        last_error = None
+        for item in ordered:
+            ctrl = item["control"]
+            rect = item.get("rect")
+            if rect is not None and context is not None:
+                context["target_rect"] = rect
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="during",
+                ui_state=self._ui_state(target),
+                action_outcome=f"named_control_click_attempt:{phrase}",
+                confidence_after=hint.confidence if hint is not None else None,
+            )
+            try:
+                if self._invoke_button(ctrl):
+                    self._log("button_invoke", {"phrase": phrase, "name": item["name"], "method": "invoke"})
+                else:
+                    ctrl.click_input()
+                    self._log("button_invoke", {"phrase": phrase, "name": item["name"], "method": "click_input"})
+                if rect is not None:
+                    self._visual_memory_update(
+                        intent=memory_intent,
+                        target=target,
+                        action_type="named_control_click",
+                        rect=rect,
+                        ui_state=self._ui_state(target),
+                    )
+                self._capture_visual_action_stage(
+                    context,
+                    target=target,
+                    stage="post",
+                    ui_state=self._ui_state(target),
+                    action_outcome=f"named_control_click_completed:{phrase}",
+                    confidence_after=1.0 if hint is not None else None,
+                    updated_remembered_region=rect is not None,
+                )
+                return True
+            except Exception as exc:
+                last_error = exc
+                self._log_uia_diagnostic(
+                    "named_control_click_failed",
+                    {
+                        "phrase": phrase,
+                        "name": item["name"],
+                        "control_types": list(control_types or ()),
+                        "error": str(exc),
+                        "uia_control_diagnostics": self._build_uia_control_diagnostics(target, phrase=phrase),
+                    },
+                )
+        if hint is not None:
+            self._visual_memory_invalidate(intent=memory_intent, target=target, reason_weight=0.22)
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome=f"named_control_click_failed:{phrase}",
+            confidence_after=hint.confidence if hint is not None else None,
+        )
         self._log_uia_diagnostic(
             "named_control_search_failed",
             {
                 "phrase": phrase,
                 "control_types": list(control_types or ()),
+                "error": str(last_error) if last_error is not None else None,
                 "uia_control_diagnostics": self._build_uia_control_diagnostics(target, phrase=phrase),
             },
         )
         return False
 
     def _populate_prompt_directly(self, target, prompt: str, *, prompt_anchor=None) -> bool:
+        ui_state = self._ui_state(target)
+        hint = self._visual_memory_hint(intent="composer_area", target=target, ui_state=ui_state)
+        hint_rect = self._hint_rect(hint, target)
         composer = self._find_composer_edit(target)
+        composer_rect = None
+        if composer is not None:
+            try:
+                composer_rect = self._control_rect_tuple(composer.rectangle())
+            except Exception:
+                composer_rect = None
+        context = self._begin_visual_action(
+            target=target,
+            action_type="prompt_insertion",
+            target_intent="composer_area",
+            ui_state=ui_state,
+            target_rect=composer_rect or hint_rect or self._default_composer_rect(target),
+            candidate_rects=[rect for rect in [composer_rect, hint_rect] if rect is not None],
+            confidence_before=hint.confidence if hint is not None else None,
+            used_remembered_region=hint is not None,
+        )
         if composer is None:
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="post",
+                ui_state=self._ui_state(target),
+                action_outcome="composer_edit_not_found",
+                confidence_after=hint.confidence if hint is not None else None,
+            )
             self._log("composer_edit_not_found", {"ui_state": self._ui_state(target)})
             return False
         try:
@@ -1114,8 +1794,34 @@ class BrowserChatGPTTransport:
             for method_name, method in methods:
                 try:
                     self._clear_composer(target)
+                    self._capture_visual_action_stage(
+                        context,
+                        target=target,
+                        stage="during",
+                        ui_state=self._ui_state(target),
+                        action_outcome=f"prompt_insertion_method:{method_name}",
+                        confidence_after=hint.confidence if hint is not None else None,
+                    )
                     method()
                     if self._wait_for_prompt_inserted(target, prompt, seconds=6.0, prompt_anchor=prompt_anchor):
+                        update_rect = composer_rect
+                        if update_rect is not None:
+                            self._visual_memory_update(
+                                intent="composer_area",
+                                target=target,
+                                action_type="prompt_insertion",
+                                rect=update_rect,
+                                ui_state=self._ui_state(target),
+                            )
+                        self._capture_visual_action_stage(
+                            context,
+                            target=target,
+                            stage="post",
+                            ui_state=self._ui_state(target),
+                            action_outcome=f"prompt_insertion_completed:{method_name}",
+                            confidence_after=1.0 if hint is not None else None,
+                            updated_remembered_region=update_rect is not None,
+                        )
                         self._log("composer_populated", {"method": method_name, "prompt_length": len(prompt)})
                         return True
                 except Exception as exc:
@@ -1124,18 +1830,73 @@ class BrowserChatGPTTransport:
                         {"method": method_name, "error": str(exc), "ui_state": self._ui_state(target)},
                     )
         except Exception as exc:
+            if hint is not None:
+                self._visual_memory_invalidate(intent="composer_area", target=target, reason_weight=0.14)
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="post",
+                ui_state=self._ui_state(target),
+                action_outcome=f"prompt_insertion_failed:{exc}",
+                confidence_after=hint.confidence if hint is not None else None,
+            )
             self._log("composer_population_failed", {"error": str(exc), "ui_state": self._ui_state(target)})
             return False
+        if hint is not None:
+            self._visual_memory_invalidate(intent="composer_area", target=target, reason_weight=0.1)
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome="prompt_insertion_unconfirmed",
+            confidence_after=hint.confidence if hint is not None else None,
+        )
         self._log("composer_population_failed", {"ui_state": self._ui_state(target)})
         return False
 
     def _paste_prompt_with_click(self, target, prompt: str, click_point: tuple[int, int], prompt_anchor=None) -> bool:
+        target_rect = self._rect_from_center(click_point[0], click_point[1], radius_x=30, radius_y=24)
+        context = self._begin_visual_action(
+            target=target,
+            action_type="paste_insertion",
+            target_intent="composer_area",
+            ui_state=self._ui_state(target),
+            target_rect=target_rect,
+            candidate_rects=[target_rect],
+        )
         self._focus_window(target)
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="during",
+            ui_state=self._ui_state(target),
+            action_outcome="paste_insertion_started",
+        )
         pyautogui.click(click_point[0], click_point[1])
         time.sleep(0.25)
         self._clear_composer(target)
         self._paste_prompt_via_clipboard(target, prompt, click_point=click_point)
-        return self._wait_for_prompt_inserted(target, prompt, seconds=6.0, prompt_anchor=prompt_anchor)
+        inserted = self._wait_for_prompt_inserted(target, prompt, seconds=6.0, prompt_anchor=prompt_anchor)
+        if inserted:
+            self._visual_memory_update(
+                intent="composer_area",
+                target=target,
+                action_type="paste_insertion",
+                rect=target_rect,
+                ui_state=self._ui_state(target),
+            )
+        else:
+            self._visual_memory_invalidate(intent="composer_area", target=target, reason_weight=0.08)
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome="paste_insertion_confirmed" if inserted else "paste_insertion_unconfirmed",
+            updated_remembered_region=inserted,
+        )
+        return inserted
 
     def _paste_prompt_via_clipboard(self, target, prompt: str, click_point: tuple[int, int] | None) -> None:
         previous_clipboard = ""
@@ -1256,18 +2017,105 @@ class BrowserChatGPTTransport:
         return score
 
     def _focus_composer(self, target, lines) -> None:
+        ui_state = self._ui_state(target)
+        hint = self._visual_memory_hint(intent="composer_area", target=target, ui_state=ui_state, lines=lines)
+        hint_rect = self._hint_rect(hint, target)
         composer = self._find_composer_line(lines)
+        target_rect = hint_rect or self._default_composer_rect(target)
         if composer is not None:
-            self._click_line(target, composer)
+            x = int(target.left + composer.center[0])
+            y = int(target.top + composer.center[1])
+            target_rect = self._rect_from_center(x, y)
+        context = self._begin_visual_action(
+            target=target,
+            action_type="composer_focus",
+            target_intent="composer_area",
+            ui_state=ui_state,
+            lines=lines,
+            target_rect=target_rect,
+            candidate_rects=[rect for rect in [hint_rect, target_rect] if rect is not None],
+            confidence_before=hint.confidence if hint is not None else None,
+            used_remembered_region=hint is not None,
+        )
+        if composer is not None:
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="during",
+                ui_state=ui_state,
+                lines=lines,
+                action_outcome="composer_focus_line_click",
+                confidence_after=hint.confidence if hint is not None else None,
+            )
+            self._click_line(target, composer, target_intent="composer_area", action_type="composer_focus")
+            self._capture_visual_action_stage(
+                context,
+                target=target,
+                stage="post",
+                ui_state=self._ui_state(target),
+                action_outcome="composer_focus_completed",
+                confidence_after=hint.confidence if hint is not None else None,
+            )
             time.sleep(0.2)
             return
         self._focus_window(target)
-        pyautogui.click(int(target.left + target.width * 0.55), int(target.top + target.height * 0.88))
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="during",
+            ui_state=ui_state,
+            lines=lines,
+            action_outcome="composer_focus_area_click",
+            confidence_after=hint.confidence if hint is not None else None,
+        )
+        click_rect = hint_rect or self._default_composer_rect(target)
+        click_center = self._rect_center(click_rect) or (
+            int(target.left + target.width * 0.55),
+            int(target.top + target.height * 0.88),
+        )
+        pyautogui.click(click_center[0], click_center[1])
+        if hint_rect is not None:
+            self._visual_memory_update(
+                intent="composer_area",
+                target=target,
+                action_type="composer_focus",
+                rect=click_rect,
+                ui_state=self._ui_state(target),
+                lines=lines,
+            )
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome="composer_focus_completed",
+            confidence_after=hint.confidence if hint is not None else None,
+            updated_remembered_region=hint_rect is not None,
+        )
         time.sleep(0.2)
 
     def _attempt_send(self, target, attempt_index: int) -> None:
         strategy = attempt_index % 5
+        ui_state = self._ui_state(target)
+        hint = self._visual_memory_hint(intent="send_button_area", target=target, ui_state=ui_state)
+        context = self._begin_visual_action(
+            target=target,
+            action_type="send_action",
+            target_intent="send_button_area",
+            ui_state=ui_state,
+            target_rect=self._hint_rect(hint, target) or self._default_send_button_rect(target),
+            confidence_before=hint.confidence if hint is not None else None,
+            used_remembered_region=hint is not None,
+        )
         self._focus_window(target)
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="during",
+            ui_state=ui_state,
+            action_outcome=f"send_strategy_{strategy}_start",
+            confidence_after=hint.confidence if hint is not None else None,
+        )
         if strategy == 0:
             self._log("send_attempt", {"attempt_index": attempt_index, "strategy": "button_or_enter"})
             self._activity(
@@ -1318,6 +2166,14 @@ class BrowserChatGPTTransport:
             self._click_send_button(target)
             time.sleep(0.4)
             pyautogui.press("enter")
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome=f"send_strategy_{strategy}_completed",
+            confidence_after=hint.confidence if hint is not None else None,
+        )
 
     def _wait_for_reply_start(self, target, before_lines, seconds: float) -> bool:
         deadline = time.monotonic() + seconds
@@ -1396,14 +2252,34 @@ class BrowserChatGPTTransport:
     def _prepare_chatgpt_window(self, target, chatgpt_url: str, timeout_sec: float) -> bool:
         ready = self._wait_for_chatgpt_ready(target, timeout_sec=min(timeout_sec, 12.0))
         if not ready:
+            def recovery_action(action_name: str, target_intent: str, callback):
+                return lambda: self._run_visual_recovery_action(
+                    target=target,
+                    action_name=action_name,
+                    target_intent=target_intent,
+                    callback=callback,
+                )
+
             recovery_handlers = build_recovery_handlers(
-                rescan=lambda: None,
-                refocus_composer=lambda: self._focus_composer(target, []),
+                rescan=recovery_action("rescan", "reply_region", lambda: None),
+                refocus_composer=recovery_action("refocus_composer", "composer_area", lambda: self._focus_composer(target, [])),
                 # Dedicated thread reopen/reattach is still pending, so conservative recovery
                 # currently falls back to direct ChatGPT navigation inside the same window.
-                reopen_thread=lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
-                reload_page=lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
-                reopen_chatgpt=lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
+                reopen_thread=recovery_action(
+                    "reopen_thread",
+                    "new_chat_button",
+                    lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
+                ),
+                reload_page=recovery_action(
+                    "reload_page",
+                    "reply_region",
+                    lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
+                ),
+                reopen_chatgpt=recovery_action(
+                    "reopen_chatgpt",
+                    "reply_region",
+                    lambda: self._navigate_browser_to_chatgpt(target, chatgpt_url),
+                ),
             )
             recovery = decide_and_execute_recovery(
                 self._last_page_classification,
@@ -1833,6 +2709,24 @@ class BrowserChatGPTTransport:
         if after_lines is None:
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             after_lines = self._ocr.extract(image)
+        ui_state = self._ui_state(target)
+        checkpoint_context = None
+        hint = None
+        hint_rect = None
+        if self._visual_action_debug is not None and self._visual_action_debug.should_capture_checkpoint("reply_capture_region"):
+            hint = self._visual_memory_hint(intent="reply_region", target=target, ui_state=ui_state, lines=after_lines)
+            hint_rect = self._hint_rect(hint, target)
+            checkpoint_context = self._begin_visual_action(
+                target=target,
+                action_type="reply_capture_region",
+                target_intent="reply_region",
+                ui_state=ui_state,
+                lines=after_lines,
+                target_rect=hint_rect or self._default_reply_region_rect(target),
+                candidate_rects=[rect for rect in [hint_rect, self._default_reply_region_rect(target)] if rect is not None],
+                confidence_before=hint.confidence if hint is not None else None,
+                used_remembered_region=hint is not None,
+            )
         ocr_text = extract_reply_from_ocr_lines_for_policy(
             before_lines,
             after_lines,
@@ -1841,7 +2735,38 @@ class BrowserChatGPTTransport:
             prompt=prompt,
             policy=REPLY_TRACKER_POLICY,
         )
+        self._capture_visual_action_stage(
+            checkpoint_context,
+            target=target,
+            stage="during",
+            ui_state=ui_state,
+            lines=after_lines,
+            action_outcome=f"reply_capture_ocr:{len(ocr_text)}",
+            confidence_after=hint.confidence if hint is not None else None,
+        )
         uia_text = self._read_visible_reply_text(target)
+        merged_length = len(merge_reply_segment_sources(uia_text, ocr_text, policy=REPLY_TRACKER_POLICY))
+        if checkpoint_context is not None:
+            target_rect = hint_rect or self._default_reply_region_rect(target)
+            if merged_length > 0:
+                self._visual_memory_update(
+                    intent="reply_region",
+                    target=target,
+                    action_type="reply_capture_region",
+                    rect=target_rect,
+                    ui_state=ui_state,
+                    lines=after_lines,
+                )
+            self._capture_visual_action_stage(
+                checkpoint_context,
+                target=target,
+                stage="post",
+                ui_state=self._ui_state(target),
+                lines=after_lines,
+                action_outcome=f"reply_capture_visible:{merged_length}",
+                confidence_after=hint.confidence if hint is not None else None,
+                updated_remembered_region=merged_length > 0,
+            )
         return ocr_text, uia_text
 
     def _capture_reply_text_by_scrolling(
@@ -2013,21 +2938,105 @@ class BrowserChatGPTTransport:
         return merge_reply_segment_sources(uia_text, ocr_text, policy=REPLY_TRACKER_POLICY)
 
     def _scroll_reply_to_bottom(self, target) -> None:
+        context = self._begin_visual_action(
+            target=target,
+            action_type="scroll_action",
+            target_intent="reply_region",
+            ui_state=self._ui_state(target),
+            target_rect=self._default_reply_region_rect(target),
+        )
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="during",
+            ui_state=self._ui_state(target),
+            action_outcome="scroll_to_bottom_start",
+        )
         self._focus_reply_area(target)
         for _ in range(3):
             pyautogui.press("end")
             time.sleep(0.25)
             pyautogui.press("pagedown")
             time.sleep(0.25)
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome="scroll_to_bottom_completed",
+        )
 
     def _scroll_reply_up(self, target) -> None:
+        context = self._begin_visual_action(
+            target=target,
+            action_type="scroll_action",
+            target_intent="reply_region",
+            ui_state=self._ui_state(target),
+            target_rect=self._default_reply_region_rect(target),
+        )
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="during",
+            ui_state=self._ui_state(target),
+            action_outcome="scroll_reply_up_start",
+        )
         self._focus_reply_area(target)
         pyautogui.press("pageup")
         time.sleep(0.25)
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome="scroll_reply_up_completed",
+        )
 
     def _focus_reply_area(self, target) -> None:
+        ui_state = self._ui_state(target)
+        hint = self._visual_memory_hint(intent="reply_region", target=target, ui_state=ui_state)
+        hint_rect = self._hint_rect(hint, target)
+        target_rect = hint_rect or self._default_reply_region_rect(target)
+        context = self._begin_visual_action(
+            target=target,
+            action_type="reply_focus",
+            target_intent="reply_region",
+            ui_state=ui_state,
+            target_rect=target_rect,
+            candidate_rects=[target_rect],
+            confidence_before=hint.confidence if hint is not None else None,
+            used_remembered_region=hint is not None,
+        )
         self._focus_window(target)
-        pyautogui.click(int(target.left + target.width * 0.70), int(target.top + target.height * 0.42))
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="during",
+            ui_state=ui_state,
+            action_outcome="reply_focus_start",
+            confidence_after=hint.confidence if hint is not None else None,
+        )
+        click_center = self._rect_center(target_rect) or (
+            int(target.left + target.width * 0.70),
+            int(target.top + target.height * 0.42),
+        )
+        pyautogui.click(click_center[0], click_center[1])
+        self._visual_memory_update(
+            intent="reply_region",
+            target=target,
+            action_type="reply_focus",
+            rect=target_rect,
+            ui_state=self._ui_state(target),
+        )
+        self._capture_visual_action_stage(
+            context,
+            target=target,
+            stage="post",
+            ui_state=self._ui_state(target),
+            action_outcome="reply_focus_completed",
+            confidence_after=hint.confidence if hint is not None else None,
+            updated_remembered_region=True,
+        )
         time.sleep(0.2)
 
     def _focus_window(self, target) -> None:
