@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from aster.config.models import AsterConfig
+from aster.context_collector import CollectedContext
 from aster.orchestrator import AsterOrchestrator
 from aster.response_parser import ParsedPlan, PatchOperation
 
@@ -50,9 +51,9 @@ class _FakeGit:
 
 
 class _FakeBrowserResult:
-    def __init__(self, raw_text: str) -> None:
+    def __init__(self, raw_text: str, metadata: dict[str, object] | None = None) -> None:
         self.raw_text = raw_text
-        self.metadata = {"window_title": "Fake ChatGPT"}
+        self.metadata = {"window_title": "Fake ChatGPT", **(metadata or {})}
 
 
 class _RetryingBrowserTransport:
@@ -203,3 +204,60 @@ def test_orchestrator_wires_runtime_log_heartbeat_into_browser_transport(tmp_pat
     assert orchestrator.runtime_log_heartbeat.interval_seconds == 45
     assert orchestrator.runtime_log_heartbeat.branch_only is False
     assert orchestrator.browser_transport._runtime_log_heartbeat is orchestrator.runtime_log_heartbeat
+
+
+def test_parse_with_retry_omits_invalid_browser_retry_seed(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sync_with_remote = False
+    orchestrator = AsterOrchestrator(config)
+    orchestrator._last_generation_metadata = {
+        "retry_seed_valid": False,
+        "retry_seed_validity_reason": "unbalanced_structure",
+    }
+    calls: list[str | None] = []
+
+    def _parse(raw_text: str):
+        if raw_text == "":
+            raise ValueError("not parseable")
+        return ParsedPlan(
+            summary="ok",
+            notes=[],
+            operations=[
+                PatchOperation(
+                    type="NEED THESE FILES FIRST",
+                    path="README.md",
+                    reason="need context",
+                )
+            ],
+        )
+
+    orchestrator.parser.parse = _parse
+
+    def _retry_generate(*_args, **kwargs):
+        calls.append(kwargs.get("prior_text"))
+
+        class _PromptPackage:
+            messages = [{"role": "user", "content": "retry"}]
+            approx_chars = 5
+            included_files = []
+            omitted_files = []
+            compacted = False
+
+        return (
+            '{"summary":"ok","notes":[],"operations":[{"type":"NEED THESE FILES FIRST","path":"README.md","reason":"need context"}]}',
+            _PromptPackage(),
+        )
+
+    orchestrator._generate_with_prompt_retries = _retry_generate
+    context = CollectedContext(
+        project_root=tmp_path,
+        project_summary="demo",
+        file_tree="demo/",
+        relevant_files=[],
+        skipped_files=[],
+    )
+
+    plan = orchestrator._parse_with_retry("build app", context, [], "browser", "")
+
+    assert calls == [None]
+    assert plan.requires_more_files() is True

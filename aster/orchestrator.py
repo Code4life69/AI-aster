@@ -101,6 +101,7 @@ class AsterOrchestrator:
             visual_region_memory=visual_region_memory,
             visual_action_memory_enabled=config.visual_action_memory_enabled,
         )
+        self._last_generation_metadata: dict[str, object] = {}
 
     def plan(self, goal: str, mode: str | None = None) -> OrchestrationResult:
         resolved_mode = mode or self.config.default_mode
@@ -255,8 +256,10 @@ class AsterOrchestrator:
                 chatgpt_url=self.config.chatgpt_url,
                 launch_timeout_sec=float(self.config.browser_launch_timeout_seconds),
             )
+            self._last_generation_metadata = dict(result.metadata)
             self.logger.log("browser_result", result.metadata)
             return result.raw_text
+        self._last_generation_metadata = {}
         if not self.config.api_mode_enabled:
             raise RuntimeError("API mode is disabled. Use browser mode or enable API mode in config.")
         self._activity(
@@ -270,6 +273,14 @@ class AsterOrchestrator:
         try:
             return self.parser.parse(raw)
         except Exception:
+            retry_seed_valid = bool(raw.strip())
+            retry_seed_validity_reason = "raw_response_present" if retry_seed_valid else "empty_response"
+            if mode == "browser":
+                retry_seed_valid = bool(self._last_generation_metadata.get("retry_seed_valid", retry_seed_valid))
+                retry_seed_validity_reason = str(
+                    self._last_generation_metadata.get("retry_seed_validity_reason", retry_seed_validity_reason)
+                )
+            prior_text = raw if retry_seed_valid and raw.strip() else None
             self._activity(
                 "retry_request",
                 "The first response was not machine-parseable, so Aster is retrying with stricter instructions.",
@@ -281,13 +292,16 @@ class AsterOrchestrator:
                 context,
                 history,
                 mode,
-                prior_text=raw,
+                prior_text=prior_text,
             )
             self.logger.log(
                 "prompt_retry",
                 {
                     "mode": mode,
                     "prior_response_preview": raw[:500],
+                    "retry_seed_used": prior_text is not None,
+                    "retry_seed_valid": retry_seed_valid,
+                    "retry_seed_validity_reason": retry_seed_validity_reason,
                     **self._summarize_prompt_package(prompt_package),
                 },
             )

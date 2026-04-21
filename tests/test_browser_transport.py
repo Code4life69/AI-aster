@@ -531,6 +531,8 @@ def test_finalize_captured_reply_salvages_best_previous_structured_candidate() -
     assert diagnostics["salvage_attempted"] is True
     assert diagnostics["salvage_succeeded"] is True
     assert diagnostics["salvage_source"] == "uia"
+    assert diagnostics["retry_seed_valid"] is True
+    assert diagnostics["retry_seed_validity_reason"] == "parseable_structured_json"
 
 
 def test_finalize_captured_reply_does_not_salvage_untrusted_scrolled_candidate() -> None:
@@ -551,6 +553,7 @@ def test_finalize_captured_reply_does_not_salvage_untrusted_scrolled_candidate()
     assert diagnostics["salvage_attempted"] is True
     assert diagnostics["salvage_succeeded"] is False
     assert diagnostics["final_capture_failure_reason"] == "structured_block_seen_but_not_salvageable"
+    assert diagnostics["retry_seed_valid"] is False
 
 
 def test_finalize_captured_reply_rejects_low_region_trust_candidate_for_salvage() -> None:
@@ -575,6 +578,7 @@ def test_finalize_captured_reply_rejects_low_region_trust_candidate_for_salvage(
     assert diagnostics["salvage_succeeded"] is False
     assert diagnostics["best_structured_candidate_region_trusted"] is False
     assert diagnostics["final_capture_failure_reason"] == "structured_block_seen_but_region_trust_too_low"
+    assert diagnostics["retry_seed_valid"] is False
 
 
 def test_finalize_captured_reply_prefers_trusted_candidate_for_salvage() -> None:
@@ -610,6 +614,33 @@ def test_finalize_captured_reply_prefers_trusted_candidate_for_salvage() -> None
     assert diagnostics["salvage_succeeded"] is True
     assert diagnostics["salvage_source"] == "ocr"
     assert diagnostics["best_salvageable_candidate_region_trusted"] is True
+    assert diagnostics["best_retry_safe_candidate_source"] == "ocr"
+
+
+def test_finalize_captured_reply_preserves_partial_structured_candidate_for_diagnostics_only() -> None:
+    transport = BrowserChatGPTTransport()
+    snapshot = transport._last_reply_capture_snapshot
+    transport._remember_reply_capture_candidate(
+        snapshot,
+        source="uia",
+        text=(
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]\n'
+        ),
+        score=350.0,
+        salvage_allowed=True,
+        observation_counts={},
+    )
+
+    parsed, diagnostics = transport._finalize_captured_reply("")
+
+    assert parsed == ""
+    assert diagnostics["salvage_attempted"] is True
+    assert diagnostics["salvage_succeeded"] is False
+    assert diagnostics["salvage_preserved_for_diagnostics_only"] is True
+    assert diagnostics["retry_seed_valid"] is False
+    assert diagnostics["retry_seed_validity_reason"] == "unbalanced_structure"
+    assert diagnostics["final_capture_failure_reason"] == "structured_block_seen_but_not_retry_safe"
 
 
 def test_capture_reply_text_does_not_require_anchor_when_thread_was_not_reused(monkeypatch) -> None:
@@ -793,6 +824,62 @@ def test_generate_salvages_final_structured_block_from_trusted_capture(monkeypat
 
     assert looks_like_patch_plan_json(result.raw_text) is True
     assert '"saved.py"' in result.raw_text
+    assert result.metadata["retry_seed_valid"] is True
+
+
+def test_generate_returns_empty_reply_when_only_diagnostic_salvage_exists(monkeypatch) -> None:
+    transport = BrowserChatGPTTransport()
+    transport._logger = None
+    transport._ensure_runtime = lambda: None
+    transport._show_automation_notice = lambda: None
+    transport._hide_automation_notice = lambda: None
+    transport._activity = lambda *_args, **_kwargs: None
+    transport._populate_prompt_directly = lambda target, prompt, prompt_anchor=None: True
+    transport._stabilize_and_send = lambda target, before_lines, prompt: None
+    transport._prepare_chatgpt_window = lambda target, chatgpt_url, timeout_sec: False
+    transport._capture = _FakeCaptureService()
+    transport._ocr = _FakeOCR()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    transport._ensure_chatgpt_window = lambda chatgpt_url, launch_timeout_sec: _Target()
+    transport._ui_state = lambda target: {
+        "show_in_text_field_present": False,
+        "send_prompt_present": False,
+        "send_prompt_enabled": None,
+        "stop_streaming_present": False,
+    }
+    transport._capture_visible_text_lines = lambda target: []
+
+    def _capture_reply_text(*_args, **_kwargs):
+        snapshot = transport._last_reply_capture_snapshot
+        transport._remember_reply_capture_candidate(
+            snapshot,
+            source="uia",
+            text=(
+                "ASTER_PATCH_BEGIN\n"
+                '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]\n'
+            ),
+            score=360.0,
+            salvage_allowed=True,
+            observation_counts={},
+        )
+        transport._last_reply_capture_snapshot = snapshot
+        return ""
+
+    transport._capture_reply_text = _capture_reply_text
+
+    result = transport.generate("create saved.py", timeout_sec=4.0, launch_timeout_sec=1.0)
+
+    assert result.raw_text == ""
+    assert result.metadata["retry_seed_valid"] is False
+    assert result.metadata["retry_seed_validity_reason"] == "unbalanced_structure"
+    assert result.metadata["final_capture_failure_reason"] == "structured_block_seen_but_not_retry_safe"
 
 
 def test_generate_raises_final_capture_failure_when_no_salvageable_candidate_exists(monkeypatch) -> None:

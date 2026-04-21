@@ -197,7 +197,7 @@ PAGE_READINESS_WRONG_PAGE_MARKERS = (
 @dataclass(slots=True)
 class BrowserResult:
     raw_text: str
-    metadata: dict[str, str]
+    metadata: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -208,6 +208,8 @@ class _StructuredReplyCandidate:
     score: float
     parseable: bool
     salvage_allowed: bool
+    retry_safe: bool = False
+    retry_seed_validity_reason: str = ""
     region_trusted: bool = True
     region_confidence: float | None = None
     region_reason: str = ""
@@ -218,6 +220,7 @@ class _StructuredReplyCandidate:
 class _ReplyCaptureSnapshot:
     best_structured: _StructuredReplyCandidate | None = None
     best_salvageable: _StructuredReplyCandidate | None = None
+    best_retry_safe: _StructuredReplyCandidate | None = None
 
 
 class _AutomationNotice:
@@ -1154,14 +1157,46 @@ class BrowserChatGPTTransport:
                         **final_capture_diagnostics,
                     },
                 )
+                result_metadata: dict[str, Any] = {
+                    "window_title": target.title,
+                    "retry_seed_valid": final_capture_diagnostics.get("retry_seed_valid", bool(parsed.strip())),
+                    "retry_seed_validity_reason": final_capture_diagnostics.get("retry_seed_validity_reason", ""),
+                    "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
+                    "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
+                        "salvage_preserved_for_diagnostics_only",
+                        False,
+                    ),
+                }
                 if not parsed.strip():
                     failure_reason = final_capture_diagnostics.get("final_capture_failure_reason", "no_structured_block_seen")
+                    if failure_reason == "structured_block_seen_but_not_retry_safe":
+                        self._activity(
+                            "browser_reply_partial",
+                            "Captured a partial structured reply, but it was not trustworthy enough to reuse as a retry seed.",
+                            "Aster preserved the best structured fragment for diagnostics only and will let the retry path continue without reusing malformed JSON.",
+                            status="warning",
+                            details={
+                                "best_structured_candidate_length": final_capture_diagnostics.get(
+                                    "best_structured_candidate_length",
+                                    0,
+                                ),
+                                "retry_seed_validity_reason": final_capture_diagnostics.get(
+                                    "retry_seed_validity_reason",
+                                    "",
+                                ),
+                            },
+                        )
+                        return BrowserResult(
+                            raw_text="",
+                            metadata=result_metadata,
+                        )
                     reason_messages = {
                         "no_structured_block_seen": "no structured patch block was seen during reply capture",
                         "structured_block_seen_but_lost": "a structured patch block was seen earlier but final extraction lost it",
                         "structured_block_seen_but_not_parseable": "structured patch text was seen, but none of it became parseable JSON",
                         "structured_block_seen_but_not_salvageable": "a structured patch block was seen earlier, but it was not trusted enough to salvage",
                         "structured_block_seen_but_region_trust_too_low": "a structured patch block was seen earlier, but the reply-region evidence was too weak to trust it for salvage",
+                        "structured_block_seen_but_not_retry_safe": "a structured patch block was seen earlier, but none of it was safe enough to reuse as a retry seed",
                     }
                     raise RuntimeError(
                         "Browser mode could not capture a final ChatGPT response: "
@@ -1176,7 +1211,7 @@ class BrowserChatGPTTransport:
                 )
                 return BrowserResult(
                     raw_text=parsed,
-                    metadata={"window_title": target.title},
+                    metadata=result_metadata,
                 )
             finally:
                 self._hide_automation_notice()
@@ -3216,6 +3251,7 @@ class BrowserChatGPTTransport:
     def _structured_candidate_priority(candidate: _StructuredReplyCandidate) -> tuple[int, int, int, int, float, int, int]:
         return (
             int(candidate.parseable),
+            int(candidate.retry_safe),
             int(candidate.salvage_allowed),
             int(candidate.region_trusted),
             candidate.observation_count,
@@ -3225,7 +3261,49 @@ class BrowserChatGPTTransport:
         )
 
     @staticmethod
+    def _retry_seed_contaminated(text: str) -> bool:
+        lowered = " ".join(text.lower().split())
+        markers = (
+            "system:",
+            "user:",
+            "coding orchestrator backend",
+            "return json only",
+            "browser mode has a smaller prompt budget",
+            "context omitted for browser size safety",
+            "relevant file tree:",
+            "please do not type, click, or move the mouse",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _classify_retry_seed_text(
+        self,
+        text: str,
+        *,
+        region_trusted: bool,
+        salvage_allowed: bool,
+    ) -> tuple[bool, str]:
+        cleaned = text.strip()
+        if not cleaned:
+            return False, "empty_structured_text"
+        if not salvage_allowed:
+            return False, "candidate_not_salvageable"
+        if not region_trusted:
+            return False, "reply_region_not_trusted"
+        if self._retry_seed_contaminated(cleaned):
+            return False, "prompt_or_preamble_contamination"
+        progress = structured_completion_progress(cleaned)
+        if int(progress.get("schema_hits", 0)) < 3:
+            return False, "missing_required_schema_keys"
+        if int(progress.get("operation_items", 0)) < 1:
+            return False, "operations_array_incomplete"
+        if int(progress.get("brace_balance", 0)) != 0 or int(progress.get("bracket_balance", 0)) != 0:
+            return False, "unbalanced_structure"
+        if not bool(progress.get("parseable")):
+            return False, "not_parseable_json"
+        return True, "parseable_structured_json"
+
     def _build_structured_reply_candidate(
+        self,
         *,
         source: str,
         text: str,
@@ -3252,6 +3330,11 @@ class BrowserChatGPTTransport:
         )
         if not structured_hint:
             return None
+        retry_safe, retry_seed_validity_reason = self._classify_retry_seed_text(
+            parsed,
+            region_trusted=region_trusted,
+            salvage_allowed=salvage_allowed,
+        )
         return _StructuredReplyCandidate(
             source=source,
             raw_text=cleaned,
@@ -3259,6 +3342,8 @@ class BrowserChatGPTTransport:
             score=score,
             parseable=looks_like_patch_plan_json(parsed),
             salvage_allowed=salvage_allowed,
+            retry_safe=retry_safe,
+            retry_seed_validity_reason=retry_seed_validity_reason,
             region_trusted=region_trusted,
             region_confidence=region_confidence,
             region_reason=region_reason,
@@ -3302,6 +3387,11 @@ class BrowserChatGPTTransport:
             or self._structured_candidate_priority(candidate) > self._structured_candidate_priority(snapshot.best_salvageable)
         ):
             snapshot.best_salvageable = candidate
+        if candidate.retry_safe and (
+            snapshot.best_retry_safe is None
+            or self._structured_candidate_priority(candidate) > self._structured_candidate_priority(snapshot.best_retry_safe)
+        ):
+            snapshot.best_retry_safe = candidate
         return candidate
 
     def _finalize_captured_reply(self, reply: str) -> tuple[str, dict[str, Any]]:
@@ -3309,6 +3399,12 @@ class BrowserChatGPTTransport:
         snapshot = self._last_reply_capture_snapshot
         best_structured = snapshot.best_structured
         best_salvageable = snapshot.best_salvageable
+        best_retry_safe = snapshot.best_retry_safe
+        final_reply_retry_safe, final_reply_retry_reason = self._classify_retry_seed_text(
+            parsed,
+            region_trusted=True,
+            salvage_allowed=True,
+        )
         diagnostics: dict[str, Any] = {
             "best_structured_candidate_length": len(best_structured.parsed_text) if best_structured is not None else 0,
             "best_structured_candidate_source": best_structured.source if best_structured is not None else None,
@@ -3317,25 +3413,53 @@ class BrowserChatGPTTransport:
             "best_structured_candidate_region_trusted": best_structured.region_trusted if best_structured is not None else False,
             "best_structured_candidate_region_confidence": best_structured.region_confidence if best_structured is not None else None,
             "best_structured_candidate_region_reason": best_structured.region_reason if best_structured is not None else "",
+            "best_structured_candidate_retry_safe": best_structured.retry_safe if best_structured is not None else False,
+            "best_structured_candidate_retry_seed_validity_reason": (
+                best_structured.retry_seed_validity_reason if best_structured is not None else ""
+            ),
             "best_salvageable_candidate_length": len(best_salvageable.parsed_text) if best_salvageable is not None else 0,
             "best_salvageable_candidate_source": best_salvageable.source if best_salvageable is not None else None,
             "best_salvageable_candidate_region_trusted": best_salvageable.region_trusted if best_salvageable is not None else False,
             "best_salvageable_candidate_region_confidence": best_salvageable.region_confidence if best_salvageable is not None else None,
             "best_salvageable_candidate_region_reason": best_salvageable.region_reason if best_salvageable is not None else "",
+            "best_salvageable_candidate_retry_safe": best_salvageable.retry_safe if best_salvageable is not None else False,
+            "best_salvageable_candidate_retry_seed_validity_reason": (
+                best_salvageable.retry_seed_validity_reason if best_salvageable is not None else ""
+            ),
+            "best_retry_safe_candidate_length": len(best_retry_safe.parsed_text) if best_retry_safe is not None else 0,
+            "best_retry_safe_candidate_source": best_retry_safe.source if best_retry_safe is not None else None,
+            "best_retry_safe_candidate_region_trusted": best_retry_safe.region_trusted if best_retry_safe is not None else False,
+            "best_retry_safe_candidate_region_confidence": best_retry_safe.region_confidence if best_retry_safe is not None else None,
+            "best_retry_safe_candidate_region_reason": best_retry_safe.region_reason if best_retry_safe is not None else "",
+            "best_retry_safe_candidate_parseable": best_retry_safe.parseable if best_retry_safe is not None else False,
+            "best_retry_safe_candidate_retry_seed_validity_reason": (
+                best_retry_safe.retry_seed_validity_reason if best_retry_safe is not None else ""
+            ),
             "salvage_attempted": False,
             "salvage_succeeded": False,
             "salvage_source": None,
+            "salvage_preserved_for_diagnostics_only": False,
+            "retry_seed_valid": False,
+            "retry_seed_validity_reason": final_reply_retry_reason if parsed.strip() else "",
             "final_capture_failure_reason": "",
         }
-        if parsed.strip():
+        if parsed.strip() and final_reply_retry_safe:
+            diagnostics["retry_seed_valid"] = True
             return parsed, diagnostics
 
         diagnostics["salvage_attempted"] = best_structured is not None
-        if best_salvageable is not None and best_salvageable.parsed_text.strip():
+        if best_retry_safe is not None and best_retry_safe.parsed_text.strip():
             diagnostics["salvage_succeeded"] = True
-            diagnostics["salvage_source"] = best_salvageable.source
+            diagnostics["salvage_source"] = best_retry_safe.source
+            diagnostics["retry_seed_valid"] = True
+            diagnostics["retry_seed_validity_reason"] = best_retry_safe.retry_seed_validity_reason
             diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_lost"
-            return best_salvageable.parsed_text, diagnostics
+            return best_retry_safe.parsed_text, diagnostics
+        if best_salvageable is not None and best_salvageable.parsed_text.strip():
+            diagnostics["salvage_preserved_for_diagnostics_only"] = True
+            diagnostics["retry_seed_validity_reason"] = best_salvageable.retry_seed_validity_reason
+            diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_not_retry_safe"
+            return "", diagnostics
 
         if best_structured is None:
             diagnostics["final_capture_failure_reason"] = "no_structured_block_seen"
@@ -3348,7 +3472,7 @@ class BrowserChatGPTTransport:
                 else "structured_block_seen_but_not_salvageable"
             )
         else:
-            diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_lost"
+            diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_not_retry_safe"
         return "", diagnostics
 
     def _analyze_screen(self, target, lines=None, ui_state: dict[str, Any] | None = None) -> PageClassification:
