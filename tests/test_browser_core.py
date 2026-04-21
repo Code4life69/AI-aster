@@ -1024,7 +1024,71 @@ def test_assess_scrolled_segment_addition_requires_region_integrity_not_just_com
     assert assessment["after_progress"]["completion_score"] >= assessment["before_progress"]["completion_score"]
     assert assessment["contributed"] is False
     assert assessment["region_integrity_score"] <= 0
-    assert assessment["skip_reason"] in {"unrelated_page_content", "reply_region_drift", "low_region_integrity"}
+    assert assessment["trusted_lineage_score"] <= 0
+    assert assessment["skip_reason"] in {
+        "unrelated_page_content",
+        "reply_region_drift",
+        "low_region_integrity",
+        "missing_seed_or_trusted_lineage",
+        "current_blob_only_continuity",
+    }
+
+
+def test_assess_scrolled_segment_addition_rejects_current_blob_only_match_against_corrupted_merge() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    corrupted_current = (
+        anchor
+        + '\nconfig.runtime_log_heartbeat_branch_only is True\n'
+        + 'calls["config"] = config\n'
+    )
+    current_only_segment = (
+        'calls["config"] = config\n'
+        'monkeypatch.setattr(cli, "load_config", lambda project_root: sentinel_config)\n'
+    )
+
+    assessment = assess_scrolled_segment_addition(
+        corrupted_current,
+        current_only_segment,
+        policy=TEST_REPLY_POLICY,
+        seed_text=anchor,
+        trusted_lineage_text=anchor,
+    )
+
+    assert assessment["contributed"] is False
+    assert assessment["matched_current_blob_only"] is True
+    assert assessment["matched_seed_lineage"] is False
+    assert assessment["matched_trusted_lineage"] is False
+    assert assessment["skip_reason"] in {"current_blob_only_continuity", "missing_seed_or_trusted_lineage"}
+
+
+def test_assess_scrolled_segment_addition_contains_later_weak_segment_after_drift_suspicion() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    drift_segment = (
+        "tests/test_calc.py\n"
+        "collected 4 items\n"
+        'ASTER_PATCH_BEGIN\n{"summary":"other","notes":[],"operations":[{"type":"CREATE FILE","path":"tests/test_calc.py","reason":"add","content":"def test_ok():\\n    assert 1 == 1"}]}\nASTER_PATCH_END'
+    )
+    first = assess_scrolled_segment_addition(anchor, drift_segment, policy=TEST_REPLY_POLICY, seed_text=anchor, trusted_lineage_text=anchor)
+    weak_followup = 'config.runtime_log_heartbeat_branch_only is True\\nassert config.thread_reuse_enabled is False\\n'
+
+    second = assess_scrolled_segment_addition(
+        anchor,
+        weak_followup,
+        policy=TEST_REPLY_POLICY,
+        seed_text=anchor,
+        trusted_lineage_text=anchor,
+        drift_containment_active=bool(first["activate_drift_containment"]),
+    )
+
+    assert first["activate_drift_containment"] is True
+    assert second["contributed"] is False
+    assert second["skip_reason"] in {"drift_containment_active", "missing_seed_or_trusted_lineage"}
 
 
 def test_merge_scrolled_reply_segments_combines_ordered_segments_into_parseable_json() -> None:
@@ -1073,6 +1137,8 @@ def test_assess_scrolled_segment_addition_allows_completion_progress_with_small_
     assert assessment["after_progress"]["parseable"] is True
     assert assessment["region_integrity_score"] > 0
     assert assessment["region_consistent"] is True
+    assert assessment["trusted_lineage_score"] > 0
+    assert assessment["trusted_lineage_extended"] is True
 
 
 def test_structured_completion_progress_prefers_balanced_parseable_growth_over_raw_length() -> None:

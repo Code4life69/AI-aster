@@ -60,6 +60,20 @@ SCROLLED_TEST_OUTPUT_PATTERNS = (
     r"^.+::.+\s+(passed|failed|error|skipped)\b",
     r"^(passed|failed|errors?) in \d",
 )
+SCROLLED_REPO_SOURCE_MARKERS = (
+    "monkeypatch.setattr",
+    "assert config.",
+    'calls["',
+    "calls['",
+    "def test_",
+    "class test",
+    "from aster.",
+    "import aster",
+    "browserchatgpttransport",
+    "replytrackerpolicy",
+    "choose_best_reply_candidate",
+    "build_turn_anchor",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,10 +530,24 @@ def merge_scrolled_reply_with_anchor(anchor_text: str, scrolled_segment: str, *,
 
 def merge_scrolled_reply_segments(anchor_text: str, segments: list[str], *, policy: ReplyTrackerPolicy) -> str:
     merged = clean_captured_segment_for_policy(anchor_text, policy=policy)
+    trusted_lineage = merged
+    drift_containment_active = False
     for segment in segments:
-        assessment = assess_scrolled_segment_addition(merged, segment, policy=policy, seed_text=anchor_text)
+        assessment = assess_scrolled_segment_addition(
+            merged,
+            segment,
+            policy=policy,
+            seed_text=anchor_text,
+            trusted_lineage_text=trusted_lineage,
+            drift_containment_active=drift_containment_active,
+        )
         if assessment["contributed"]:
             merged = str(assessment["merged_text"])
+            if assessment["trusted_lineage_extended"]:
+                trusted_lineage = merged
+            drift_containment_active = False
+        elif assessment["activate_drift_containment"]:
+            drift_containment_active = True
     return merged
 
 
@@ -579,6 +607,8 @@ def assess_scrolled_segment_addition(
     *,
     policy: ReplyTrackerPolicy,
     seed_text: str = "",
+    trusted_lineage_text: str = "",
+    drift_containment_active: bool = False,
 ) -> dict[str, object]:
     current_clean = clean_captured_segment_for_policy(current_merged, policy=policy)
     before_progress = structured_completion_progress(current_clean)
@@ -598,11 +628,22 @@ def assess_scrolled_segment_addition(
         "region_integrity_score": 0,
         "region_reasons": [],
         "continuity_against_seed": 0,
+        "continuity_against_trusted_lineage": 0,
         "continuity_against_current": 0,
         "region_consistent": False,
         "unrelated_page_content": False,
         "unrelated_page_hits": [],
         "drift_detected": False,
+        "trusted_lineage_score": 0,
+        "trusted_lineage_reasons": [],
+        "trusted_lineage_match": False,
+        "matched_seed_lineage": False,
+        "matched_trusted_lineage": False,
+        "contextual_structured_extension": False,
+        "matched_current_blob_only": False,
+        "trusted_lineage_extended": False,
+        "activate_drift_containment": False,
+        "drift_containment_active": drift_containment_active,
     }
     if not segment_clean:
         result["skip_reason"] = "empty_segment"
@@ -646,35 +687,63 @@ def assess_scrolled_segment_addition(
         segment_text=segment_clean,
         ordered_merge=ordered_merge,
         seed_text=seed_text,
+        trusted_lineage_text=trusted_lineage_text,
         before_progress=before_progress,
         after_progress=after_progress,
+        drift_containment_active=drift_containment_active,
     )
     result["region_integrity_score"] = integrity["region_integrity_score"]
     result["region_reasons"] = integrity["region_reasons"]
     result["continuity_against_seed"] = integrity["continuity_against_seed"]
+    result["continuity_against_trusted_lineage"] = integrity["continuity_against_trusted_lineage"]
     result["continuity_against_current"] = integrity["continuity_against_current"]
     result["region_consistent"] = integrity["region_consistent"]
     result["unrelated_page_content"] = integrity["unrelated_page_content"]
     result["unrelated_page_hits"] = integrity["unrelated_page_hits"]
     result["drift_detected"] = integrity["drift_detected"]
+    result["trusted_lineage_score"] = integrity["trusted_lineage_score"]
+    result["trusted_lineage_reasons"] = integrity["trusted_lineage_reasons"]
+    result["trusted_lineage_match"] = integrity["trusted_lineage_match"]
+    result["matched_seed_lineage"] = integrity["matched_seed_lineage"]
+    result["matched_trusted_lineage"] = integrity["matched_trusted_lineage"]
+    result["contextual_structured_extension"] = integrity["contextual_structured_extension"]
+    result["matched_current_blob_only"] = integrity["matched_current_blob_only"]
+    result["activate_drift_containment"] = integrity["activate_drift_containment"]
 
     if _normalize(ordered_merge) == _normalize(current_clean):
         result["skip_reason"] = "duplicate_overlap"
         return result
     if current_clean and _scrolled_anchor_consistency(current_clean, ordered_merge) <= 0:
         result["skip_reason"] = "lost_structured_seed"
+        result["activate_drift_containment"] = True
         return result
     if "duplicate_patch_start" in integrity["region_reasons"]:
         result["skip_reason"] = "reply_region_drift"
+        result["activate_drift_containment"] = True
+        return result
+    if not integrity["trusted_lineage_match"] and not integrity["clear_structured_closure"]:
+        result["skip_reason"] = (
+            "current_blob_only_continuity"
+            if integrity["matched_current_blob_only"]
+            else "missing_seed_or_trusted_lineage"
+        )
+        result["activate_drift_containment"] = True
+        return result
+    if drift_containment_active and integrity["trusted_lineage_score"] < 8 and not integrity["clear_structured_closure"]:
+        result["skip_reason"] = "drift_containment_active"
+        result["activate_drift_containment"] = True
         return result
     if integrity["unrelated_page_content"] and not integrity["region_consistent"]:
         result["skip_reason"] = "unrelated_page_content"
+        result["activate_drift_containment"] = True
         return result
     if integrity["drift_detected"]:
         result["skip_reason"] = "reply_region_drift"
+        result["activate_drift_containment"] = True
         return result
     if current_clean and int(integrity["region_integrity_score"]) <= 0:
         result["skip_reason"] = "low_region_integrity"
+        result["activate_drift_containment"] = True
         return result
     if novelty_count <= 0 and result["growth_chars"] <= 0 and not result["meaningful_completion_progress"]:
         result["skip_reason"] = "no_new_structured_content"
@@ -683,6 +752,11 @@ def assess_scrolled_segment_addition(
     result["contributed"] = True
     result["skip_reason"] = ""
     result["merged_text"] = ordered_merge
+    result["trusted_lineage_extended"] = (
+        integrity["trusted_lineage_match"]
+        or integrity["clear_structured_closure"]
+        or integrity["contextual_structured_extension"]
+    )
     return result
 
 
@@ -1103,18 +1177,22 @@ def _assess_scrolled_region_integrity(
     segment_text: str,
     ordered_merge: str,
     seed_text: str,
+    trusted_lineage_text: str,
     before_progress: dict[str, object],
     after_progress: dict[str, object],
+    drift_containment_active: bool,
 ) -> dict[str, object]:
     current_clean = current_text.strip()
     seed_clean = seed_text.strip() or current_clean
+    trusted_lineage_clean = trusted_lineage_text.strip() or seed_clean or current_clean
     segment_clean = segment_text.strip()
     normalized_segment = _normalize(segment_clean)
     current_consistency = _scrolled_anchor_consistency(current_clean, segment_clean) if current_clean else 0
     seed_consistency = _scrolled_anchor_consistency(seed_clean, segment_clean) if seed_clean else 0
-    merged_current_consistency = _scrolled_anchor_consistency(current_clean, ordered_merge) if current_clean else 0
-    merged_seed_consistency = _scrolled_anchor_consistency(seed_clean, ordered_merge) if seed_clean else 0
-    tail_overlap = _suffix_prefix_overlap(_normalize(current_clean or seed_clean), normalized_segment)
+    trusted_lineage_consistency = (
+        _scrolled_anchor_consistency(trusted_lineage_clean, segment_clean) if trusted_lineage_clean else 0
+    )
+    tail_overlap = _suffix_prefix_overlap(_normalize(trusted_lineage_clean or seed_clean or current_clean), normalized_segment)
     unrelated_page_hits = _scrolled_unrelated_page_hits(segment_clean)
     duplicate_patch_start = bool(before_progress["has_begin_marker"] and _has_begin_marker(segment_clean))
     segment_structure_state = _reply_candidate_structure_state(
@@ -1127,67 +1205,130 @@ def _assess_scrolled_region_integrity(
         or int(after_progress["schema_hits"]) > int(before_progress["schema_hits"])
         or int(after_progress["operation_items"]) > int(before_progress["operation_items"])
     )
-    structured_continuation = bool(
-        current_consistency > 0
-        or seed_consistency > 0
-        or tail_overlap >= 24
-        or completion_progress
+    clear_structured_closure = bool(
+        (not bool(before_progress["has_end_marker"]) and bool(after_progress["has_end_marker"]))
+        or (not bool(before_progress["parseable"]) and bool(after_progress["parseable"]))
     )
+    contextual_structured_extension = bool(
+        not drift_containment_active
+        and not unrelated_page_hits
+        and not duplicate_patch_start
+        and current_clean
+        and _reply_candidate_structure_state(current_clean, is_patch_json=looks_like_patch_plan_json) == "partial_structured"
+        and segment_structure_state in {"raw_code", "unstructured", "partial_structured"}
+        and len(segment_clean) >= 24
+    )
+    trusted_lineage_match = bool(
+        seed_consistency > 0
+        or trusted_lineage_consistency > 0
+        or tail_overlap >= 24
+        or contextual_structured_extension
+    )
+    current_blob_only_match = bool(
+        current_consistency > 0 and not trusted_lineage_match
+    )
+    structured_continuation = bool(
+        trusted_lineage_match
+        or (completion_progress and not unrelated_page_hits)
+        or clear_structured_closure
+    )
+
+    trusted_lineage_score = 0
+    trusted_lineage_reasons: list[str] = []
+    if seed_consistency > 0:
+        trusted_lineage_score += seed_consistency * 5
+        trusted_lineage_reasons.append("seed_reply_continuity")
+    if trusted_lineage_consistency > 0:
+        trusted_lineage_score += trusted_lineage_consistency * 4
+        trusted_lineage_reasons.append("trusted_lineage_continuity")
+    if tail_overlap >= 24:
+        trusted_lineage_score += min(4, max(1, tail_overlap // 32))
+        trusted_lineage_reasons.append("trusted_lineage_overlap")
+    if clear_structured_closure and structured_continuation:
+        trusted_lineage_score += 6
+        trusted_lineage_reasons.append("clear_structured_closure")
+    elif completion_progress and trusted_lineage_match:
+        trusted_lineage_score += 3
+        trusted_lineage_reasons.append("structured_completion_progress")
+    if contextual_structured_extension:
+        trusted_lineage_score += 2
+        trusted_lineage_reasons.append("contextual_structured_extension")
+    if current_blob_only_match:
+        trusted_lineage_score -= 6
+        trusted_lineage_reasons.append("current_blob_only_match")
+    if unrelated_page_hits:
+        penalty = 4 + min(len(unrelated_page_hits), 3) * 2
+        if not trusted_lineage_match:
+            penalty += 4
+        trusted_lineage_score -= penalty
+        trusted_lineage_reasons.append("unrelated_page_content")
+    if duplicate_patch_start:
+        trusted_lineage_score -= 12
+        trusted_lineage_reasons.append("duplicate_patch_start")
+    if drift_containment_active and not trusted_lineage_match and not clear_structured_closure:
+        trusted_lineage_score -= 8
+        trusted_lineage_reasons.append("drift_containment_active")
 
     score = 0
     reasons: list[str] = []
-    if current_consistency > 0:
-        score += current_consistency * 4
-        reasons.append("current_reply_continuity")
     if seed_consistency > 0:
-        score += seed_consistency * 3
+        score += seed_consistency * 5
         reasons.append("seed_reply_continuity")
-    if merged_current_consistency > 0:
-        score += merged_current_consistency * 2
-        reasons.append("merged_reply_continuity")
-    if merged_seed_consistency > 0:
-        score += merged_seed_consistency * 2
-        reasons.append("merged_seed_continuity")
+    if trusted_lineage_consistency > 0:
+        score += trusted_lineage_consistency * 4
+        reasons.append("trusted_lineage_continuity")
+    if current_consistency > 0 and trusted_lineage_match:
+        score += current_consistency * 2
+        reasons.append("current_reply_continuity")
+    if current_blob_only_match:
+        score -= 4
+        reasons.append("current_blob_only_match")
     if tail_overlap >= 24:
         score += min(4, max(1, tail_overlap // 32))
-        reasons.append("tail_overlap")
+        reasons.append("trusted_lineage_overlap")
     if structured_continuation:
         score += 5
         reasons.append("structured_continuation")
+    if contextual_structured_extension:
+        score += 2
+        reasons.append("contextual_structured_extension")
     if segment_structure_state in {"partial_structured", "complete_structured"} and structured_continuation:
         score += 3
         reasons.append("structured_segment")
-    if not bool(before_progress["has_end_marker"]) and bool(after_progress["has_end_marker"]):
+    if clear_structured_closure:
         score += 4
-        reasons.append("gains_patch_end")
-    if not bool(before_progress["parseable"]) and bool(after_progress["parseable"]):
-        score += 6
-        reasons.append("gains_parseable_json")
+        reasons.append("clear_structured_closure")
+    if not clear_structured_closure and completion_progress and trusted_lineage_match:
+        score += 2
+        reasons.append("structured_completion_progress")
     if int(after_progress["schema_hits"]) > int(before_progress["schema_hits"]):
         score += 2
         reasons.append("adds_schema_keys")
     if int(after_progress["operation_items"]) > int(before_progress["operation_items"]):
         score += 2
         reasons.append("adds_operations")
-
+    if unrelated_page_hits:
+        penalty = 4 + min(len(unrelated_page_hits), 3) * 2
+        if not trusted_lineage_match:
+            penalty += 4
+        score -= penalty
+        reasons.append("unrelated_page_content")
     if duplicate_patch_start:
         score -= 12
-        if unrelated_page_hits:
-            score -= 8
-            score = min(score, -1)
         reasons.append("duplicate_patch_start")
-    if unrelated_page_hits:
-        score -= 4 + min(len(unrelated_page_hits), 3) * 2
-        reasons.append("unrelated_page_content")
-    if current_clean and segment_structure_state in {"raw_code", "unstructured"} and not structured_continuation:
-        score -= 5
+    if current_clean and segment_structure_state in {"raw_code", "unstructured"} and not trusted_lineage_match:
+        score -= 6
         reasons.append("weak_region_continuity")
+    if drift_containment_active and not trusted_lineage_match and not clear_structured_closure:
+        score -= 8
+        reasons.append("drift_containment_active")
 
     drift_detected = bool(
         current_clean
         and (
-            (duplicate_patch_start and current_consistency <= 0 and seed_consistency <= 0)
-            or (unrelated_page_hits and current_consistency <= 0 and seed_consistency <= 0 and not completion_progress)
+            duplicate_patch_start
+            or current_blob_only_match
+            or (unrelated_page_hits and not trusted_lineage_match and not clear_structured_closure)
         )
     )
     if drift_detected:
@@ -1198,16 +1339,30 @@ def _assess_scrolled_region_integrity(
     for reason in reasons:
         if reason not in deduped_reasons:
             deduped_reasons.append(reason)
+    deduped_lineage_reasons: list[str] = []
+    for reason in trusted_lineage_reasons:
+        if reason not in deduped_lineage_reasons:
+            deduped_lineage_reasons.append(reason)
 
     return {
         "region_integrity_score": score,
         "region_reasons": deduped_reasons,
         "continuity_against_seed": seed_consistency,
+        "continuity_against_trusted_lineage": trusted_lineage_consistency,
         "continuity_against_current": current_consistency,
-        "region_consistent": score > 0 and not drift_detected,
+        "region_consistent": score > 0 and not drift_detected and trusted_lineage_score > 0,
         "unrelated_page_content": bool(unrelated_page_hits),
         "unrelated_page_hits": unrelated_page_hits,
         "drift_detected": drift_detected,
+        "trusted_lineage_score": trusted_lineage_score,
+        "trusted_lineage_reasons": deduped_lineage_reasons,
+        "trusted_lineage_match": trusted_lineage_match,
+        "matched_seed_lineage": seed_consistency > 0,
+        "matched_trusted_lineage": trusted_lineage_consistency > 0 or tail_overlap >= 24,
+        "contextual_structured_extension": contextual_structured_extension,
+        "matched_current_blob_only": current_blob_only_match,
+        "clear_structured_closure": clear_structured_closure,
+        "activate_drift_containment": drift_detected or current_blob_only_match or (drift_containment_active and not trusted_lineage_match),
     }
 
 
@@ -1297,6 +1452,8 @@ def _scrolled_unrelated_page_hits(text: str) -> list[str]:
             hits.append("repo_listing")
         if _looks_like_test_output_line(line) and "test_output" not in hits:
             hits.append("test_output")
+        if _looks_like_repo_source_line(line) and "repo_source" not in hits:
+            hits.append("repo_source")
     return hits
 
 
@@ -1323,6 +1480,13 @@ def _looks_like_test_output_line(line: str) -> bool:
         if re.search(pattern, stripped, flags=re.IGNORECASE):
             return True
     return False
+
+
+def _looks_like_repo_source_line(line: str) -> bool:
+    lowered = _normalize(line.strip())
+    if not lowered:
+        return False
+    return any(marker in lowered for marker in SCROLLED_REPO_SOURCE_MARKERS)
 
 
 def _reply_candidate_structure_state(

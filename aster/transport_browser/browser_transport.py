@@ -1779,10 +1779,12 @@ class BrowserChatGPTTransport:
         segments: list[str] = []
         no_progress_steps = 0
         merged = structured_anchor_text.strip()
+        trusted_lineage = merged
         step = 0
         step_limit = max_steps
         continuation_windows_used = 0
         recent_completion_progress_steps = 0
+        drift_containment_active = False
 
         while step < step_limit:
             self._tick_runtime_log_heartbeat("capture_reply_text_by_scrolling")
@@ -1792,6 +1794,8 @@ class BrowserChatGPTTransport:
                 segment,
                 policy=REPLY_TRACKER_POLICY,
                 seed_text=structured_anchor_text or merged,
+                trusted_lineage_text=trusted_lineage,
+                drift_containment_active=drift_containment_active,
             )
             if assessment["contributed"]:
                 no_progress_steps = 0
@@ -1801,6 +1805,9 @@ class BrowserChatGPTTransport:
                     recent_completion_progress_steps = max(0, recent_completion_progress_steps - 1)
                 segments.append(str(assessment["segment_text"]))
                 merged = str(assessment["merged_text"])
+                if assessment["trusted_lineage_extended"]:
+                    trusted_lineage = merged
+                drift_containment_active = False
                 self._log(
                     "reply_scroll_segment",
                     {
@@ -1817,11 +1824,20 @@ class BrowserChatGPTTransport:
                         "region_integrity_score": assessment["region_integrity_score"],
                         "region_reasons": assessment["region_reasons"],
                         "region_consistent": assessment["region_consistent"],
+                        "trusted_lineage_score": assessment["trusted_lineage_score"],
+                        "trusted_lineage_reasons": assessment["trusted_lineage_reasons"],
+                        "trusted_lineage_extended": assessment["trusted_lineage_extended"],
+                        "matched_seed_lineage": assessment["matched_seed_lineage"],
+                        "matched_trusted_lineage": assessment["matched_trusted_lineage"],
+                        "contextual_structured_extension": assessment["contextual_structured_extension"],
+                        "matched_current_blob_only": assessment["matched_current_blob_only"],
                         "continuity_against_seed": assessment["continuity_against_seed"],
+                        "continuity_against_trusted_lineage": assessment["continuity_against_trusted_lineage"],
                         "continuity_against_current": assessment["continuity_against_current"],
                         "unrelated_page_content": assessment["unrelated_page_content"],
                         "unrelated_page_hits": assessment["unrelated_page_hits"],
                         "drift_detected": assessment["drift_detected"],
+                        "drift_containment_active": drift_containment_active,
                         "before_progress": assessment["before_progress"],
                         "after_progress": assessment["after_progress"],
                     },
@@ -1829,6 +1845,8 @@ class BrowserChatGPTTransport:
             else:
                 no_progress_steps += 1
                 recent_completion_progress_steps = max(0, recent_completion_progress_steps - 1)
+                if assessment["activate_drift_containment"]:
+                    drift_containment_active = True
                 event = (
                     "reply_scroll_prompt_boundary"
                     if assessment["skip_reason"] == "prompt_or_preamble_contamination"
@@ -1850,11 +1868,20 @@ class BrowserChatGPTTransport:
                         "region_integrity_score": assessment["region_integrity_score"],
                         "region_reasons": assessment["region_reasons"],
                         "region_consistent": assessment["region_consistent"],
+                        "trusted_lineage_score": assessment["trusted_lineage_score"],
+                        "trusted_lineage_reasons": assessment["trusted_lineage_reasons"],
+                        "trusted_lineage_extended": assessment["trusted_lineage_extended"],
+                        "matched_seed_lineage": assessment["matched_seed_lineage"],
+                        "matched_trusted_lineage": assessment["matched_trusted_lineage"],
+                        "contextual_structured_extension": assessment["contextual_structured_extension"],
+                        "matched_current_blob_only": assessment["matched_current_blob_only"],
                         "continuity_against_seed": assessment["continuity_against_seed"],
+                        "continuity_against_trusted_lineage": assessment["continuity_against_trusted_lineage"],
                         "continuity_against_current": assessment["continuity_against_current"],
                         "unrelated_page_content": assessment["unrelated_page_content"],
                         "unrelated_page_hits": assessment["unrelated_page_hits"],
                         "drift_detected": assessment["drift_detected"],
+                        "drift_containment_active": drift_containment_active,
                         "before_progress": assessment["before_progress"],
                         "after_progress": assessment["after_progress"],
                     },
