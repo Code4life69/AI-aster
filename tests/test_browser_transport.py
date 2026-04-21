@@ -618,7 +618,7 @@ def test_capture_reply_text_blocks_one_shot_scrolled_structured_candidate(monkey
         ]
     )
     transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: next(replies)
-    transport._capture_reply_text_by_scrolling = lambda target, before_lines, prompt, max_steps: (
+    transport._capture_reply_text_by_scrolling = lambda target, before_lines, prompt, max_steps, **_kwargs: (
         '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}'
     )
     monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
@@ -637,6 +637,45 @@ def test_capture_reply_text_blocks_one_shot_scrolled_structured_candidate(monkey
     assert scroll_events
     assert scroll_events[-1]["acceptance_tier"] == "scrolled_structured"
     assert scroll_events[-1]["accepted"] is False
+
+
+def test_capture_reply_text_by_scrolling_keeps_structured_anchor_over_prompt_contamination(monkeypatch) -> None:
+    transport = BrowserChatGPTTransport()
+    transport._logger = None
+    transport._tick_runtime_log_heartbeat = lambda *_args, **_kwargs: None
+    transport._activity = lambda *_args, **_kwargs: None
+    transport._scroll_reply_to_bottom = lambda target: None
+    transport._scroll_reply_up = lambda target: None
+    segments = iter(
+        [
+            "SYSTEM:\nYou are a coding orchestrator backend. Return JSON only.\nUSER:\nUser goal: Build app\n",
+            'from tkinter import ttk\\nprint(\\"ok\\")"}]}\nASTER_PATCH_END',
+            "",
+        ]
+    )
+    transport._capture_visible_reply_segment = lambda target, before_lines, prompt: next(segments)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+
+    class _Target:
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    reply = transport._capture_reply_text_by_scrolling(
+        _Target(),
+        before_lines=[],
+        prompt="create app",
+        max_steps=3,
+        structured_anchor_text=(
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+        ),
+    )
+
+    assert "SYSTEM:" not in reply
+    assert "USER:" not in reply
+    assert "ASTER_PATCH_END" in reply
 
 
 def test_reply_detection_rejects_code_like_reply_while_send_button_is_still_visible() -> None:

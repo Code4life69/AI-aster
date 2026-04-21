@@ -36,10 +36,12 @@ from aster.browser_core import (
     looks_like_reply_started_candidate_for_policy,
     merge_text_segments,
     merge_reply_segment_sources,
+    merge_scrolled_reply_segments,
     reply_detection_blocked,
     reply_looks_incomplete,
     prompt_insertion_confirmed,
     score_candidate_for_policy,
+    scrolled_segment_looks_contaminated_for_policy,
     select_preferred_reply_candidate,
     segment_looks_like_prompt_echo_for_policy,
     serialize_anchor,
@@ -1603,7 +1605,13 @@ class BrowserChatGPTTransport:
                             **self._reply_acceptance_log_payload(acceptance),
                         },
                     )
-                    scrolled = self._capture_reply_text_by_scrolling(target, before_lines, prompt, max_steps=10)
+                    scrolled = self._capture_reply_text_by_scrolling(
+                        target,
+                        before_lines,
+                        prompt,
+                        max_steps=10,
+                        structured_anchor_text=candidate if acceptance.acceptance_tier == "partial_structured_reply" else "",
+                    )
                     if scrolled.strip():
                         best_from_scroll = choose_best_reply_candidate_for_policy(
                             {"scrolled": scrolled},
@@ -1747,7 +1755,15 @@ class BrowserChatGPTTransport:
         uia_text = self._read_visible_reply_text(target)
         return ocr_text, uia_text
 
-    def _capture_reply_text_by_scrolling(self, target, before_lines, prompt: str, max_steps: int) -> str:
+    def _capture_reply_text_by_scrolling(
+        self,
+        target,
+        before_lines,
+        prompt: str,
+        max_steps: int,
+        *,
+        structured_anchor_text: str = "",
+    ) -> str:
         self._activity(
             "browser_scroll_read",
             "Scrolling through the ChatGPT thread to collect the full reply.",
@@ -1756,12 +1772,12 @@ class BrowserChatGPTTransport:
         self._scroll_reply_to_bottom(target)
         segments: list[str] = []
         repeated = 0
-        previous_signature = ""
+        merged = structured_anchor_text.strip()
 
         for step in range(max_steps):
             self._tick_runtime_log_heartbeat("capture_reply_text_by_scrolling")
             segment = self._capture_visible_reply_segment(target, before_lines, prompt)
-            if segment_looks_like_prompt_echo_for_policy(segment, policy=REPLY_TRACKER_POLICY):
+            if scrolled_segment_looks_contaminated_for_policy(segment, policy=REPLY_TRACKER_POLICY):
                 self._log(
                     "reply_scroll_prompt_boundary",
                     {
@@ -1773,25 +1789,34 @@ class BrowserChatGPTTransport:
                     break
                 repeated += 1
                 continue
-            signature = _normalize(segment)
             if not segment.strip():
                 repeated += 1
-            elif signature == previous_signature:
+                proposed = merged
+            else:
+                proposed = merge_scrolled_reply_segments(
+                    structured_anchor_text,
+                    list(reversed([*segments, segment])),
+                    policy=REPLY_TRACKER_POLICY,
+                )
+            signature = _normalize(proposed)
+            if not proposed.strip():
+                repeated += 1
+            elif signature == _normalize(merged):
                 repeated += 1
             else:
                 repeated = 0
-                previous_signature = signature
                 segments.append(segment)
+                merged = proposed
                 self._log(
                     "reply_scroll_segment",
                     {
                         "step": step,
                         "length": len(segment),
                         "preview": segment[:220],
+                        "merged_length": len(merged),
                     },
                 )
 
-            merged = merge_text_segments(list(reversed(segments)))
             if looks_like_patch_plan_json(merged):
                 self._scroll_reply_to_bottom(target)
                 return merged
@@ -1800,6 +1825,10 @@ class BrowserChatGPTTransport:
             self._scroll_reply_up(target)
 
         self._scroll_reply_to_bottom(target)
+        if merged.strip():
+            return merged
+        if structured_anchor_text.strip():
+            return merge_scrolled_reply_segments(structured_anchor_text, list(reversed(segments)), policy=REPLY_TRACKER_POLICY)
         return merge_text_segments(list(reversed(segments)))
 
     def _capture_visible_reply_segment(self, target, before_lines, prompt: str) -> str:

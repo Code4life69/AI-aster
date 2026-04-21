@@ -32,10 +32,13 @@ from aster.browser_core.reply_tracker import (
     looks_like_reply_started_candidate_for_policy,
     looks_like_substantive_reply_candidate,
     looks_like_substantive_reply_candidate_for_policy,
+    merge_scrolled_reply_segments,
+    merge_scrolled_reply_with_anchor,
     merge_reply_segment_sources,
     reply_detection_blocked,
     reply_matches_anchor,
     reply_looks_incomplete,
+    scrolled_segment_looks_contaminated_for_policy,
     score_candidate,
     score_candidate_for_policy,
     select_preferred_reply_candidate,
@@ -889,6 +892,68 @@ def test_reply_tracker_policy_cleans_and_merges_reply_segments() -> None:
     assert "User goal" not in merged
     assert "Share" not in merged
     assert '"operations"' in merged
+
+
+def test_scrolled_segment_contamination_rejects_system_and_user_preamble() -> None:
+    segment = (
+        "SYSTEM:\nYou are a coding orchestrator backend. Return JSON only.\n"
+        "USER:\nUser goal: Build app\nRelevant file contents:\nPATH: app.py\n"
+    )
+
+    assert scrolled_segment_looks_contaminated_for_policy(segment, policy=TEST_REPLY_POLICY) is True
+
+
+def test_merge_scrolled_reply_with_anchor_preserves_existing_partial_over_unrelated_raw_code() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    raw_code = (
+        "self.root.resizable(False, False)\n"
+        "self.display_var = tk.StringVar(value='0')\n"
+        "for label in ('7', '8', '9', '/'):\n"
+        "    ttk.Button(frame, text=label).grid(sticky='nsew')\n"
+    )
+
+    merged = merge_scrolled_reply_with_anchor(anchor, raw_code, policy=TEST_REPLY_POLICY)
+
+    assert merged == anchor
+
+
+def test_merge_scrolled_reply_with_anchor_prefers_structured_extension() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    extension = (
+        'from tkinter import ttk\\nprint(\\"ok\\")"}]}\n'
+        "ASTER_PATCH_END"
+    )
+
+    merged = merge_scrolled_reply_with_anchor(anchor, extension, policy=TEST_REPLY_POLICY)
+
+    assert "ASTER_PATCH_END" in merged
+    assert '"operations"' in merged
+    assert len(merged) > len(anchor)
+
+
+def test_merge_scrolled_reply_segments_keeps_structured_alignment_over_page_junk() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    segments = [
+        "SYSTEM:\nYou are a coding orchestrator backend. Return JSON only.\nUSER:\nUser goal: Build app\n",
+        'from tkinter import ttk\\nprint(\\"ok\\")"}]}\nASTER_PATCH_END',
+        "Projects\nSearch chats\nShare\n",
+    ]
+
+    merged = merge_scrolled_reply_segments(anchor, segments, policy=TEST_REPLY_POLICY)
+
+    assert "SYSTEM:" not in merged
+    assert "USER:" not in merged
+    assert "Search chats" not in merged
+    assert "ASTER_PATCH_END" in merged
 
 
 def test_summarize_reply_wait_iteration_flags_stale_capture_without_candidate() -> None:

@@ -18,6 +18,19 @@ STRUCTURED_SCHEMA_HINTS = (
     '"path"',
     '"reason"',
 )
+STRONG_SCROLLED_CONTAMINATION_MARKERS = (
+    "browser mode has a smaller prompt budget",
+    "context omitted for browser size safety",
+    "included_files",
+    "omitted_files",
+    "return promptpackage",
+    "coding orchestrator backend",
+    "return json only",
+    "relevant file tree:",
+    "relevant file contents:",
+    "conversation history:",
+    "final output rules for browser mode:",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +459,39 @@ def merge_reply_segment_sources(uia_text: str, ocr_text: str, *, policy: ReplyTr
     )
 
 
+def merge_scrolled_reply_with_anchor(anchor_text: str, scrolled_segment: str, *, policy: ReplyTrackerPolicy) -> str:
+    anchor_clean = clean_captured_segment_for_policy(anchor_text, policy=policy)
+    segment_clean = clean_captured_segment_for_policy(scrolled_segment, policy=policy)
+    if not segment_clean:
+        return anchor_clean
+    if scrolled_segment_looks_contaminated_for_policy(segment_clean, policy=policy):
+        return anchor_clean
+    if not anchor_clean:
+        return segment_clean
+
+    candidates = [
+        anchor_clean,
+        segment_clean,
+        clean_captured_segment_for_policy(merge_text_segments([segment_clean, anchor_clean]), policy=policy),
+        clean_captured_segment_for_policy(merge_text_segments([anchor_clean, segment_clean]), policy=policy),
+    ]
+    best = anchor_clean
+    best_priority = _scrolled_merge_priority(best, anchor_text=anchor_clean, policy=policy)
+    for candidate in candidates[1:]:
+        priority = _scrolled_merge_priority(candidate, anchor_text=anchor_clean, policy=policy)
+        if priority > best_priority:
+            best = candidate
+            best_priority = priority
+    return best
+
+
+def merge_scrolled_reply_segments(anchor_text: str, segments: list[str], *, policy: ReplyTrackerPolicy) -> str:
+    merged = clean_captured_segment_for_policy(anchor_text, policy=policy)
+    for segment in segments:
+        merged = merge_scrolled_reply_with_anchor(merged, segment, policy=policy)
+    return merged
+
+
 def merge_text_segments(segments: list[str]) -> str:
     merged_lines: list[str] = []
     merged_norms: list[str] = []
@@ -492,6 +538,22 @@ def segment_looks_like_prompt_echo(text: str, *, prompt_echo_markers: tuple[str,
 
 def segment_looks_like_prompt_echo_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> bool:
     return segment_looks_like_prompt_echo(text, prompt_echo_markers=policy.prompt_echo_markers)
+
+
+def scrolled_segment_looks_contaminated(text: str, *, prompt_echo_markers: tuple[str, ...]) -> bool:
+    cleaned = text.strip()
+    if not cleaned:
+        return False
+    lowered = _normalize(cleaned)
+    if segment_looks_like_prompt_echo(cleaned, prompt_echo_markers=prompt_echo_markers):
+        return True
+    if re.search(r"(^|\n)\s*(system|user|assistant)\s*:", cleaned, flags=re.IGNORECASE):
+        return True
+    return any(marker in lowered for marker in STRONG_SCROLLED_CONTAMINATION_MARKERS)
+
+
+def scrolled_segment_looks_contaminated_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> bool:
+    return scrolled_segment_looks_contaminated(text, prompt_echo_markers=policy.prompt_echo_markers)
 
 
 def clean_captured_segment_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> str:
@@ -738,6 +800,45 @@ def _reply_candidate_priority(
     )
 
 
+def _scrolled_merge_priority(
+    text: str,
+    *,
+    anchor_text: str,
+    policy: ReplyTrackerPolicy,
+) -> tuple[int, int, int, int, int, int]:
+    cleaned = text.strip()
+    if not cleaned:
+        return (-1, -1, -1, -1, -1, -1)
+    if scrolled_segment_looks_contaminated_for_policy(cleaned, policy=policy):
+        return (-1, -1, -1, -1, -1, -1)
+    structure_state = _reply_candidate_structure_state(cleaned, is_patch_json=looks_like_patch_plan_json)
+    state_rank = {
+        "empty": 0,
+        "unstructured": 1,
+        "raw_code": 1,
+        "partial_structured": 3,
+        "complete_structured": 4,
+    }[structure_state]
+    normalized = _normalize(cleaned)
+    has_end_marker = int("aster patch end" in normalized or "aster_patch_end" in normalized)
+    schema_hits = _structured_schema_hit_count(cleaned)
+    anchor_consistency = _scrolled_anchor_consistency(anchor_text, cleaned)
+    starts_with_structured = int(
+        normalized.startswith("aster patch begin")
+        or normalized.startswith("aster_patch_begin")
+        or normalized.startswith("{")
+        or normalized.startswith('"summary"')
+    )
+    return (
+        int(looks_like_patch_plan_json(cleaned)),
+        state_rank,
+        starts_with_structured,
+        anchor_consistency,
+        has_end_marker,
+        schema_hits,
+    )
+
+
 def _structured_reply_quality(
     text: str,
     *,
@@ -759,6 +860,28 @@ def _structured_reply_quality(
     if '"operations"' in cleaned and "{" in cleaned:
         return 1
     return 0
+
+
+def _structured_schema_hit_count(text: str) -> int:
+    return sum(1 for hint in STRUCTURED_SCHEMA_HINTS if hint in text)
+
+
+def _scrolled_anchor_consistency(anchor_text: str, candidate_text: str) -> int:
+    anchor_clean = anchor_text.strip()
+    candidate_clean = candidate_text.strip()
+    if not anchor_clean or not candidate_clean:
+        return 0
+    anchor_normalized = _normalize(anchor_clean)
+    candidate_normalized = _normalize(candidate_clean)
+    if anchor_normalized and anchor_normalized in candidate_normalized:
+        return 3
+    excerpt = anchor_normalized[:160]
+    if excerpt and excerpt in candidate_normalized:
+        return 2
+    anchor_lines = [_normalize(line) for line in anchor_clean.splitlines() if line.strip()]
+    candidate_lines = {_normalize(line) for line in candidate_clean.splitlines() if line.strip()}
+    overlap = sum(1 for line in anchor_lines[:8] if line in candidate_lines)
+    return min(overlap, 2)
 
 
 def _reply_candidate_structure_state(
