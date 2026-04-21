@@ -50,6 +50,7 @@ from .reply_tracker import (
     reply_detection_blocked,
     reply_looks_incomplete,
     reply_matches_anchor,
+    assess_scrolled_segment_addition,
     score_candidate,
     score_candidate_for_policy,
     scrolled_segment_looks_contaminated,
@@ -58,6 +59,7 @@ from .reply_tracker import (
     segment_looks_like_prompt_echo,
     segment_looks_like_prompt_echo_for_policy,
     summarize_reply_wait_iteration,
+    structured_completion_progress,
     should_ignore_candidate_for_policy,
     should_ignore_candidate,
 )
@@ -120,6 +122,7 @@ __all__ = [
     "reply_detection_blocked",
     "reply_looks_incomplete",
     "reply_matches_anchor",
+    "assess_scrolled_segment_addition",
     "score_candidate",
     "score_candidate_for_policy",
     "scrolled_segment_looks_contaminated",
@@ -131,5 +134,6 @@ __all__ = [
     "should_ignore_candidate_for_policy",
     "should_ignore_candidate",
     "summarize_reply_wait_iteration",
+    "structured_completion_progress",
     "window_title_suggests_existing_chat",
 ]

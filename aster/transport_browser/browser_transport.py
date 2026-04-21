@@ -34,6 +34,7 @@ from aster.browser_core import (
     looks_like_chatgpt_page,
     looks_like_patch_plan_json,
     looks_like_reply_started_candidate_for_policy,
+    assess_scrolled_segment_addition,
     merge_text_segments,
     merge_reply_segment_sources,
     merge_scrolled_reply_segments,
@@ -43,7 +44,6 @@ from aster.browser_core import (
     score_candidate_for_policy,
     scrolled_segment_looks_contaminated_for_policy,
     select_preferred_reply_candidate,
-    segment_looks_like_prompt_echo_for_policy,
     serialize_anchor,
     summarize_reply_wait_iteration,
     window_title_suggests_existing_chat,
@@ -1771,56 +1771,61 @@ class BrowserChatGPTTransport:
         )
         self._scroll_reply_to_bottom(target)
         segments: list[str] = []
-        repeated = 0
+        no_progress_steps = 0
         merged = structured_anchor_text.strip()
 
         for step in range(max_steps):
             self._tick_runtime_log_heartbeat("capture_reply_text_by_scrolling")
             segment = self._capture_visible_reply_segment(target, before_lines, prompt)
-            if scrolled_segment_looks_contaminated_for_policy(segment, policy=REPLY_TRACKER_POLICY):
-                self._log(
-                    "reply_scroll_prompt_boundary",
-                    {
-                        "step": step,
-                        "preview": segment[:220],
-                    },
-                )
-                if segments:
-                    break
-                repeated += 1
-                continue
-            if not segment.strip():
-                repeated += 1
-                proposed = merged
-            else:
-                proposed = merge_scrolled_reply_segments(
-                    structured_anchor_text,
-                    list(reversed([*segments, segment])),
-                    policy=REPLY_TRACKER_POLICY,
-                )
-            signature = _normalize(proposed)
-            if not proposed.strip():
-                repeated += 1
-            elif signature == _normalize(merged):
-                repeated += 1
-            else:
-                repeated = 0
-                segments.append(segment)
-                merged = proposed
+            assessment = assess_scrolled_segment_addition(
+                merged,
+                segment,
+                policy=REPLY_TRACKER_POLICY,
+            )
+            if assessment["contributed"]:
+                no_progress_steps = 0
+                segments.append(str(assessment["segment_text"]))
+                merged = str(assessment["merged_text"])
                 self._log(
                     "reply_scroll_segment",
                     {
                         "step": step,
-                        "length": len(segment),
-                        "preview": segment[:220],
+                        "length": len(str(assessment["segment_text"])),
+                        "preview": str(assessment["segment_text"])[:220],
                         "merged_length": len(merged),
+                        "novelty_count": assessment["novelty_count"],
+                        "growth_chars": assessment["growth_chars"],
+                        "completion_progressed": assessment["completion_progressed"],
+                        "before_progress": assessment["before_progress"],
+                        "after_progress": assessment["after_progress"],
+                    },
+                )
+            else:
+                no_progress_steps += 1
+                event = (
+                    "reply_scroll_prompt_boundary"
+                    if assessment["skip_reason"] == "prompt_or_preamble_contamination"
+                    else "reply_scroll_segment_skipped"
+                )
+                self._log(
+                    event,
+                    {
+                        "step": step,
+                        "skip_reason": assessment["skip_reason"],
+                        "length": len(str(assessment["segment_text"])),
+                        "preview": str(assessment["segment_text"])[:220],
+                        "novelty_count": assessment["novelty_count"],
+                        "growth_chars": assessment["growth_chars"],
+                        "completion_progressed": assessment["completion_progressed"],
+                        "before_progress": assessment["before_progress"],
+                        "after_progress": assessment["after_progress"],
                     },
                 )
 
             if looks_like_patch_plan_json(merged):
                 self._scroll_reply_to_bottom(target)
                 return merged
-            if repeated >= 2:
+            if no_progress_steps >= 3:
                 break
             self._scroll_reply_up(target)
 
@@ -1845,9 +1850,8 @@ class BrowserChatGPTTransport:
 
     def _scroll_reply_up(self, target) -> None:
         self._focus_reply_area(target)
-        for _ in range(2):
-            pyautogui.press("pageup")
-            time.sleep(0.25)
+        pyautogui.press("pageup")
+        time.sleep(0.25)
 
     def _focus_reply_area(self, target) -> None:
         self._focus_window(target)

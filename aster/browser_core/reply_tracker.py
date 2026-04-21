@@ -472,8 +472,8 @@ def merge_scrolled_reply_with_anchor(anchor_text: str, scrolled_segment: str, *,
     candidates = [
         anchor_clean,
         segment_clean,
-        clean_captured_segment_for_policy(merge_text_segments([segment_clean, anchor_clean]), policy=policy),
-        clean_captured_segment_for_policy(merge_text_segments([anchor_clean, segment_clean]), policy=policy),
+        clean_captured_segment_for_policy(_merge_structured_text_by_overlap(segment_clean, anchor_clean), policy=policy),
+        clean_captured_segment_for_policy(_merge_structured_text_by_overlap(anchor_clean, segment_clean), policy=policy),
     ]
     best = anchor_clean
     best_priority = _scrolled_merge_priority(best, anchor_text=anchor_clean, policy=policy)
@@ -488,8 +488,83 @@ def merge_scrolled_reply_with_anchor(anchor_text: str, scrolled_segment: str, *,
 def merge_scrolled_reply_segments(anchor_text: str, segments: list[str], *, policy: ReplyTrackerPolicy) -> str:
     merged = clean_captured_segment_for_policy(anchor_text, policy=policy)
     for segment in segments:
-        merged = merge_scrolled_reply_with_anchor(merged, segment, policy=policy)
+        assessment = assess_scrolled_segment_addition(merged, segment, policy=policy)
+        if assessment["contributed"]:
+            merged = str(assessment["merged_text"])
     return merged
+
+
+def structured_completion_progress(text: str) -> dict[str, object]:
+    cleaned = text.strip()
+    normalized = _normalize(cleaned)
+    return {
+        "parseable": looks_like_patch_plan_json(cleaned),
+        "has_begin_marker": "aster patch begin" in normalized or "aster_patch_begin" in normalized,
+        "has_end_marker": "aster patch end" in normalized or "aster_patch_end" in normalized,
+        "brace_balance": cleaned.count("{") - cleaned.count("}"),
+        "bracket_balance": cleaned.count("[") - cleaned.count("]"),
+        "schema_hits": _structured_schema_hit_count(cleaned),
+        "operation_items": len(re.findall(r'"type"\s*:', cleaned)),
+        "text_length": len(cleaned),
+    }
+
+
+def assess_scrolled_segment_addition(
+    current_merged: str,
+    segment: str,
+    *,
+    policy: ReplyTrackerPolicy,
+) -> dict[str, object]:
+    current_clean = clean_captured_segment_for_policy(current_merged, policy=policy)
+    before_progress = structured_completion_progress(current_clean)
+    segment_clean = clean_captured_segment_for_policy(segment, policy=policy)
+    result = {
+        "contributed": False,
+        "skip_reason": "",
+        "segment_text": segment_clean,
+        "merged_text": current_clean,
+        "novelty_count": 0,
+        "growth_chars": 0,
+        "completion_progressed": False,
+        "before_progress": before_progress,
+        "after_progress": before_progress,
+    }
+    if not segment_clean:
+        result["skip_reason"] = "empty_segment"
+        return result
+    if scrolled_segment_looks_contaminated_for_policy(segment, policy=policy):
+        result["skip_reason"] = "prompt_or_preamble_contamination"
+        return result
+
+    ordered_merge = clean_captured_segment_for_policy(
+        _merge_structured_text_by_overlap(current_clean, segment_clean) if current_clean else segment_clean,
+        policy=policy,
+    )
+    if not ordered_merge:
+        result["skip_reason"] = "empty_after_cleaning"
+        return result
+
+    novelty_count = _ordered_segment_novelty_count(current_clean, ordered_merge)
+    after_progress = structured_completion_progress(ordered_merge)
+    result["novelty_count"] = novelty_count
+    result["growth_chars"] = max(0, len(ordered_merge) - len(current_clean))
+    result["after_progress"] = after_progress
+    result["completion_progressed"] = _completion_progress_score(after_progress) > _completion_progress_score(before_progress)
+
+    if _normalize(ordered_merge) == _normalize(current_clean):
+        result["skip_reason"] = "duplicate_overlap"
+        return result
+    if current_clean and _scrolled_anchor_consistency(current_clean, ordered_merge) <= 0:
+        result["skip_reason"] = "lost_structured_seed"
+        return result
+    if novelty_count <= 0:
+        result["skip_reason"] = "no_new_structured_content"
+        return result
+
+    result["contributed"] = True
+    result["skip_reason"] = ""
+    result["merged_text"] = ordered_merge
+    return result
 
 
 def merge_text_segments(segments: list[str]) -> str:
@@ -512,6 +587,30 @@ def merge_text_segments(segments: list[str]) -> str:
             merged_lines.append(line)
             merged_norms.append(norm)
     return "\n".join(merged_lines)
+
+
+def _merge_structured_text_by_overlap(current_text: str, segment_text: str) -> str:
+    current = current_text.strip()
+    segment = segment_text.strip()
+    if not current:
+        return segment
+    if not segment:
+        return current
+    if segment in current:
+        return current
+    max_overlap = min(len(current), len(segment), 800)
+    overlap = 0
+    for count in range(max_overlap, 0, -1):
+        if current[-count:] == segment[:count]:
+            overlap = count
+            break
+    if overlap:
+        return current + segment[overlap:]
+    if current.endswith(("\\n", "\\t", "\\r")):
+        return current + segment
+    if current.endswith(("\n", "\t", " ")):
+        return current + segment
+    return current + "\n" + segment
 
 
 def reply_looks_incomplete(text: str) -> bool:
@@ -553,7 +652,15 @@ def scrolled_segment_looks_contaminated(text: str, *, prompt_echo_markers: tuple
 
 
 def scrolled_segment_looks_contaminated_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> bool:
-    return scrolled_segment_looks_contaminated(text, prompt_echo_markers=policy.prompt_echo_markers)
+    if scrolled_segment_looks_contaminated(text, prompt_echo_markers=policy.prompt_echo_markers):
+        return True
+    lowered = _normalize(text.strip())
+    if any(noise in lowered for noise in policy.browser_reply_noise) and not looks_like_substantive_reply_candidate_for_policy(
+        text,
+        policy=policy,
+    ):
+        return True
+    return False
 
 
 def clean_captured_segment_for_policy(text: str, *, policy: ReplyTrackerPolicy) -> str:
@@ -839,6 +946,19 @@ def _scrolled_merge_priority(
     )
 
 
+def _completion_progress_score(progress: dict[str, object]) -> tuple[int, int, int, int, int, int]:
+    brace_distance = abs(int(progress["brace_balance"]))
+    bracket_distance = abs(int(progress["bracket_balance"]))
+    return (
+        int(bool(progress["parseable"])),
+        int(bool(progress["has_end_marker"])),
+        -brace_distance,
+        -bracket_distance,
+        int(progress["schema_hits"]),
+        int(progress["operation_items"]),
+    )
+
+
 def _structured_reply_quality(
     text: str,
     *,
@@ -864,6 +984,12 @@ def _structured_reply_quality(
 
 def _structured_schema_hit_count(text: str) -> int:
     return sum(1 for hint in STRUCTURED_SCHEMA_HINTS if hint in text)
+
+
+def _ordered_segment_novelty_count(current_text: str, merged_text: str) -> int:
+    current_lines = {_normalize(line) for line in current_text.splitlines() if line.strip()}
+    merged_lines = [_normalize(line) for line in merged_text.splitlines() if line.strip()]
+    return sum(1 for line in merged_lines if line and line not in current_lines)
 
 
 def _scrolled_anchor_consistency(anchor_text: str, candidate_text: str) -> int:

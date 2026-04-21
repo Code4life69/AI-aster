@@ -19,6 +19,7 @@ from aster.browser_core.recovery_engine import (
 )
 from aster.browser_core.reply_tracker import (
     ReplyTrackerPolicy,
+    assess_scrolled_segment_addition,
     choose_best_reply_candidate,
     choose_best_reply_candidate_for_policy,
     clean_captured_segment_for_policy,
@@ -46,6 +47,7 @@ from aster.browser_core.reply_tracker import (
     segment_looks_like_prompt_echo_for_policy,
     should_ignore_candidate,
     should_ignore_candidate_for_policy,
+    structured_completion_progress,
     summarize_reply_wait_iteration,
     build_reply_capture_result,
 )
@@ -954,6 +956,69 @@ def test_merge_scrolled_reply_segments_keeps_structured_alignment_over_page_junk
     assert "USER:" not in merged
     assert "Search chats" not in merged
     assert "ASTER_PATCH_END" in merged
+
+
+def test_assess_scrolled_segment_addition_marks_completion_progress() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    tail = 'from tkinter import ttk\\nprint(\\"ok\\")"}]}\nASTER_PATCH_END'
+
+    assessment = assess_scrolled_segment_addition(anchor, tail, policy=TEST_REPLY_POLICY)
+
+    assert assessment["contributed"] is True
+    assert assessment["completion_progressed"] is True
+    assert assessment["after_progress"]["has_end_marker"] is True
+
+
+def test_assess_scrolled_segment_addition_skips_duplicate_tail_segment() -> None:
+    current = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+        'from tkinter import ttk\\nprint(\\"ok\\")"}]}\n'
+        "ASTER_PATCH_END"
+    )
+
+    assessment = assess_scrolled_segment_addition(current, 'from tkinter import ttk\\nprint(\\"ok\\")"}]}\nASTER_PATCH_END', policy=TEST_REPLY_POLICY)
+
+    assert assessment["contributed"] is False
+    assert assessment["skip_reason"] in {"duplicate_overlap", "no_new_structured_content"}
+
+
+def test_merge_scrolled_reply_segments_combines_ordered_segments_into_parseable_json() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    segments = [
+        'from tkinter import ttk\\nprint(\\"ok\\")"}',
+        ']}\nASTER_PATCH_END',
+    ]
+
+    merged = merge_scrolled_reply_segments(anchor, segments, policy=TEST_REPLY_POLICY)
+
+    assert looks_like_patch_plan_json(merged) is True
+
+
+def test_structured_completion_progress_prefers_balanced_parseable_growth_over_raw_length() -> None:
+    long_partial = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"line 1\\n'
+        "line 2\\nline 3\\nline 4\\n"
+    )
+    shorter_complete = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"done"}]}\n'
+        "ASTER_PATCH_END"
+    )
+
+    partial_progress = structured_completion_progress(long_partial)
+    complete_progress = structured_completion_progress(shorter_complete)
+
+    assert partial_progress["parseable"] is False
+    assert complete_progress["parseable"] is True
+    assert complete_progress["has_end_marker"] is True
 
 
 def test_summarize_reply_wait_iteration_flags_stale_capture_without_candidate() -> None:
