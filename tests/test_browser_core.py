@@ -47,6 +47,8 @@ from aster.browser_core.reply_tracker import (
     segment_looks_like_prompt_echo_for_policy,
     should_ignore_candidate,
     should_ignore_candidate_for_policy,
+    should_extend_structured_scroll_window,
+    structured_completion_score,
     structured_completion_progress,
     summarize_reply_wait_iteration,
     build_reply_capture_result,
@@ -1001,6 +1003,21 @@ def test_merge_scrolled_reply_segments_combines_ordered_segments_into_parseable_
     assert looks_like_patch_plan_json(merged) is True
 
 
+def test_assess_scrolled_segment_addition_allows_completion_progress_with_small_fragment() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    closing_fragment = 'from tkinter import ttk\\nprint(\\"ok\\")"}]}\nASTER_PATCH_END'
+
+    assessment = assess_scrolled_segment_addition(anchor, closing_fragment, policy=TEST_REPLY_POLICY)
+
+    assert assessment["contributed"] is True
+    assert assessment["meaningful_completion_progress"] is True
+    assert assessment["completion_score_delta"] > 0
+    assert assessment["after_progress"]["parseable"] is True
+
+
 def test_structured_completion_progress_prefers_balanced_parseable_growth_over_raw_length() -> None:
     long_partial = (
         "ASTER_PATCH_BEGIN\n"
@@ -1019,6 +1036,55 @@ def test_structured_completion_progress_prefers_balanced_parseable_growth_over_r
     assert partial_progress["parseable"] is False
     assert complete_progress["parseable"] is True
     assert complete_progress["has_end_marker"] is True
+
+
+def test_structured_completion_score_rewards_closure_more_than_raw_growth() -> None:
+    longer_partial = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"line 1\\n'
+        "line 2\\nline 3\\nline 4\\nline 5\\nline 6\\n"
+    )
+    shorter_closer = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"done"}]}\n'
+    )
+
+    assert structured_completion_score(shorter_closer) > structured_completion_score(longer_partial)
+
+
+def test_should_extend_structured_scroll_window_requires_recent_structured_progress() -> None:
+    partial = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"done"}]\n'
+    )
+
+    assert should_extend_structured_scroll_window(
+        partial,
+        recent_completion_progress_steps=1,
+        continuation_windows_used=0,
+        step_index=1,
+        step_limit=2,
+        no_progress_steps=0,
+    ) is True
+    assert should_extend_structured_scroll_window(
+        partial,
+        recent_completion_progress_steps=0,
+        continuation_windows_used=0,
+        step_index=1,
+        step_limit=2,
+        no_progress_steps=0,
+    ) is False
+
+
+def test_should_extend_structured_scroll_window_rejects_nonstructured_junk() -> None:
+    assert should_extend_structured_scroll_window(
+        "def build_ui(self):\n    return frame",
+        recent_completion_progress_steps=2,
+        continuation_windows_used=0,
+        step_index=1,
+        step_limit=2,
+        no_progress_steps=0,
+    ) is False
 
 
 def test_summarize_reply_wait_iteration_flags_stale_capture_without_candidate() -> None:

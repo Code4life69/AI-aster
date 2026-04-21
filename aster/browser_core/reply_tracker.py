@@ -497,7 +497,7 @@ def merge_scrolled_reply_segments(anchor_text: str, segments: list[str], *, poli
 def structured_completion_progress(text: str) -> dict[str, object]:
     cleaned = text.strip()
     normalized = _normalize(cleaned)
-    return {
+    progress = {
         "parseable": looks_like_patch_plan_json(cleaned),
         "has_begin_marker": "aster patch begin" in normalized or "aster_patch_begin" in normalized,
         "has_end_marker": "aster patch end" in normalized or "aster_patch_end" in normalized,
@@ -507,6 +507,41 @@ def structured_completion_progress(text: str) -> dict[str, object]:
         "operation_items": len(re.findall(r'"type"\s*:', cleaned)),
         "text_length": len(cleaned),
     }
+    progress["completion_score"] = _completion_progress_numeric_score(progress)
+    return progress
+
+
+def structured_completion_score(progress_or_text: dict[str, object] | str) -> int:
+    if isinstance(progress_or_text, str):
+        return int(structured_completion_progress(progress_or_text)["completion_score"])
+    return int(progress_or_text.get("completion_score", _completion_progress_numeric_score(progress_or_text)))
+
+
+def should_extend_structured_scroll_window(
+    text: str,
+    *,
+    recent_completion_progress_steps: int,
+    continuation_windows_used: int,
+    step_index: int,
+    step_limit: int,
+    no_progress_steps: int,
+) -> bool:
+    if continuation_windows_used >= 1:
+        return False
+    if step_index + 1 < step_limit:
+        return False
+    if no_progress_steps > 1:
+        return False
+    progress = structured_completion_progress(text)
+    if progress["parseable"]:
+        return False
+    if not reply_looks_incomplete(text):
+        return False
+    if not progress["has_begin_marker"] and int(progress["schema_hits"]) < 2:
+        return False
+    if structured_completion_score(progress) < 24:
+        return False
+    return recent_completion_progress_steps > 0
 
 
 def assess_scrolled_segment_addition(
@@ -526,6 +561,8 @@ def assess_scrolled_segment_addition(
         "novelty_count": 0,
         "growth_chars": 0,
         "completion_progressed": False,
+        "completion_score_delta": 0,
+        "meaningful_completion_progress": False,
         "before_progress": before_progress,
         "after_progress": before_progress,
     }
@@ -546,10 +583,26 @@ def assess_scrolled_segment_addition(
 
     novelty_count = _ordered_segment_novelty_count(current_clean, ordered_merge)
     after_progress = structured_completion_progress(ordered_merge)
+    before_rank = _completion_progress_score(before_progress)
+    after_rank = _completion_progress_score(after_progress)
+    completion_score_delta = structured_completion_score(after_progress) - structured_completion_score(before_progress)
     result["novelty_count"] = novelty_count
     result["growth_chars"] = max(0, len(ordered_merge) - len(current_clean))
     result["after_progress"] = after_progress
-    result["completion_progressed"] = _completion_progress_score(after_progress) > _completion_progress_score(before_progress)
+    result["completion_progressed"] = after_rank > before_rank
+    result["completion_score_delta"] = completion_score_delta
+    result["meaningful_completion_progress"] = bool(
+        result["completion_progressed"]
+        or completion_score_delta > 0
+        or (
+            not bool(before_progress["has_end_marker"])
+            and bool(after_progress["has_end_marker"])
+        )
+        or (
+            not bool(before_progress["parseable"])
+            and bool(after_progress["parseable"])
+        )
+    )
 
     if _normalize(ordered_merge) == _normalize(current_clean):
         result["skip_reason"] = "duplicate_overlap"
@@ -557,7 +610,7 @@ def assess_scrolled_segment_addition(
     if current_clean and _scrolled_anchor_consistency(current_clean, ordered_merge) <= 0:
         result["skip_reason"] = "lost_structured_seed"
         return result
-    if novelty_count <= 0:
+    if novelty_count <= 0 and result["growth_chars"] <= 0 and not result["meaningful_completion_progress"]:
         result["skip_reason"] = "no_new_structured_content"
         return result
 
@@ -619,6 +672,8 @@ def reply_looks_incomplete(text: str) -> bool:
         return True
     lowered = _normalize(cleaned)
     if "aster patch begin" in lowered and "aster patch end" not in lowered:
+        return True
+    if cleaned.count("{") > cleaned.count("}") or cleaned.count("[") > cleaned.count("]"):
         return True
     if '"operations"' in cleaned and not cleaned.rstrip().endswith("}"):
         return True
@@ -957,6 +1012,23 @@ def _completion_progress_score(progress: dict[str, object]) -> tuple[int, int, i
         int(progress["schema_hits"]),
         int(progress["operation_items"]),
     )
+
+
+def _completion_progress_numeric_score(progress: dict[str, object]) -> int:
+    brace_distance = abs(int(progress["brace_balance"]))
+    bracket_distance = abs(int(progress["bracket_balance"]))
+    score = 0
+    if progress["has_begin_marker"]:
+        score += 8
+    if progress["has_end_marker"]:
+        score += 16
+    if progress["parseable"]:
+        score += 80
+    score += min(int(progress["schema_hits"]), 6) * 6
+    score += min(int(progress["operation_items"]), 8) * 4
+    score += max(0, 18 - brace_distance * 4)
+    score += max(0, 16 - bracket_distance * 5)
+    return score
 
 
 def _structured_reply_quality(

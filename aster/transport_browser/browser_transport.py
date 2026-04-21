@@ -45,7 +45,10 @@ from aster.browser_core import (
     scrolled_segment_looks_contaminated_for_policy,
     select_preferred_reply_candidate,
     serialize_anchor,
+    should_extend_structured_scroll_window,
     summarize_reply_wait_iteration,
+    structured_completion_progress,
+    structured_completion_score,
     window_title_suggests_existing_chat,
 )
 from aster.runtime_log_heartbeat import RuntimeLogHeartbeatPusher
@@ -1613,6 +1616,7 @@ class BrowserChatGPTTransport:
                         structured_anchor_text=candidate if acceptance.acceptance_tier == "partial_structured_reply" else "",
                     )
                     if scrolled.strip():
+                        scrolled_progress = structured_completion_progress(scrolled)
                         best_from_scroll = choose_best_reply_candidate_for_policy(
                             {"scrolled": scrolled},
                             policy=REPLY_TRACKER_POLICY,
@@ -1637,6 +1641,8 @@ class BrowserChatGPTTransport:
                                 {
                                     "length": len(scrolled),
                                     "preview": scrolled[:240],
+                                    "structured_completion_score": structured_completion_score(scrolled_progress),
+                                    "structured_completion_progress": scrolled_progress,
                                     **self._reply_acceptance_log_payload(scroll_acceptance),
                                 },
                             )
@@ -1773,8 +1779,12 @@ class BrowserChatGPTTransport:
         segments: list[str] = []
         no_progress_steps = 0
         merged = structured_anchor_text.strip()
+        step = 0
+        step_limit = max_steps
+        continuation_windows_used = 0
+        recent_completion_progress_steps = 0
 
-        for step in range(max_steps):
+        while step < step_limit:
             self._tick_runtime_log_heartbeat("capture_reply_text_by_scrolling")
             segment = self._capture_visible_reply_segment(target, before_lines, prompt)
             assessment = assess_scrolled_segment_addition(
@@ -1784,6 +1794,10 @@ class BrowserChatGPTTransport:
             )
             if assessment["contributed"]:
                 no_progress_steps = 0
+                if assessment["meaningful_completion_progress"]:
+                    recent_completion_progress_steps += 1
+                else:
+                    recent_completion_progress_steps = max(0, recent_completion_progress_steps - 1)
                 segments.append(str(assessment["segment_text"]))
                 merged = str(assessment["merged_text"])
                 self._log(
@@ -1796,12 +1810,16 @@ class BrowserChatGPTTransport:
                         "novelty_count": assessment["novelty_count"],
                         "growth_chars": assessment["growth_chars"],
                         "completion_progressed": assessment["completion_progressed"],
+                        "meaningful_completion_progress": assessment["meaningful_completion_progress"],
+                        "completion_score_delta": assessment["completion_score_delta"],
+                        "completion_score": assessment["after_progress"]["completion_score"],
                         "before_progress": assessment["before_progress"],
                         "after_progress": assessment["after_progress"],
                     },
                 )
             else:
                 no_progress_steps += 1
+                recent_completion_progress_steps = max(0, recent_completion_progress_steps - 1)
                 event = (
                     "reply_scroll_prompt_boundary"
                     if assessment["skip_reason"] == "prompt_or_preamble_contamination"
@@ -1817,6 +1835,9 @@ class BrowserChatGPTTransport:
                         "novelty_count": assessment["novelty_count"],
                         "growth_chars": assessment["growth_chars"],
                         "completion_progressed": assessment["completion_progressed"],
+                        "meaningful_completion_progress": assessment["meaningful_completion_progress"],
+                        "completion_score_delta": assessment["completion_score_delta"],
+                        "completion_score": assessment["after_progress"]["completion_score"],
                         "before_progress": assessment["before_progress"],
                         "after_progress": assessment["after_progress"],
                     },
@@ -1825,9 +1846,33 @@ class BrowserChatGPTTransport:
             if looks_like_patch_plan_json(merged):
                 self._scroll_reply_to_bottom(target)
                 return merged
+            if should_extend_structured_scroll_window(
+                merged,
+                recent_completion_progress_steps=recent_completion_progress_steps,
+                continuation_windows_used=continuation_windows_used,
+                step_index=step,
+                step_limit=step_limit,
+                no_progress_steps=no_progress_steps,
+            ):
+                previous_limit = step_limit
+                continuation_windows_used += 1
+                step_limit += 2
+                self._log(
+                    "reply_scroll_continuation_window",
+                    {
+                        "step": step,
+                        "reason": "structured_completion_progress",
+                        "previous_step_limit": previous_limit,
+                        "new_step_limit": step_limit,
+                        "recent_completion_progress_steps": recent_completion_progress_steps,
+                        "completion_score": structured_completion_score(merged),
+                        "progress": structured_completion_progress(merged),
+                    },
+                )
             if no_progress_steps >= 3:
                 break
             self._scroll_reply_up(target)
+            step += 1
 
         self._scroll_reply_to_bottom(target)
         if merged.strip():
