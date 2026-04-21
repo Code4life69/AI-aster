@@ -74,6 +74,8 @@ SCROLLED_REPO_SOURCE_MARKERS = (
     "choose_best_reply_candidate",
     "build_turn_anchor",
 )
+VISUAL_REGION_LOW_CONFIDENCE = 0.45
+VISUAL_REGION_STRONG_CONFIDENCE = 0.55
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,6 +611,7 @@ def assess_scrolled_segment_addition(
     seed_text: str = "",
     trusted_lineage_text: str = "",
     drift_containment_active: bool = False,
+    visual_region_evidence: dict[str, object] | None = None,
 ) -> dict[str, object]:
     current_clean = clean_captured_segment_for_policy(current_merged, policy=policy)
     before_progress = structured_completion_progress(current_clean)
@@ -640,10 +643,19 @@ def assess_scrolled_segment_addition(
         "matched_seed_lineage": False,
         "matched_trusted_lineage": False,
         "contextual_structured_extension": False,
+        "contextual_extension_allowed_reason": "",
+        "contextual_extension_denied_reason": "",
         "matched_current_blob_only": False,
         "trusted_lineage_extended": False,
         "activate_drift_containment": False,
         "drift_containment_active": drift_containment_active,
+        "visual_region_confidence": None,
+        "visual_region_used_remembered_region": False,
+        "visual_region_confirmed_reply_region": False,
+        "visual_region_supports_extension": False,
+        "visual_region_supports_reply_region": False,
+        "visual_region_low_confidence": False,
+        "segment_structure_state": "empty",
     }
     if not segment_clean:
         result["skip_reason"] = "empty_segment"
@@ -691,6 +703,7 @@ def assess_scrolled_segment_addition(
         before_progress=before_progress,
         after_progress=after_progress,
         drift_containment_active=drift_containment_active,
+        visual_region_evidence=visual_region_evidence,
     )
     result["region_integrity_score"] = integrity["region_integrity_score"]
     result["region_reasons"] = integrity["region_reasons"]
@@ -707,8 +720,17 @@ def assess_scrolled_segment_addition(
     result["matched_seed_lineage"] = integrity["matched_seed_lineage"]
     result["matched_trusted_lineage"] = integrity["matched_trusted_lineage"]
     result["contextual_structured_extension"] = integrity["contextual_structured_extension"]
+    result["contextual_extension_allowed_reason"] = integrity["contextual_extension_allowed_reason"]
+    result["contextual_extension_denied_reason"] = integrity["contextual_extension_denied_reason"]
     result["matched_current_blob_only"] = integrity["matched_current_blob_only"]
     result["activate_drift_containment"] = integrity["activate_drift_containment"]
+    result["visual_region_confidence"] = integrity["visual_region_confidence"]
+    result["visual_region_used_remembered_region"] = integrity["visual_region_used_remembered_region"]
+    result["visual_region_confirmed_reply_region"] = integrity["visual_region_confirmed_reply_region"]
+    result["visual_region_supports_extension"] = integrity["visual_region_supports_extension"]
+    result["visual_region_supports_reply_region"] = integrity["visual_region_supports_reply_region"]
+    result["visual_region_low_confidence"] = integrity["visual_region_low_confidence"]
+    result["segment_structure_state"] = integrity["segment_structure_state"]
 
     if _normalize(ordered_merge) == _normalize(current_clean):
         result["skip_reason"] = "duplicate_overlap"
@@ -727,6 +749,14 @@ def assess_scrolled_segment_addition(
             if integrity["matched_current_blob_only"]
             else "missing_seed_or_trusted_lineage"
         )
+        result["activate_drift_containment"] = True
+        return result
+    if (
+        integrity["segment_structure_state"] in {"raw_code", "unstructured"}
+        and not integrity["contextual_structured_extension"]
+        and not integrity["clear_structured_closure"]
+    ):
+        result["skip_reason"] = integrity["contextual_extension_denied_reason"] or "weak_contextual_extension"
         result["activate_drift_containment"] = True
         return result
     if drift_containment_active and integrity["trusted_lineage_score"] < 8 and not integrity["clear_structured_closure"]:
@@ -1171,6 +1201,47 @@ def _completion_progress_numeric_score(progress: dict[str, object]) -> int:
     return score
 
 
+def _scrolled_visual_region_support(visual_region_evidence: dict[str, object] | None) -> dict[str, object]:
+    if not visual_region_evidence:
+        return {
+            "has_visual_region_evidence": False,
+            "used_remembered_region": False,
+            "visual_region_confidence": None,
+            "confirmed_reply_region": False,
+            "supports_reply_region": False,
+            "strong_visual_region_support": False,
+            "weak_visual_region_support": False,
+        }
+    confidence_raw = visual_region_evidence.get("visual_region_confidence")
+    confidence = None if confidence_raw is None else float(confidence_raw)
+    used_remembered_region = bool(visual_region_evidence.get("used_remembered_region"))
+    confirmed_reply_region = bool(visual_region_evidence.get("confirmed_reply_region"))
+    supports_reply_region = bool(
+        visual_region_evidence.get("supports_reply_region")
+        or confirmed_reply_region
+        or (confidence is not None and confidence >= VISUAL_REGION_STRONG_CONFIDENCE)
+    )
+    weak_visual_region_support = bool(
+        used_remembered_region
+        and not confirmed_reply_region
+        and confidence is not None
+        and confidence < VISUAL_REGION_LOW_CONFIDENCE
+    )
+    strong_visual_region_support = bool(
+        confirmed_reply_region
+        or (confidence is not None and confidence >= VISUAL_REGION_STRONG_CONFIDENCE)
+    )
+    return {
+        "has_visual_region_evidence": True,
+        "used_remembered_region": used_remembered_region,
+        "visual_region_confidence": confidence,
+        "confirmed_reply_region": confirmed_reply_region,
+        "supports_reply_region": supports_reply_region,
+        "strong_visual_region_support": strong_visual_region_support,
+        "weak_visual_region_support": weak_visual_region_support,
+    }
+
+
 def _assess_scrolled_region_integrity(
     *,
     current_text: str,
@@ -1181,6 +1252,7 @@ def _assess_scrolled_region_integrity(
     before_progress: dict[str, object],
     after_progress: dict[str, object],
     drift_containment_active: bool,
+    visual_region_evidence: dict[str, object] | None,
 ) -> dict[str, object]:
     current_clean = current_text.strip()
     seed_clean = seed_text.strip() or current_clean
@@ -1205,11 +1277,20 @@ def _assess_scrolled_region_integrity(
         or int(after_progress["schema_hits"]) > int(before_progress["schema_hits"])
         or int(after_progress["operation_items"]) > int(before_progress["operation_items"])
     )
+    visual_region = _scrolled_visual_region_support(visual_region_evidence)
+    lineage_match_without_context = bool(
+        seed_consistency > 0
+        or trusted_lineage_consistency > 0
+        or tail_overlap >= 24
+    )
     clear_structured_closure = bool(
         (not bool(before_progress["has_end_marker"]) and bool(after_progress["has_end_marker"]))
         or (not bool(before_progress["parseable"]) and bool(after_progress["parseable"]))
     )
-    contextual_structured_extension = bool(
+    contextual_structured_extension = False
+    contextual_extension_allowed_reason = ""
+    contextual_extension_denied_reason = ""
+    base_contextual_conditions = bool(
         not drift_containment_active
         and not unrelated_page_hits
         and not duplicate_patch_start
@@ -1218,10 +1299,42 @@ def _assess_scrolled_region_integrity(
         and segment_structure_state in {"raw_code", "unstructured", "partial_structured"}
         and len(segment_clean) >= 24
     )
+    if not bool(visual_region["has_visual_region_evidence"]):
+        contextual_structured_extension = base_contextual_conditions
+        if contextual_structured_extension:
+            contextual_extension_allowed_reason = "no_visual_region_evidence"
+    elif drift_containment_active:
+        contextual_extension_denied_reason = "drift_containment_active"
+    elif unrelated_page_hits:
+        contextual_extension_denied_reason = "unrelated_page_content"
+    elif duplicate_patch_start:
+        contextual_extension_denied_reason = "duplicate_patch_start"
+    elif not current_clean:
+        contextual_extension_denied_reason = "missing_current_structured_seed"
+    elif _reply_candidate_structure_state(current_clean, is_patch_json=looks_like_patch_plan_json) != "partial_structured":
+        contextual_extension_denied_reason = "current_not_partial_structured"
+    elif segment_structure_state not in {"raw_code", "unstructured", "partial_structured"}:
+        contextual_extension_denied_reason = "segment_not_extension_candidate"
+    elif len(segment_clean) < 24:
+        contextual_extension_denied_reason = "segment_too_short"
+    elif not lineage_match_without_context:
+        contextual_extension_denied_reason = "missing_seed_or_trusted_lineage"
+    elif (
+        segment_structure_state in {"raw_code", "unstructured"}
+        and bool(visual_region["used_remembered_region"])
+        and not bool(visual_region["strong_visual_region_support"])
+    ):
+        contextual_extension_denied_reason = "visual_region_support_required"
+    else:
+        contextual_structured_extension = base_contextual_conditions
+        if contextual_structured_extension:
+            contextual_extension_allowed_reason = (
+                "trusted_lineage_with_visual_region_support"
+                if segment_structure_state in {"raw_code", "unstructured"}
+                else "trusted_lineage_partial_structured_extension"
+            )
     trusted_lineage_match = bool(
-        seed_consistency > 0
-        or trusted_lineage_consistency > 0
-        or tail_overlap >= 24
+        lineage_match_without_context
         or contextual_structured_extension
     )
     current_blob_only_match = bool(
@@ -1253,6 +1366,9 @@ def _assess_scrolled_region_integrity(
     if contextual_structured_extension:
         trusted_lineage_score += 2
         trusted_lineage_reasons.append("contextual_structured_extension")
+    elif contextual_extension_denied_reason == "visual_region_support_required":
+        trusted_lineage_score -= 5
+        trusted_lineage_reasons.append("weak_visual_region_support")
     if current_blob_only_match:
         trusted_lineage_score -= 6
         trusted_lineage_reasons.append("current_blob_only_match")
@@ -1292,6 +1408,9 @@ def _assess_scrolled_region_integrity(
     if contextual_structured_extension:
         score += 2
         reasons.append("contextual_structured_extension")
+    elif contextual_extension_denied_reason == "visual_region_support_required":
+        score -= 4
+        reasons.append("weak_visual_region_support")
     if segment_structure_state in {"partial_structured", "complete_structured"} and structured_continuation:
         score += 3
         reasons.append("structured_segment")
@@ -1360,8 +1479,17 @@ def _assess_scrolled_region_integrity(
         "matched_seed_lineage": seed_consistency > 0,
         "matched_trusted_lineage": trusted_lineage_consistency > 0 or tail_overlap >= 24,
         "contextual_structured_extension": contextual_structured_extension,
+        "contextual_extension_allowed_reason": contextual_extension_allowed_reason,
+        "contextual_extension_denied_reason": contextual_extension_denied_reason,
         "matched_current_blob_only": current_blob_only_match,
         "clear_structured_closure": clear_structured_closure,
+        "segment_structure_state": segment_structure_state,
+        "visual_region_confidence": visual_region["visual_region_confidence"],
+        "visual_region_used_remembered_region": visual_region["used_remembered_region"],
+        "visual_region_confirmed_reply_region": visual_region["confirmed_reply_region"],
+        "visual_region_supports_extension": visual_region["strong_visual_region_support"],
+        "visual_region_supports_reply_region": visual_region["supports_reply_region"],
+        "visual_region_low_confidence": visual_region["weak_visual_region_support"],
         "activate_drift_containment": drift_detected or current_blob_only_match or (drift_containment_active and not trusted_lineage_match),
     }
 

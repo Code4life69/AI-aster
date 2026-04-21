@@ -1141,6 +1141,82 @@ def test_assess_scrolled_segment_addition_allows_completion_progress_with_small_
     assert assessment["trusted_lineage_extended"] is True
 
 
+def test_assess_scrolled_segment_addition_rejects_repo_text_as_contextual_extension() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    repo_like_segment = (
+        'assert config.runtime_log_heartbeat_branch_only is True\\n'
+        'calls["config"] = config\\n'
+        'monkeypatch.setattr(cli, "load_config", lambda project_root: sentinel_config)\\n'
+    )
+
+    assessment = assess_scrolled_segment_addition(
+        anchor,
+        repo_like_segment,
+        policy=TEST_REPLY_POLICY,
+        seed_text=anchor,
+        trusted_lineage_text=anchor,
+        visual_region_evidence={
+            "visual_region_confidence": 0.92,
+            "used_remembered_region": True,
+            "confirmed_reply_region": True,
+            "supports_reply_region": True,
+        },
+    )
+
+    assert assessment["contributed"] is False
+    assert assessment["contextual_structured_extension"] is False
+    assert assessment["skip_reason"] in {
+        "unrelated_page_content",
+        "missing_seed_or_trusted_lineage",
+        "visual_region_support_required",
+    }
+
+
+def test_assess_scrolled_segment_addition_requires_strong_visual_region_support_for_raw_extension() -> None:
+    anchor = (
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"import tkinter as tk\\n'
+    )
+    raw_continuation = 'content":"import tkinter as tk\\nfrom tkinter import ttk\\nprint(\\"ok\\")"}'
+
+    weak = assess_scrolled_segment_addition(
+        anchor,
+        raw_continuation,
+        policy=TEST_REPLY_POLICY,
+        seed_text=anchor,
+        trusted_lineage_text=anchor,
+        visual_region_evidence={
+            "visual_region_confidence": 0.22,
+            "used_remembered_region": True,
+            "confirmed_reply_region": False,
+            "supports_reply_region": False,
+        },
+    )
+    strong = assess_scrolled_segment_addition(
+        anchor,
+        raw_continuation,
+        policy=TEST_REPLY_POLICY,
+        seed_text=anchor,
+        trusted_lineage_text=anchor,
+        visual_region_evidence={
+            "visual_region_confidence": 0.84,
+            "used_remembered_region": True,
+            "confirmed_reply_region": True,
+            "supports_reply_region": True,
+        },
+    )
+
+    assert weak["contributed"] is False
+    assert weak["contextual_structured_extension"] is False
+    assert weak["contextual_extension_denied_reason"] == "visual_region_support_required"
+    assert strong["contributed"] is True
+    assert strong["contextual_structured_extension"] is True
+    assert strong["contextual_extension_allowed_reason"] == "trusted_lineage_with_visual_region_support"
+
+
 def test_structured_completion_progress_prefers_balanced_parseable_growth_over_raw_length() -> None:
     long_partial = (
         "ASTER_PATCH_BEGIN\n"

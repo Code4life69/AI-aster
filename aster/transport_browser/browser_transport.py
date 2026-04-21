@@ -208,6 +208,9 @@ class _StructuredReplyCandidate:
     score: float
     parseable: bool
     salvage_allowed: bool
+    region_trusted: bool = True
+    region_confidence: float | None = None
+    region_reason: str = ""
     observation_count: int = 1
 
 
@@ -459,6 +462,8 @@ class BrowserChatGPTTransport:
         self._last_uia_control_diagnostics: dict[str, Any] | None = None
         self._last_uia_diagnostic_signature = ""
         self._last_reply_capture_snapshot = _ReplyCaptureSnapshot()
+        self._last_reply_region_visual_evidence: dict[str, Any] = {}
+        self._last_scrolled_capture_meta: dict[str, Any] = {}
         self._visual_action_debug = visual_action_debug
         self._visual_region_memory = visual_region_memory
         self._visual_action_memory_enabled = visual_action_memory_enabled
@@ -602,6 +607,7 @@ class BrowserChatGPTTransport:
         target,
         ui_state: dict[str, Any] | None = None,
         lines=None,
+        log_events: bool = True,
     ):
         if not self._visual_action_memory_enabled or self._visual_region_memory is None:
             return None
@@ -619,31 +625,33 @@ class BrowserChatGPTTransport:
             ocr_hints=tuple(self._visual_ocr_summary(lines)[:3]),
         )
         if hint is None:
-            self._log("visual_memory_miss", {"intent": intent, "window_title": str(getattr(target, "title", ""))})
+            if log_events:
+                self._log("visual_memory_miss", {"intent": intent, "window_title": str(getattr(target, "title", ""))})
             return None
-        self._log(
-            "visual_memory_hit",
-            {
-                "intent": intent,
-                "confidence": round(hint.confidence, 3),
-                "score": round(hint.score, 3),
-                "title_match": hint.title_match,
-                "page_state_match": hint.page_state_match,
-            },
-        )
-        confidence_event = (
-            "action_region_confidence_confirmed"
-            if hint.confidence >= 0.45 or hint.score >= 0.6
-            else "action_region_confidence_low"
-        )
-        self._log(
-            confidence_event,
-            {
-                "intent": intent,
-                "confidence": round(hint.confidence, 3),
-                "score": round(hint.score, 3),
-            },
-        )
+        if log_events:
+            self._log(
+                "visual_memory_hit",
+                {
+                    "intent": intent,
+                    "confidence": round(hint.confidence, 3),
+                    "score": round(hint.score, 3),
+                    "title_match": hint.title_match,
+                    "page_state_match": hint.page_state_match,
+                },
+            )
+            confidence_event = (
+                "action_region_confidence_confirmed"
+                if hint.confidence >= 0.45 or hint.score >= 0.6
+                else "action_region_confidence_low"
+            )
+            self._log(
+                confidence_event,
+                {
+                    "intent": intent,
+                    "confidence": round(hint.confidence, 3),
+                    "score": round(hint.score, 3),
+                },
+            )
         return hint
 
     def _visual_memory_update(
@@ -703,6 +711,41 @@ class BrowserChatGPTTransport:
                 "failure_count": entry.failure_count,
             },
         )
+
+    @staticmethod
+    def _build_reply_region_visual_evidence(*, hint, merged_length: int) -> dict[str, Any]:
+        confidence = None if hint is None else float(hint.confidence)
+        used_remembered_region = hint is not None
+        confirmed_reply_region = merged_length > 0
+        supports_reply_region = bool(
+            confirmed_reply_region
+            or hint is None
+            or confidence is None
+            or confidence >= 0.55
+        )
+        return {
+            "visual_region_confidence": confidence,
+            "used_remembered_region": used_remembered_region,
+            "confirmed_reply_region": confirmed_reply_region,
+            "supports_reply_region": supports_reply_region,
+            "low_confidence_region": bool(
+                used_remembered_region and not confirmed_reply_region and confidence is not None and confidence < 0.45
+            ),
+        }
+
+    def _reply_region_candidate_trusted(self) -> tuple[bool, str]:
+        evidence = self._last_reply_region_visual_evidence
+        if not evidence:
+            return True, "no_visual_region_evidence"
+        if evidence.get("low_confidence_region"):
+            return False, "low_confidence_visual_reply_region"
+        if evidence.get("confirmed_reply_region"):
+            return True, "confirmed_reply_region_capture"
+        if not evidence.get("used_remembered_region"):
+            return True, "no_remembered_region_dependency"
+        if evidence.get("supports_reply_region"):
+            return True, "remembered_reply_region_supported"
+        return False, "weak_visual_reply_region_support"
 
     def _begin_visual_action(
         self,
@@ -1118,6 +1161,7 @@ class BrowserChatGPTTransport:
                         "structured_block_seen_but_lost": "a structured patch block was seen earlier but final extraction lost it",
                         "structured_block_seen_but_not_parseable": "structured patch text was seen, but none of it became parseable JSON",
                         "structured_block_seen_but_not_salvageable": "a structured patch block was seen earlier, but it was not trusted enough to salvage",
+                        "structured_block_seen_but_region_trust_too_low": "a structured patch block was seen earlier, but the reply-region evidence was too weak to trust it for salvage",
                     }
                     raise RuntimeError(
                         "Browser mode could not capture a final ChatGPT response: "
@@ -2400,6 +2444,8 @@ class BrowserChatGPTTransport:
     ) -> str:
         started_at = time.monotonic()
         deadline = time.monotonic() + timeout_sec
+        self._last_reply_region_visual_evidence = {}
+        self._last_scrolled_capture_meta = {}
         best_text = ""
         best_source = ""
         best_score = float("-inf")
@@ -2461,12 +2507,16 @@ class BrowserChatGPTTransport:
             last_wait_diagnostics = diagnostics
             if current_best is not None:
                 source, candidate, score = current_best
+                region_trusted, region_reason = self._reply_region_candidate_trusted()
                 self._remember_reply_capture_candidate(
                     snapshot,
                     source=source,
                     text=candidate,
                     score=score,
-                    salvage_allowed=source in {"uia", "ocr"},
+                    salvage_allowed=source in {"uia", "ocr"} and region_trusted,
+                    region_trusted=region_trusted,
+                    region_confidence=self._last_reply_region_visual_evidence.get("visual_region_confidence"),
+                    region_reason=region_reason,
                     observation_counts=structured_observation_counts,
                 )
                 preferred = select_preferred_reply_candidate(
@@ -2559,6 +2609,11 @@ class BrowserChatGPTTransport:
                                 text=candidate,
                                 score=score,
                                 salvage_allowed=scroll_acceptance.accepted,
+                                region_trusted=bool(
+                                    self._last_scrolled_capture_meta.get("region_trusted", scroll_acceptance.accepted)
+                                ),
+                                region_confidence=self._last_scrolled_capture_meta.get("visual_region_confidence"),
+                                region_reason=str(self._last_scrolled_capture_meta.get("region_reason", "")),
                                 observation_counts=structured_observation_counts,
                             )
                             self._log(
@@ -2580,6 +2635,9 @@ class BrowserChatGPTTransport:
                                     "best_structured_candidate_salvage_allowed": (
                                         snapshot.best_salvageable is not None
                                     ),
+                                    "scrolled_region_trusted": self._last_scrolled_capture_meta.get("region_trusted"),
+                                    "scrolled_region_reason": self._last_scrolled_capture_meta.get("region_reason"),
+                                    "scrolled_region_confidence": self._last_scrolled_capture_meta.get("visual_region_confidence"),
                                     **self._reply_acceptance_log_payload(scroll_acceptance),
                                 },
                             )
@@ -2619,12 +2677,16 @@ class BrowserChatGPTTransport:
 
         timeout_candidate = (best_source or "best", best_text, best_score) if best_text else None
         if timeout_candidate is not None:
+            region_trusted, region_reason = self._reply_region_candidate_trusted()
             self._remember_reply_capture_candidate(
                 snapshot,
                 source=str(timeout_candidate[0]),
                 text=str(timeout_candidate[1]),
                 score=float(timeout_candidate[2]),
-                salvage_allowed=str(timeout_candidate[0]) in {"uia", "ocr"},
+                salvage_allowed=str(timeout_candidate[0]) in {"uia", "ocr"} and region_trusted,
+                region_trusted=region_trusted,
+                region_confidence=self._last_reply_region_visual_evidence.get("visual_region_confidence"),
+                region_reason=region_reason,
                 observation_counts=structured_observation_counts,
             )
         timeout_acceptance = evaluate_reply_acceptance(
@@ -2680,12 +2742,16 @@ class BrowserChatGPTTransport:
             timed_out=True,
         )
         if fallback_block.strip():
+            region_trusted, region_reason = self._reply_region_candidate_trusted()
             self._remember_reply_capture_candidate(
                 snapshot,
                 source="screen_reader_fallback",
                 text=fallback,
                 score=fallback_candidate[2] if fallback_candidate is not None else score_candidate_for_policy(fallback_block, policy=REPLY_TRACKER_POLICY),
-                salvage_allowed=fallback_candidate is not None and fallback_acceptance.accepted,
+                salvage_allowed=fallback_candidate is not None and fallback_acceptance.accepted and region_trusted,
+                region_trusted=region_trusted,
+                region_confidence=self._last_reply_region_visual_evidence.get("visual_region_confidence"),
+                region_reason=region_reason,
                 observation_counts=structured_observation_counts,
             )
         if fallback_candidate is not None and fallback_acceptance.accepted:
@@ -2711,11 +2777,29 @@ class BrowserChatGPTTransport:
             after_lines = self._ocr.extract(image)
         ui_state = self._ui_state(target)
         checkpoint_context = None
-        hint = None
+        hint = self._visual_memory_hint(
+            intent="reply_region",
+            target=target,
+            ui_state=ui_state,
+            lines=after_lines,
+            log_events=False,
+        )
         hint_rect = None
         if self._visual_action_debug is not None and self._visual_action_debug.should_capture_checkpoint("reply_capture_region"):
-            hint = self._visual_memory_hint(intent="reply_region", target=target, ui_state=ui_state, lines=after_lines)
             hint_rect = self._hint_rect(hint, target)
+            if hint is None and self._visual_action_debug.enabled:
+                self._log("visual_memory_miss", {"intent": "reply_region", "window_title": str(getattr(target, "title", ""))})
+            elif hint is not None:
+                self._log(
+                    "visual_memory_hit",
+                    {
+                        "intent": "reply_region",
+                        "confidence": round(hint.confidence, 3),
+                        "score": round(hint.score, 3),
+                        "title_match": hint.title_match,
+                        "page_state_match": hint.page_state_match,
+                    },
+                )
             checkpoint_context = self._begin_visual_action(
                 target=target,
                 action_type="reply_capture_region",
@@ -2746,6 +2830,10 @@ class BrowserChatGPTTransport:
         )
         uia_text = self._read_visible_reply_text(target)
         merged_length = len(merge_reply_segment_sources(uia_text, ocr_text, policy=REPLY_TRACKER_POLICY))
+        self._last_reply_region_visual_evidence = self._build_reply_region_visual_evidence(
+            hint=hint,
+            merged_length=merged_length,
+        )
         if checkpoint_context is not None:
             target_rect = hint_rect or self._default_reply_region_rect(target)
             if merged_length > 0:
@@ -2793,6 +2881,7 @@ class BrowserChatGPTTransport:
         continuation_windows_used = 0
         recent_completion_progress_steps = 0
         drift_containment_active = False
+        self._last_scrolled_capture_meta = {}
 
         while step < step_limit:
             self._tick_runtime_log_heartbeat("capture_reply_text_by_scrolling")
@@ -2804,7 +2893,26 @@ class BrowserChatGPTTransport:
                 seed_text=structured_anchor_text or merged,
                 trusted_lineage_text=trusted_lineage,
                 drift_containment_active=drift_containment_active,
+                visual_region_evidence=self._last_reply_region_visual_evidence,
             )
+            self._last_scrolled_capture_meta = {
+                "region_trusted": bool(
+                    assessment["trusted_lineage_score"] >= 10
+                    and not assessment["drift_detected"]
+                    and not assessment["matched_current_blob_only"]
+                    and (
+                        assessment["matched_seed_lineage"]
+                        or assessment["matched_trusted_lineage"]
+                        or assessment["contextual_structured_extension"]
+                    )
+                ),
+                "visual_region_confidence": assessment["visual_region_confidence"],
+                "region_reason": (
+                    assessment["contextual_extension_allowed_reason"]
+                    or assessment["contextual_extension_denied_reason"]
+                    or ",".join(str(reason) for reason in assessment["trusted_lineage_reasons"][:2])
+                ),
+            }
             if assessment["contributed"]:
                 no_progress_steps = 0
                 if assessment["meaningful_completion_progress"]:
@@ -2838,10 +2946,18 @@ class BrowserChatGPTTransport:
                         "matched_seed_lineage": assessment["matched_seed_lineage"],
                         "matched_trusted_lineage": assessment["matched_trusted_lineage"],
                         "contextual_structured_extension": assessment["contextual_structured_extension"],
+                        "contextual_extension_allowed_reason": assessment["contextual_extension_allowed_reason"],
+                        "contextual_extension_denied_reason": assessment["contextual_extension_denied_reason"],
                         "matched_current_blob_only": assessment["matched_current_blob_only"],
                         "continuity_against_seed": assessment["continuity_against_seed"],
                         "continuity_against_trusted_lineage": assessment["continuity_against_trusted_lineage"],
                         "continuity_against_current": assessment["continuity_against_current"],
+                        "visual_region_confidence": assessment["visual_region_confidence"],
+                        "visual_region_used_remembered_region": assessment["visual_region_used_remembered_region"],
+                        "visual_region_confirmed_reply_region": assessment["visual_region_confirmed_reply_region"],
+                        "visual_region_supports_extension": assessment["visual_region_supports_extension"],
+                        "visual_region_supports_reply_region": assessment["visual_region_supports_reply_region"],
+                        "visual_region_low_confidence": assessment["visual_region_low_confidence"],
                         "unrelated_page_content": assessment["unrelated_page_content"],
                         "unrelated_page_hits": assessment["unrelated_page_hits"],
                         "drift_detected": assessment["drift_detected"],
@@ -2882,10 +2998,18 @@ class BrowserChatGPTTransport:
                         "matched_seed_lineage": assessment["matched_seed_lineage"],
                         "matched_trusted_lineage": assessment["matched_trusted_lineage"],
                         "contextual_structured_extension": assessment["contextual_structured_extension"],
+                        "contextual_extension_allowed_reason": assessment["contextual_extension_allowed_reason"],
+                        "contextual_extension_denied_reason": assessment["contextual_extension_denied_reason"],
                         "matched_current_blob_only": assessment["matched_current_blob_only"],
                         "continuity_against_seed": assessment["continuity_against_seed"],
                         "continuity_against_trusted_lineage": assessment["continuity_against_trusted_lineage"],
                         "continuity_against_current": assessment["continuity_against_current"],
+                        "visual_region_confidence": assessment["visual_region_confidence"],
+                        "visual_region_used_remembered_region": assessment["visual_region_used_remembered_region"],
+                        "visual_region_confirmed_reply_region": assessment["visual_region_confirmed_reply_region"],
+                        "visual_region_supports_extension": assessment["visual_region_supports_extension"],
+                        "visual_region_supports_reply_region": assessment["visual_region_supports_reply_region"],
+                        "visual_region_low_confidence": assessment["visual_region_low_confidence"],
                         "unrelated_page_content": assessment["unrelated_page_content"],
                         "unrelated_page_hits": assessment["unrelated_page_hits"],
                         "drift_detected": assessment["drift_detected"],
@@ -3089,10 +3213,11 @@ class BrowserChatGPTTransport:
         }
 
     @staticmethod
-    def _structured_candidate_priority(candidate: _StructuredReplyCandidate) -> tuple[int, int, int, float, int, int]:
+    def _structured_candidate_priority(candidate: _StructuredReplyCandidate) -> tuple[int, int, int, int, float, int, int]:
         return (
             int(candidate.parseable),
             int(candidate.salvage_allowed),
+            int(candidate.region_trusted),
             candidate.observation_count,
             candidate.score,
             len(candidate.parsed_text),
@@ -3106,6 +3231,9 @@ class BrowserChatGPTTransport:
         text: str,
         score: float,
         salvage_allowed: bool,
+        region_trusted: bool,
+        region_confidence: float | None,
+        region_reason: str,
         observation_count: int,
     ) -> _StructuredReplyCandidate | None:
         cleaned = text.strip()
@@ -3131,6 +3259,9 @@ class BrowserChatGPTTransport:
             score=score,
             parseable=looks_like_patch_plan_json(parsed),
             salvage_allowed=salvage_allowed,
+            region_trusted=region_trusted,
+            region_confidence=region_confidence,
+            region_reason=region_reason,
             observation_count=observation_count,
         )
 
@@ -3143,6 +3274,9 @@ class BrowserChatGPTTransport:
         score: float,
         salvage_allowed: bool,
         observation_counts: dict[str, int],
+        region_trusted: bool = True,
+        region_confidence: float | None = None,
+        region_reason: str = "",
     ) -> _StructuredReplyCandidate | None:
         parsed = extract_structured_block(text)
         if not parsed.strip():
@@ -3154,13 +3288,16 @@ class BrowserChatGPTTransport:
             text=text,
             score=score,
             salvage_allowed=salvage_allowed,
+            region_trusted=region_trusted,
+            region_confidence=region_confidence,
+            region_reason=region_reason,
             observation_count=observation_count,
         )
         if candidate is None:
             return None
         if snapshot.best_structured is None or self._structured_candidate_priority(candidate) > self._structured_candidate_priority(snapshot.best_structured):
             snapshot.best_structured = candidate
-        if candidate.salvage_allowed and (
+        if candidate.salvage_allowed and candidate.region_trusted and (
             snapshot.best_salvageable is None
             or self._structured_candidate_priority(candidate) > self._structured_candidate_priority(snapshot.best_salvageable)
         ):
@@ -3177,8 +3314,14 @@ class BrowserChatGPTTransport:
             "best_structured_candidate_source": best_structured.source if best_structured is not None else None,
             "best_structured_candidate_parseable": best_structured.parseable if best_structured is not None else False,
             "best_structured_candidate_observations": best_structured.observation_count if best_structured is not None else 0,
+            "best_structured_candidate_region_trusted": best_structured.region_trusted if best_structured is not None else False,
+            "best_structured_candidate_region_confidence": best_structured.region_confidence if best_structured is not None else None,
+            "best_structured_candidate_region_reason": best_structured.region_reason if best_structured is not None else "",
             "best_salvageable_candidate_length": len(best_salvageable.parsed_text) if best_salvageable is not None else 0,
             "best_salvageable_candidate_source": best_salvageable.source if best_salvageable is not None else None,
+            "best_salvageable_candidate_region_trusted": best_salvageable.region_trusted if best_salvageable is not None else False,
+            "best_salvageable_candidate_region_confidence": best_salvageable.region_confidence if best_salvageable is not None else None,
+            "best_salvageable_candidate_region_reason": best_salvageable.region_reason if best_salvageable is not None else "",
             "salvage_attempted": False,
             "salvage_succeeded": False,
             "salvage_source": None,
@@ -3199,7 +3342,11 @@ class BrowserChatGPTTransport:
         elif not best_structured.parseable:
             diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_not_parseable"
         elif best_salvageable is None:
-            diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_not_salvageable"
+            diagnostics["final_capture_failure_reason"] = (
+                "structured_block_seen_but_region_trust_too_low"
+                if not best_structured.region_trusted
+                else "structured_block_seen_but_not_salvageable"
+            )
         else:
             diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_lost"
         return "", diagnostics

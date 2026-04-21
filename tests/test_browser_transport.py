@@ -553,6 +553,65 @@ def test_finalize_captured_reply_does_not_salvage_untrusted_scrolled_candidate()
     assert diagnostics["final_capture_failure_reason"] == "structured_block_seen_but_not_salvageable"
 
 
+def test_finalize_captured_reply_rejects_low_region_trust_candidate_for_salvage() -> None:
+    transport = BrowserChatGPTTransport()
+    snapshot = transport._last_reply_capture_snapshot
+    transport._remember_reply_capture_candidate(
+        snapshot,
+        source="uia",
+        text='{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"unsafe.py","reason":"add","content":"print(1)"}]}',
+        score=320.0,
+        salvage_allowed=True,
+        observation_counts={},
+        region_trusted=False,
+        region_confidence=0.18,
+        region_reason="low_confidence_visual_reply_region",
+    )
+
+    parsed, diagnostics = transport._finalize_captured_reply("")
+
+    assert parsed == ""
+    assert diagnostics["salvage_attempted"] is True
+    assert diagnostics["salvage_succeeded"] is False
+    assert diagnostics["best_structured_candidate_region_trusted"] is False
+    assert diagnostics["final_capture_failure_reason"] == "structured_block_seen_but_region_trust_too_low"
+
+
+def test_finalize_captured_reply_prefers_trusted_candidate_for_salvage() -> None:
+    transport = BrowserChatGPTTransport()
+    snapshot = transport._last_reply_capture_snapshot
+    observation_counts: dict[str, int] = {}
+    transport._remember_reply_capture_candidate(
+        snapshot,
+        source="uia",
+        text='{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"unsafe.py","reason":"add","content":"print(1)"}]}',
+        score=390.0,
+        salvage_allowed=True,
+        observation_counts=observation_counts,
+        region_trusted=False,
+        region_confidence=0.12,
+        region_reason="weak_visual_reply_region_support",
+    )
+    transport._remember_reply_capture_candidate(
+        snapshot,
+        source="ocr",
+        text='{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"safe.py","reason":"add","content":"print(2)"}]}',
+        score=280.0,
+        salvage_allowed=True,
+        observation_counts=observation_counts,
+        region_trusted=True,
+        region_confidence=0.82,
+        region_reason="confirmed_reply_region_capture",
+    )
+
+    parsed, diagnostics = transport._finalize_captured_reply("")
+
+    assert '"safe.py"' in parsed
+    assert diagnostics["salvage_succeeded"] is True
+    assert diagnostics["salvage_source"] == "ocr"
+    assert diagnostics["best_salvageable_candidate_region_trusted"] is True
+
+
 def test_capture_reply_text_does_not_require_anchor_when_thread_was_not_reused(monkeypatch) -> None:
     transport = BrowserChatGPTTransport(thread_reuse_enabled=True)
     transport._executor = _FakeExecutor("")
