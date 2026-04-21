@@ -1,5 +1,7 @@
 import subprocess
 
+import pytest
+
 from aster.browser_core.reply_tracker import (
     clean_captured_segment_for_policy,
     extract_structured_block,
@@ -506,6 +508,51 @@ def test_capture_reply_text_can_reject_selected_raw_code_candidate(monkeypatch) 
     assert "Raw code appeared" in str(timeout_events[-1]["rejection_reason"])
 
 
+def test_finalize_captured_reply_salvages_best_previous_structured_candidate() -> None:
+    transport = BrowserChatGPTTransport()
+    snapshot = transport._last_reply_capture_snapshot
+    transport._remember_reply_capture_candidate(
+        snapshot,
+        source="uia",
+        text=(
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}\n'
+            "ASTER_PATCH_END"
+        ),
+        score=350.0,
+        salvage_allowed=True,
+        observation_counts={},
+    )
+
+    parsed, diagnostics = transport._finalize_captured_reply("")
+
+    assert looks_like_patch_plan_json(parsed) is True
+    assert '"saved.py"' in parsed
+    assert diagnostics["salvage_attempted"] is True
+    assert diagnostics["salvage_succeeded"] is True
+    assert diagnostics["salvage_source"] == "uia"
+
+
+def test_finalize_captured_reply_does_not_salvage_untrusted_scrolled_candidate() -> None:
+    transport = BrowserChatGPTTransport()
+    snapshot = transport._last_reply_capture_snapshot
+    transport._remember_reply_capture_candidate(
+        snapshot,
+        source="scrolled",
+        text='{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"unsafe.py","reason":"add","content":"print(1)"}]}',
+        score=300.0,
+        salvage_allowed=False,
+        observation_counts={},
+    )
+
+    parsed, diagnostics = transport._finalize_captured_reply("")
+
+    assert parsed == ""
+    assert diagnostics["salvage_attempted"] is True
+    assert diagnostics["salvage_succeeded"] is False
+    assert diagnostics["final_capture_failure_reason"] == "structured_block_seen_but_not_salvageable"
+
+
 def test_capture_reply_text_does_not_require_anchor_when_thread_was_not_reused(monkeypatch) -> None:
     transport = BrowserChatGPTTransport(thread_reuse_enabled=True)
     transport._executor = _FakeExecutor("")
@@ -637,6 +684,90 @@ def test_capture_reply_text_blocks_one_shot_scrolled_structured_candidate(monkey
     assert scroll_events
     assert scroll_events[-1]["acceptance_tier"] == "scrolled_structured"
     assert scroll_events[-1]["accepted"] is False
+
+
+def test_generate_salvages_final_structured_block_from_trusted_capture(monkeypatch) -> None:
+    transport = BrowserChatGPTTransport()
+    transport._logger = None
+    transport._ensure_runtime = lambda: None
+    transport._show_automation_notice = lambda: None
+    transport._hide_automation_notice = lambda: None
+    transport._activity = lambda *_args, **_kwargs: None
+    transport._populate_prompt_directly = lambda target, prompt, prompt_anchor=None: True
+    transport._stabilize_and_send = lambda target, before_lines, prompt: None
+    transport._prepare_chatgpt_window = lambda target, chatgpt_url, timeout_sec: False
+    transport._capture = _FakeCaptureService()
+    transport._ocr = _FakeOCR()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    transport._ensure_chatgpt_window = lambda chatgpt_url, launch_timeout_sec: _Target()
+    transport._ui_state = lambda target: {
+        "show_in_text_field_present": False,
+        "send_prompt_present": False,
+        "send_prompt_enabled": None,
+        "stop_streaming_present": False,
+    }
+    transport._capture_visible_text_lines = lambda target: []
+
+    def _capture_reply_text(*_args, **_kwargs):
+        snapshot = transport._last_reply_capture_snapshot
+        transport._remember_reply_capture_candidate(
+            snapshot,
+            source="uia",
+            text='{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}',
+            score=360.0,
+            salvage_allowed=True,
+            observation_counts={},
+        )
+        transport._last_reply_capture_snapshot = snapshot
+        return ""
+
+    transport._capture_reply_text = _capture_reply_text
+
+    result = transport.generate("create saved.py", timeout_sec=4.0, launch_timeout_sec=1.0)
+
+    assert looks_like_patch_plan_json(result.raw_text) is True
+    assert '"saved.py"' in result.raw_text
+
+
+def test_generate_raises_final_capture_failure_when_no_salvageable_candidate_exists(monkeypatch) -> None:
+    transport = BrowserChatGPTTransport()
+    transport._logger = None
+    transport._ensure_runtime = lambda: None
+    transport._show_automation_notice = lambda: None
+    transport._hide_automation_notice = lambda: None
+    transport._activity = lambda *_args, **_kwargs: None
+    transport._populate_prompt_directly = lambda target, prompt, prompt_anchor=None: True
+    transport._stabilize_and_send = lambda target, before_lines, prompt: None
+    transport._prepare_chatgpt_window = lambda target, chatgpt_url, timeout_sec: False
+    transport._capture = _FakeCaptureService()
+    transport._ocr = _FakeOCR()
+
+    class _Target:
+        title = "ChatGPT - Google Chrome"
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    transport._ensure_chatgpt_window = lambda chatgpt_url, launch_timeout_sec: _Target()
+    transport._ui_state = lambda target: {
+        "show_in_text_field_present": False,
+        "send_prompt_present": False,
+        "send_prompt_enabled": None,
+        "stop_streaming_present": False,
+    }
+    transport._capture_visible_text_lines = lambda target: []
+    transport._capture_reply_text = lambda *_args, **_kwargs: ""
+
+    with pytest.raises(RuntimeError, match="no structured patch block was seen during reply capture"):
+        transport.generate("create saved.py", timeout_sec=4.0, launch_timeout_sec=1.0)
 
 
 def test_capture_reply_text_by_scrolling_keeps_structured_anchor_over_prompt_contamination(monkeypatch) -> None:

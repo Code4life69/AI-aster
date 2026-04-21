@@ -193,6 +193,23 @@ class BrowserResult:
     metadata: dict[str, str]
 
 
+@dataclass(slots=True)
+class _StructuredReplyCandidate:
+    source: str
+    raw_text: str
+    parsed_text: str
+    score: float
+    parseable: bool
+    salvage_allowed: bool
+    observation_count: int = 1
+
+
+@dataclass(slots=True)
+class _ReplyCaptureSnapshot:
+    best_structured: _StructuredReplyCandidate | None = None
+    best_salvageable: _StructuredReplyCandidate | None = None
+
+
 class _AutomationNotice:
     _active_process: subprocess.Popen[str] | None = None
     _active_owner_id: int | None = None
@@ -431,6 +448,7 @@ class BrowserChatGPTTransport:
         self._last_page_classification: PageClassification | None = None
         self._last_uia_control_diagnostics: dict[str, Any] | None = None
         self._last_uia_diagnostic_signature = ""
+        self._last_reply_capture_snapshot = _ReplyCaptureSnapshot()
 
     def _log(self, event: str, payload: dict[str, Any]) -> None:
         if self._logger is None:
@@ -552,6 +570,7 @@ class BrowserChatGPTTransport:
             details={"prompt_length": len(prompt)},
         )
         prompt_anchor = build_turn_anchor(prompt)
+        self._last_reply_capture_snapshot = _ReplyCaptureSnapshot()
         self._start_runtime_log_heartbeat()
         try:
             self.thread_registry.load()
@@ -638,17 +657,28 @@ class BrowserChatGPTTransport:
                     prompt_anchor=prompt_anchor,
                     thread_reused_for_capture=thread_reused_for_capture,
                 )
-                parsed = extract_structured_block(reply)
+                parsed, final_capture_diagnostics = self._finalize_captured_reply(reply)
                 self._log(
                     "generate_reply_captured",
                     {
                         "reply_length": len(reply),
                         "parsed_length": len(parsed),
                         "reply_preview": reply[:300],
+                        **final_capture_diagnostics,
                     },
                 )
                 if not parsed.strip():
-                    raise RuntimeError("Browser mode could not capture a final ChatGPT response")
+                    failure_reason = final_capture_diagnostics.get("final_capture_failure_reason", "no_structured_block_seen")
+                    reason_messages = {
+                        "no_structured_block_seen": "no structured patch block was seen during reply capture",
+                        "structured_block_seen_but_lost": "a structured patch block was seen earlier but final extraction lost it",
+                        "structured_block_seen_but_not_parseable": "structured patch text was seen, but none of it became parseable JSON",
+                        "structured_block_seen_but_not_salvageable": "a structured patch block was seen earlier, but it was not trusted enough to salvage",
+                    }
+                    raise RuntimeError(
+                        "Browser mode could not capture a final ChatGPT response: "
+                        f"{reason_messages.get(failure_reason, failure_reason)}."
+                    )
                 self._activity(
                     "browser_reply_ready",
                     "Captured a reply from ChatGPT and extracted the structured block.",
@@ -1506,6 +1536,8 @@ class BrowserChatGPTTransport:
         previous_uia_text = ""
         last_wait_diagnostics: dict[str, Any] | None = None
         last_ui_state: dict[str, Any] = {}
+        snapshot = _ReplyCaptureSnapshot()
+        structured_observation_counts: dict[str, int] = {}
 
         while time.monotonic() < deadline:
             self._tick_runtime_log_heartbeat("capture_reply_text")
@@ -1553,6 +1585,14 @@ class BrowserChatGPTTransport:
             last_wait_diagnostics = diagnostics
             if current_best is not None:
                 source, candidate, score = current_best
+                self._remember_reply_capture_candidate(
+                    snapshot,
+                    source=source,
+                    text=candidate,
+                    score=score,
+                    salvage_allowed=source in {"uia", "ocr"},
+                    observation_counts=structured_observation_counts,
+                )
                 preferred = select_preferred_reply_candidate(
                     (source, best_text, best_score) if best_text else None,
                     current_best,
@@ -1588,6 +1628,7 @@ class BrowserChatGPTTransport:
                             **self._reply_acceptance_log_payload(acceptance),
                         },
                     )
+                    self._last_reply_capture_snapshot = snapshot
                     return candidate
                 if acceptance.should_scroll and not scanned_with_scroll and not self._response_still_streaming(ui_state):
                     self._log(
@@ -1636,6 +1677,14 @@ class BrowserChatGPTTransport:
                                 stable_structured_hits=scroll_stable_hits,
                                 scrolling_attempted=True,
                             )
+                            scroll_candidate = self._remember_reply_capture_candidate(
+                                snapshot,
+                                source="scrolled",
+                                text=candidate,
+                                score=score,
+                                salvage_allowed=scroll_acceptance.accepted,
+                                observation_counts=structured_observation_counts,
+                            )
                             self._log(
                                 "reply_scrolled_capture",
                                 {
@@ -1643,6 +1692,18 @@ class BrowserChatGPTTransport:
                                     "preview": scrolled[:240],
                                     "structured_completion_score": structured_completion_score(scrolled_progress),
                                     "structured_completion_progress": scrolled_progress,
+                                    "best_structured_candidate_source": (
+                                        snapshot.best_structured.source if snapshot.best_structured is not None else None
+                                    ),
+                                    "best_structured_candidate_length": (
+                                        len(snapshot.best_structured.parsed_text) if snapshot.best_structured is not None else 0
+                                    ),
+                                    "best_structured_candidate_parseable": (
+                                        snapshot.best_structured.parseable if snapshot.best_structured is not None else False
+                                    ),
+                                    "best_structured_candidate_salvage_allowed": (
+                                        snapshot.best_salvageable is not None
+                                    ),
                                     **self._reply_acceptance_log_payload(scroll_acceptance),
                                 },
                             )
@@ -1672,6 +1733,7 @@ class BrowserChatGPTTransport:
                                         **self._reply_acceptance_log_payload(scroll_acceptance),
                                     },
                                 )
+                                self._last_reply_capture_snapshot = snapshot
                                 return candidate
                     scanned_with_scroll = True
             previous_candidate_text = current_best[1] if current_best is not None else ""
@@ -1680,6 +1742,15 @@ class BrowserChatGPTTransport:
             attempt_index += 1
 
         timeout_candidate = (best_source or "best", best_text, best_score) if best_text else None
+        if timeout_candidate is not None:
+            self._remember_reply_capture_candidate(
+                snapshot,
+                source=str(timeout_candidate[0]),
+                text=str(timeout_candidate[1]),
+                score=float(timeout_candidate[2]),
+                salvage_allowed=str(timeout_candidate[0]) in {"uia", "ocr"},
+                observation_counts=structured_observation_counts,
+            )
         timeout_acceptance = evaluate_reply_acceptance(
             timeout_candidate,
             ui_state=last_ui_state,
@@ -1703,6 +1774,7 @@ class BrowserChatGPTTransport:
                 },
             )
         if timeout_candidate is not None and timeout_acceptance.accepted:
+            self._last_reply_capture_snapshot = snapshot
             return best_text
 
         fallback = self._executor.read_chatgpt_browser_reply(
@@ -1731,6 +1803,15 @@ class BrowserChatGPTTransport:
             scrolling_attempted=scanned_with_scroll,
             timed_out=True,
         )
+        if fallback_block.strip():
+            self._remember_reply_capture_candidate(
+                snapshot,
+                source="screen_reader_fallback",
+                text=fallback,
+                score=fallback_candidate[2] if fallback_candidate is not None else score_candidate_for_policy(fallback_block, policy=REPLY_TRACKER_POLICY),
+                salvage_allowed=fallback_candidate is not None and fallback_acceptance.accepted,
+                observation_counts=structured_observation_counts,
+            )
         if fallback_candidate is not None and fallback_acceptance.accepted:
             self._log(
                 "reply_candidate_selected",
@@ -1742,7 +1823,9 @@ class BrowserChatGPTTransport:
                     **self._reply_acceptance_log_payload(fallback_acceptance),
                 },
             )
+            self._last_reply_capture_snapshot = snapshot
             return fallback_block
+        self._last_reply_capture_snapshot = snapshot
         return ""
 
     def _capture_visible_reply_sources(self, target, before_lines, prompt: str, lines=None) -> tuple[str, str]:
@@ -1995,6 +2078,122 @@ class BrowserChatGPTTransport:
             "requires_more_observation": acceptance.requires_more_observation,
             "should_scroll": acceptance.should_scroll,
         }
+
+    @staticmethod
+    def _structured_candidate_priority(candidate: _StructuredReplyCandidate) -> tuple[int, int, int, float, int, int]:
+        return (
+            int(candidate.parseable),
+            int(candidate.salvage_allowed),
+            candidate.observation_count,
+            candidate.score,
+            len(candidate.parsed_text),
+            len(candidate.raw_text),
+        )
+
+    @staticmethod
+    def _build_structured_reply_candidate(
+        *,
+        source: str,
+        text: str,
+        score: float,
+        salvage_allowed: bool,
+        observation_count: int,
+    ) -> _StructuredReplyCandidate | None:
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        parsed = extract_structured_block(cleaned)
+        if not parsed.strip():
+            return None
+        normalized = " ".join(cleaned.lower().split())
+        structured_hint = (
+            looks_like_patch_plan_json(parsed)
+            or "aster patch begin" in normalized
+            or "aster_patch_begin" in normalized
+            or ('"operations"' in parsed and "{" in parsed)
+            or ('"summary"' in parsed and "{" in parsed)
+        )
+        if not structured_hint:
+            return None
+        return _StructuredReplyCandidate(
+            source=source,
+            raw_text=cleaned,
+            parsed_text=parsed,
+            score=score,
+            parseable=looks_like_patch_plan_json(parsed),
+            salvage_allowed=salvage_allowed,
+            observation_count=observation_count,
+        )
+
+    def _remember_reply_capture_candidate(
+        self,
+        snapshot: _ReplyCaptureSnapshot,
+        *,
+        source: str,
+        text: str,
+        score: float,
+        salvage_allowed: bool,
+        observation_counts: dict[str, int],
+    ) -> _StructuredReplyCandidate | None:
+        parsed = extract_structured_block(text)
+        if not parsed.strip():
+            return None
+        observation_count = observation_counts.get(parsed, 0) + 1
+        observation_counts[parsed] = observation_count
+        candidate = self._build_structured_reply_candidate(
+            source=source,
+            text=text,
+            score=score,
+            salvage_allowed=salvage_allowed,
+            observation_count=observation_count,
+        )
+        if candidate is None:
+            return None
+        if snapshot.best_structured is None or self._structured_candidate_priority(candidate) > self._structured_candidate_priority(snapshot.best_structured):
+            snapshot.best_structured = candidate
+        if candidate.salvage_allowed and (
+            snapshot.best_salvageable is None
+            or self._structured_candidate_priority(candidate) > self._structured_candidate_priority(snapshot.best_salvageable)
+        ):
+            snapshot.best_salvageable = candidate
+        return candidate
+
+    def _finalize_captured_reply(self, reply: str) -> tuple[str, dict[str, Any]]:
+        parsed = extract_structured_block(reply)
+        snapshot = self._last_reply_capture_snapshot
+        best_structured = snapshot.best_structured
+        best_salvageable = snapshot.best_salvageable
+        diagnostics: dict[str, Any] = {
+            "best_structured_candidate_length": len(best_structured.parsed_text) if best_structured is not None else 0,
+            "best_structured_candidate_source": best_structured.source if best_structured is not None else None,
+            "best_structured_candidate_parseable": best_structured.parseable if best_structured is not None else False,
+            "best_structured_candidate_observations": best_structured.observation_count if best_structured is not None else 0,
+            "best_salvageable_candidate_length": len(best_salvageable.parsed_text) if best_salvageable is not None else 0,
+            "best_salvageable_candidate_source": best_salvageable.source if best_salvageable is not None else None,
+            "salvage_attempted": False,
+            "salvage_succeeded": False,
+            "salvage_source": None,
+            "final_capture_failure_reason": "",
+        }
+        if parsed.strip():
+            return parsed, diagnostics
+
+        diagnostics["salvage_attempted"] = best_structured is not None
+        if best_salvageable is not None and best_salvageable.parsed_text.strip():
+            diagnostics["salvage_succeeded"] = True
+            diagnostics["salvage_source"] = best_salvageable.source
+            diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_lost"
+            return best_salvageable.parsed_text, diagnostics
+
+        if best_structured is None:
+            diagnostics["final_capture_failure_reason"] = "no_structured_block_seen"
+        elif not best_structured.parseable:
+            diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_not_parseable"
+        elif best_salvageable is None:
+            diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_not_salvageable"
+        else:
+            diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_lost"
+        return "", diagnostics
 
     def _analyze_screen(self, target, lines=None, ui_state: dict[str, Any] | None = None) -> PageClassification:
         if lines is None:
