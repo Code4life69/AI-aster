@@ -115,6 +115,46 @@ def test_summarize_edit_candidates_flags_below_threshold() -> None:
     assert summary["top_candidates"][0]["above_threshold"] is False
 
 
+def test_read_visible_reply_text_survives_malformed_descendant_iteration(monkeypatch) -> None:
+    logger = _FakeAuditLogger()
+    transport = BrowserChatGPTTransport(logger=logger)
+
+    class _BrokenWindow:
+        def descendants(self):
+            yield _FakeReplyControl(
+                "Text",
+                "Assistant reply",
+                _FakeRect(280, 180, 980, 240),
+            )
+            raise KeyError(None)
+
+    class _FakeDesktop:
+        def __init__(self, backend=None) -> None:
+            assert backend == "uia"
+
+        def window(self, handle=None):
+            assert handle == 123
+            return _BrokenWindow()
+
+    class _Target:
+        handle = 123
+        title = "ChatGPT - Google Chrome"
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    monkeypatch.setattr("aster.transport_browser.browser_transport.Desktop", _FakeDesktop)
+
+    reply_text = transport._read_visible_reply_text(_Target())
+
+    assert reply_text == "Assistant reply"
+    failure = next(event for event in logger.events if event["event"] == "uia_reply_read_failure")
+    assert failure["uia_read_failure_reason"] == "KeyError"
+    assert failure["descendant_enumeration_guard_triggered"] is True
+    assert failure["stage"] == "descendant_iteration"
+
+
 class _FakeAuditLogger:
     def __init__(self) -> None:
         self.events: list[dict[str, object]] = []
@@ -125,6 +165,32 @@ class _FakeAuditLogger:
 
     def activity(self, *args, **kwargs) -> None:
         return None
+
+
+class _FakeRect:
+    def __init__(self, left: int, top: int, right: int, bottom: int) -> None:
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+
+
+class _FakeElementInfo:
+    def __init__(self, control_type: str) -> None:
+        self.control_type = control_type
+
+
+class _FakeReplyControl:
+    def __init__(self, control_type: str, text: str, rect: _FakeRect) -> None:
+        self.element_info = _FakeElementInfo(control_type)
+        self._text = text
+        self._rect = rect
+
+    def window_text(self) -> str:
+        return self._text
+
+    def rectangle(self) -> _FakeRect:
+        return self._rect
 
 
 class _FakeNoticeProcess:
@@ -879,6 +945,7 @@ def test_generate_returns_empty_reply_when_only_diagnostic_salvage_exists(monkey
     assert result.raw_text == ""
     assert result.metadata["retry_seed_valid"] is False
     assert result.metadata["retry_seed_validity_reason"] == "unbalanced_structure"
+    assert result.metadata["retry_seed_validity_reason_source"] == "best_salvageable_candidate"
     assert result.metadata["final_capture_failure_reason"] == "structured_block_seen_but_not_retry_safe"
 
 

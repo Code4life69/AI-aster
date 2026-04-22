@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pytest
 
 from aster.config.models import AsterConfig
 from aster.context_collector import CollectedContext
@@ -77,6 +80,17 @@ class _BrowserTransport:
 
     def generate(self, prompt: str, **kwargs) -> _FakeBrowserResult:
         return _FakeBrowserResult(self.raw_text)
+
+
+class _CollectingLogger:
+    def __init__(self) -> None:
+        self.entries: list[tuple[str, dict[str, object]]] = []
+
+    def log(self, namespace: str, payload: dict[str, object]) -> None:
+        self.entries.append((namespace, payload))
+
+    def activity(self, *args, **kwargs) -> None:
+        return None
 
 
 def _config(tmp_path: Path) -> AsterConfig:
@@ -210,9 +224,12 @@ def test_parse_with_retry_omits_invalid_browser_retry_seed(tmp_path: Path) -> No
     config = _config(tmp_path)
     config.sync_with_remote = False
     orchestrator = AsterOrchestrator(config)
+    logger = _CollectingLogger()
+    orchestrator.logger = logger
     orchestrator._last_generation_metadata = {
         "retry_seed_valid": False,
         "retry_seed_validity_reason": "unbalanced_structure",
+        "retry_seed_validity_reason_source": "best_salvageable_candidate",
     }
     calls: list[str | None] = []
 
@@ -261,3 +278,59 @@ def test_parse_with_retry_omits_invalid_browser_retry_seed(tmp_path: Path) -> No
 
     assert calls == [None]
     assert plan.requires_more_files() is True
+    prompt_retry_payload = next(payload for namespace, payload in logger.entries if namespace == "prompt_retry")
+    assert prompt_retry_payload["retry_seed_used"] is False
+    assert prompt_retry_payload["retry_seed_validity_reason"] == "unbalanced_structure"
+    assert prompt_retry_payload["retry_seed_validity_reason_source"] == "best_salvageable_candidate"
+    assert prompt_retry_payload["retry_prior_response_length"] == 0
+
+
+def test_parse_with_retry_wraps_non_parseable_browser_retry_response(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sync_with_remote = False
+    orchestrator = AsterOrchestrator(config)
+    logger = _CollectingLogger()
+    orchestrator.logger = logger
+    orchestrator._last_generation_metadata = {
+        "retry_seed_valid": False,
+        "retry_seed_validity_reason": "missing_required_schema_keys",
+        "retry_seed_validity_reason_source": "best_salvageable_candidate",
+    }
+    retry_calls: list[str | None] = []
+
+    def _parse(raw_text: str):
+        raise json.JSONDecodeError("bad json", raw_text or "", 0)
+
+    orchestrator.parser.parse = _parse
+
+    def _retry_generate(*_args, **kwargs):
+        retry_calls.append(kwargs.get("prior_text"))
+
+        class _PromptPackage:
+            messages = [{"role": "user", "content": "retry"}]
+            approx_chars = 5
+            included_files = []
+            omitted_files = []
+            compacted = False
+
+        return ("not json", _PromptPackage())
+
+    orchestrator._generate_with_prompt_retries = _retry_generate
+    context = CollectedContext(
+        project_root=tmp_path,
+        project_summary="demo",
+        file_tree="demo/",
+        relevant_files=[],
+        skipped_files=[],
+    )
+
+    with pytest.raises(RuntimeError, match="Browser retry response was not machine-parseable"):
+        orchestrator._parse_with_retry("build app", context, [], "browser", "")
+
+    assert retry_calls == [None]
+    retry_parse_failure = next(payload for namespace, payload in logger.entries if namespace == "retry_parse_failure")
+    assert retry_parse_failure["retry_seed_used"] is False
+    assert retry_parse_failure["retry_prior_response_length"] == 0
+    assert retry_parse_failure["retry_seed_validity_reason"] == "missing_required_schema_keys"
+    assert retry_parse_failure["retry_seed_validity_reason_source"] == "best_salvageable_candidate"
+    assert retry_parse_failure["retry_parse_text_source"] == "retry_text"

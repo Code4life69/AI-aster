@@ -272,15 +272,9 @@ class AsterOrchestrator:
     def _parse_with_retry(self, goal: str, context: CollectedContext, history, mode: str, raw: str) -> ParsedPlan:
         try:
             return self.parser.parse(raw)
-        except Exception:
-            retry_seed_valid = bool(raw.strip())
-            retry_seed_validity_reason = "raw_response_present" if retry_seed_valid else "empty_response"
-            if mode == "browser":
-                retry_seed_valid = bool(self._last_generation_metadata.get("retry_seed_valid", retry_seed_valid))
-                retry_seed_validity_reason = str(
-                    self._last_generation_metadata.get("retry_seed_validity_reason", retry_seed_validity_reason)
-                )
-            prior_text = raw if retry_seed_valid and raw.strip() else None
+        except Exception as original_parse_error:
+            retry_seed_metadata = self._resolve_retry_seed_metadata(mode, raw)
+            prior_text = raw if retry_seed_metadata["retry_seed_valid"] and raw.strip() else None
             self._activity(
                 "retry_request",
                 "The first response was not machine-parseable, so Aster is retrying with stricter instructions.",
@@ -300,12 +294,68 @@ class AsterOrchestrator:
                     "mode": mode,
                     "prior_response_preview": raw[:500],
                     "retry_seed_used": prior_text is not None,
-                    "retry_seed_valid": retry_seed_valid,
-                    "retry_seed_validity_reason": retry_seed_validity_reason,
+                    "retry_seed_valid": retry_seed_metadata["retry_seed_valid"],
+                    "retry_seed_validity_reason": retry_seed_metadata["retry_seed_validity_reason"],
+                    "retry_seed_validity_reason_source": retry_seed_metadata["retry_seed_validity_reason_source"],
+                    "retry_prior_response_length": len(prior_text or ""),
                     **self._summarize_prompt_package(prompt_package),
                 },
             )
-            return self.parser.parse(retried_raw)
+            try:
+                return self.parser.parse(retried_raw)
+            except Exception as retry_parse_error:
+                self.logger.log(
+                    "retry_parse_failure",
+                    {
+                        "mode": mode,
+                        "retry_seed_used": prior_text is not None,
+                        "retry_prior_response_length": len(prior_text or ""),
+                        "retry_seed_valid": retry_seed_metadata["retry_seed_valid"],
+                        "retry_seed_validity_reason": retry_seed_metadata["retry_seed_validity_reason"],
+                        "retry_seed_validity_reason_source": retry_seed_metadata["retry_seed_validity_reason_source"],
+                        "original_parse_failure_reason": self._format_parse_failure_reason(original_parse_error),
+                        "original_parse_text_source": "original_text",
+                        "retry_parse_failure_reason": self._format_parse_failure_reason(retry_parse_error),
+                        "retry_parse_text_source": "retry_text",
+                    },
+                )
+                if mode == "browser":
+                    seed_state = (
+                        "after reusing a preserved retry seed"
+                        if prior_text is not None
+                        else "without reusing any preserved retry seed"
+                    )
+                    raise RuntimeError(
+                        "Browser retry response was not machine-parseable. "
+                        f"Aster retried {seed_state}, but the follow-up response still could not be parsed."
+                    ) from retry_parse_error
+                raise
+
+    def _resolve_retry_seed_metadata(self, mode: str, raw: str) -> dict[str, object]:
+        retry_seed_valid = bool(raw.strip())
+        retry_seed_validity_reason = "raw_response_present" if retry_seed_valid else "empty_response"
+        retry_seed_validity_reason_source = "raw_response_fallback"
+        if mode == "browser" and self._last_generation_metadata:
+            retry_seed_valid = bool(self._last_generation_metadata.get("retry_seed_valid", retry_seed_valid))
+            retry_seed_validity_reason = str(
+                self._last_generation_metadata.get("retry_seed_validity_reason", retry_seed_validity_reason)
+            )
+            retry_seed_validity_reason_source = str(
+                self._last_generation_metadata.get(
+                    "retry_seed_validity_reason_source",
+                    "browser_result_metadata",
+                )
+            )
+        return {
+            "retry_seed_valid": retry_seed_valid,
+            "retry_seed_validity_reason": retry_seed_validity_reason,
+            "retry_seed_validity_reason_source": retry_seed_validity_reason_source,
+        }
+
+    @staticmethod
+    def _format_parse_failure_reason(exc: Exception) -> str:
+        message = str(exc).strip()
+        return type(exc).__name__ if not message else f"{type(exc).__name__}: {message}"
 
     def _build_commit_message(self, plan: ParsedPlan) -> str:
         summary = " ".join(plan.summary.split()).strip()

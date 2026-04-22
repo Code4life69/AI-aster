@@ -467,6 +467,10 @@ class BrowserChatGPTTransport:
         self._last_reply_capture_snapshot = _ReplyCaptureSnapshot()
         self._last_reply_region_visual_evidence: dict[str, Any] = {}
         self._last_scrolled_capture_meta: dict[str, Any] = {}
+        self._last_uia_reply_read_diagnostics: dict[str, Any] = {
+            "uia_read_failure_reason": "",
+            "descendant_enumeration_guard_triggered": False,
+        }
         self._visual_action_debug = visual_action_debug
         self._visual_region_memory = visual_region_memory
         self._visual_action_memory_enabled = visual_action_memory_enabled
@@ -1161,6 +1165,10 @@ class BrowserChatGPTTransport:
                     "window_title": target.title,
                     "retry_seed_valid": final_capture_diagnostics.get("retry_seed_valid", bool(parsed.strip())),
                     "retry_seed_validity_reason": final_capture_diagnostics.get("retry_seed_validity_reason", ""),
+                    "retry_seed_validity_reason_source": final_capture_diagnostics.get(
+                        "retry_seed_validity_reason_source",
+                        "",
+                    ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
                         "salvage_preserved_for_diagnostics_only",
@@ -3441,6 +3449,7 @@ class BrowserChatGPTTransport:
             "salvage_preserved_for_diagnostics_only": False,
             "retry_seed_valid": False,
             "retry_seed_validity_reason": final_reply_retry_reason if parsed.strip() else "",
+            "retry_seed_validity_reason_source": "final_reply" if parsed.strip() else "",
             "final_capture_failure_reason": "",
         }
         if parsed.strip() and final_reply_retry_safe:
@@ -3453,11 +3462,13 @@ class BrowserChatGPTTransport:
             diagnostics["salvage_source"] = best_retry_safe.source
             diagnostics["retry_seed_valid"] = True
             diagnostics["retry_seed_validity_reason"] = best_retry_safe.retry_seed_validity_reason
+            diagnostics["retry_seed_validity_reason_source"] = "best_retry_safe_candidate"
             diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_lost"
             return best_retry_safe.parsed_text, diagnostics
         if best_salvageable is not None and best_salvageable.parsed_text.strip():
             diagnostics["salvage_preserved_for_diagnostics_only"] = True
             diagnostics["retry_seed_validity_reason"] = best_salvageable.retry_seed_validity_reason
+            diagnostics["retry_seed_validity_reason_source"] = "best_salvageable_candidate"
             diagnostics["final_capture_failure_reason"] = "structured_block_seen_but_not_retry_safe"
             return "", diagnostics
 
@@ -3680,9 +3691,14 @@ class BrowserChatGPTTransport:
         )
 
     def _read_visible_reply_text(self, target) -> str:
+        self._last_uia_reply_read_diagnostics = {
+            "uia_read_failure_reason": "",
+            "descendant_enumeration_guard_triggered": False,
+        }
         try:
             window = Desktop(backend="uia").window(handle=target.handle)
-        except Exception:
+        except Exception as exc:
+            self._record_uia_reply_read_failure(target, stage="window_attach", exc=exc)
             return ""
 
         selected: list[tuple[int, int, str]] = []
@@ -3691,7 +3707,25 @@ class BrowserChatGPTTransport:
         min_top = target.top + 110
         max_bottom = target.top + target.height - 70
 
-        for ctrl in window.descendants():
+        try:
+            descendants = iter(window.descendants())
+        except Exception as exc:
+            self._record_uia_reply_read_failure(target, stage="descendant_enumeration", exc=exc)
+            return ""
+
+        while True:
+            try:
+                ctrl = next(descendants)
+            except StopIteration:
+                break
+            except Exception as exc:
+                self._record_uia_reply_read_failure(
+                    target,
+                    stage="descendant_iteration",
+                    exc=exc,
+                    partial_matches=len(selected),
+                )
+                break
             try:
                 control_type = ctrl.element_info.control_type
                 if control_type not in {"Document", "Text", "Group"}:
@@ -3716,6 +3750,33 @@ class BrowserChatGPTTransport:
             return ""
         selected.sort(key=lambda item: (item[0], item[1]))
         return "\n".join(text for _, _, text in selected)
+
+    def _record_uia_reply_read_failure(
+        self,
+        target,
+        *,
+        stage: str,
+        exc: Exception,
+        partial_matches: int = 0,
+    ) -> None:
+        message = str(exc).strip()
+        reason = type(exc).__name__ if not message or message == "None" else f"{type(exc).__name__}: {message}"
+        diagnostics = {
+            "uia_read_failure_reason": reason,
+            "descendant_enumeration_guard_triggered": stage != "window_attach",
+            "stage": stage,
+            "partial_matches": partial_matches,
+        }
+        self._last_uia_reply_read_diagnostics = diagnostics
+        self._log(
+            "uia_reply_read_failure",
+            {
+                "window_title": getattr(target, "title", ""),
+                "stage": stage,
+                "partial_matches": partial_matches,
+                **diagnostics,
+            },
+        )
 
     @staticmethod
     def _window_title_suggests_existing_thread(title: str) -> bool:
