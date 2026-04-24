@@ -261,8 +261,8 @@ def test_parse_with_retry_omits_invalid_browser_retry_seed(tmp_path: Path) -> No
             included_files = []
             omitted_files = []
             compacted = False
-            retry_prompt_mode = "browser_no_seed_retry"
-            retry_prompt_strategy = "browser_retry_without_prior_text"
+            retry_prompt_mode = "browser_structured_output_only_retry"
+            retry_prompt_strategy = "browser_retry_structured_output_only"
             retry_prompt_reason = "unbalanced_structure"
             retry_prompt_length = 5
             retry_prompt_compacted_relative_to_original = True
@@ -290,8 +290,8 @@ def test_parse_with_retry_omits_invalid_browser_retry_seed(tmp_path: Path) -> No
     assert prompt_retry_payload["retry_seed_validity_reason"] == "unbalanced_structure"
     assert prompt_retry_payload["retry_seed_validity_reason_source"] == "best_salvageable_candidate"
     assert prompt_retry_payload["retry_prior_response_length"] == 0
-    assert prompt_retry_payload["retry_prompt_mode"] == "browser_no_seed_retry"
-    assert prompt_retry_payload["retry_prompt_strategy"] == "browser_retry_without_prior_text"
+    assert prompt_retry_payload["retry_prompt_mode"] == "browser_structured_output_only_retry"
+    assert prompt_retry_payload["retry_prompt_strategy"] == "browser_retry_structured_output_only"
     assert prompt_retry_payload["retry_prompt_reason"] == "unbalanced_structure"
 
 
@@ -324,8 +324,8 @@ def test_parse_with_retry_wraps_non_parseable_browser_retry_response(tmp_path: P
             included_files = []
             omitted_files = []
             compacted = False
-            retry_prompt_mode = "browser_no_seed_retry"
-            retry_prompt_strategy = "browser_retry_without_prior_text"
+            retry_prompt_mode = "browser_structured_output_only_retry"
+            retry_prompt_strategy = "browser_retry_structured_output_only"
             retry_prompt_reason = "missing_required_schema_keys"
             retry_prompt_length = 5
             retry_prompt_compacted_relative_to_original = True
@@ -386,8 +386,8 @@ def test_parse_with_retry_uses_retry_attempt_failure_reason_in_browser_error(tmp
             included_files = []
             omitted_files = []
             compacted = False
-            retry_prompt_mode = "browser_no_seed_retry"
-            retry_prompt_strategy = "browser_retry_without_prior_text"
+            retry_prompt_mode = "browser_structured_output_only_retry"
+            retry_prompt_strategy = "browser_retry_structured_output_only"
             retry_prompt_reason = "unbalanced_structure"
             retry_prompt_length = 5
             retry_prompt_compacted_relative_to_original = True

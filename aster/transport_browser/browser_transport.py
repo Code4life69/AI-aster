@@ -1177,6 +1177,7 @@ class BrowserChatGPTTransport:
                         "retry_seed_validity_reason_source",
                         "",
                     ),
+                    "retry_output_strict_mode": retry_attempt,
                     "retry_attempt_capture_mode": final_capture_diagnostics.get("retry_attempt_capture_mode", ""),
                     "retry_attempt_acceptance_tier": final_capture_diagnostics.get("retry_attempt_acceptance_tier", ""),
                     "retry_attempt_failure_reason": final_capture_diagnostics.get("retry_attempt_failure_reason", ""),
@@ -1190,6 +1191,19 @@ class BrowserChatGPTTransport:
                         False,
                     ),
                     "retry_attempt_wrapper_only": final_capture_diagnostics.get("retry_attempt_wrapper_only", False),
+                    "retry_attempt_block_count": final_capture_diagnostics.get("retry_attempt_block_count", 0),
+                    "retry_attempt_exact_block_only": final_capture_diagnostics.get(
+                        "retry_attempt_exact_block_only",
+                        False,
+                    ),
+                    "retry_attempt_extra_text_detected": final_capture_diagnostics.get(
+                        "retry_attempt_extra_text_detected",
+                        False,
+                    ),
+                    "retry_attempt_json_object_count": final_capture_diagnostics.get(
+                        "retry_attempt_json_object_count",
+                        0,
+                    ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
                         "salvage_preserved_for_diagnostics_only",
@@ -2632,12 +2646,16 @@ class BrowserChatGPTTransport:
                             "retry_attempt_parseable": retry_assessment["parseable"],
                             "retry_attempt_prose_contamination": retry_assessment["prose_contamination"],
                             "retry_attempt_wrapper_only": retry_assessment["wrapper_only"],
+                            "retry_attempt_block_count": retry_assessment["block_count"],
+                            "retry_attempt_exact_block_only": retry_assessment["exact_block_only"],
+                            "retry_attempt_extra_text_detected": retry_assessment["extra_text_detected"],
+                            "retry_attempt_json_object_count": retry_assessment["json_object_count"],
                             "retry_attempt_failure_reason": retry_assessment["failure_reason"],
                         },
                     )
                     self._last_reply_capture_snapshot = snapshot
                     return str(retry_assessment["selected_text"])
-                if acceptance.accepted:
+                if acceptance.accepted and not retry_attempt:
                     self._log(
                         "reply_candidate_accepted",
                         {
@@ -2755,6 +2773,26 @@ class BrowserChatGPTTransport:
                                         if retry_scroll_assessment is not None
                                         else False
                                     ),
+                                    "retry_attempt_block_count": (
+                                        retry_scroll_assessment["block_count"]
+                                        if retry_scroll_assessment is not None
+                                        else 0
+                                    ),
+                                    "retry_attempt_exact_block_only": (
+                                        retry_scroll_assessment["exact_block_only"]
+                                        if retry_scroll_assessment is not None
+                                        else False
+                                    ),
+                                    "retry_attempt_extra_text_detected": (
+                                        retry_scroll_assessment["extra_text_detected"]
+                                        if retry_scroll_assessment is not None
+                                        else False
+                                    ),
+                                    "retry_attempt_json_object_count": (
+                                        retry_scroll_assessment["json_object_count"]
+                                        if retry_scroll_assessment is not None
+                                        else 0
+                                    ),
                                     "retry_attempt_failure_reason": (
                                         retry_scroll_assessment["failure_reason"]
                                         if retry_scroll_assessment is not None
@@ -2797,12 +2835,16 @@ class BrowserChatGPTTransport:
                                         "retry_attempt_parseable": retry_scroll_assessment["parseable"],
                                         "retry_attempt_prose_contamination": retry_scroll_assessment["prose_contamination"],
                                         "retry_attempt_wrapper_only": retry_scroll_assessment["wrapper_only"],
+                                        "retry_attempt_block_count": retry_scroll_assessment["block_count"],
+                                        "retry_attempt_exact_block_only": retry_scroll_assessment["exact_block_only"],
+                                        "retry_attempt_extra_text_detected": retry_scroll_assessment["extra_text_detected"],
+                                        "retry_attempt_json_object_count": retry_scroll_assessment["json_object_count"],
                                         "retry_attempt_failure_reason": retry_scroll_assessment["failure_reason"],
                                     },
                                 )
                                 self._last_reply_capture_snapshot = snapshot
                                 return str(retry_scroll_assessment["selected_text"])
-                            if scroll_acceptance.accepted:
+                            if scroll_acceptance.accepted and not retry_attempt:
                                 self._log(
                                     "reply_candidate_accepted",
                                     {
@@ -2844,19 +2886,41 @@ class BrowserChatGPTTransport:
             scrolling_attempted=scanned_with_scroll,
             timed_out=True,
         )
+        timeout_retry_assessment = (
+            self._assess_retry_attempt_response(str(timeout_candidate[1]), candidate_source=str(timeout_candidate[0]))
+            if retry_attempt and timeout_candidate is not None
+            else None
+        )
         if last_wait_diagnostics is not None:
+            timeout_payload = {
+                **last_wait_diagnostics,
+                **self._reply_acceptance_log_payload(timeout_acceptance),
+                "elapsed_sec": round(time.monotonic() - started_at, 1),
+                "best_overall_source": best_source or None,
+                "best_overall_score": round(best_score, 1) if best_text else None,
+                "best_overall_length": len(best_text),
+            }
+            if timeout_retry_assessment is not None:
+                timeout_payload.update(
+                    {
+                        "retry_attempt_capture_mode": "structured_block_first",
+                        "retry_attempt_acceptance_tier": timeout_retry_assessment["acceptance_tier"],
+                        "retry_attempt_failure_reason": timeout_retry_assessment["failure_reason"],
+                        "retry_attempt_structured_block_found": timeout_retry_assessment["structured_block_found"],
+                        "retry_attempt_parseable": timeout_retry_assessment["parseable"],
+                        "retry_attempt_prose_contamination": timeout_retry_assessment["prose_contamination"],
+                        "retry_attempt_wrapper_only": timeout_retry_assessment["wrapper_only"],
+                        "retry_attempt_block_count": timeout_retry_assessment["block_count"],
+                        "retry_attempt_exact_block_only": timeout_retry_assessment["exact_block_only"],
+                        "retry_attempt_extra_text_detected": timeout_retry_assessment["extra_text_detected"],
+                        "retry_attempt_json_object_count": timeout_retry_assessment["json_object_count"],
+                    }
+                )
             self._log(
                 "reply_wait_timeout",
-                {
-                    **last_wait_diagnostics,
-                    **self._reply_acceptance_log_payload(timeout_acceptance),
-                    "elapsed_sec": round(time.monotonic() - started_at, 1),
-                    "best_overall_source": best_source or None,
-                    "best_overall_score": round(best_score, 1) if best_text else None,
-                    "best_overall_length": len(best_text),
-                },
+                timeout_payload,
             )
-        if timeout_candidate is not None and timeout_acceptance.accepted:
+        if timeout_candidate is not None and timeout_acceptance.accepted and not retry_attempt:
             self._last_reply_capture_snapshot = snapshot
             return best_text
 
@@ -2923,12 +2987,16 @@ class BrowserChatGPTTransport:
                     "retry_attempt_parseable": retry_fallback_assessment["parseable"],
                     "retry_attempt_prose_contamination": retry_fallback_assessment["prose_contamination"],
                     "retry_attempt_wrapper_only": retry_fallback_assessment["wrapper_only"],
+                    "retry_attempt_block_count": retry_fallback_assessment["block_count"],
+                    "retry_attempt_exact_block_only": retry_fallback_assessment["exact_block_only"],
+                    "retry_attempt_extra_text_detected": retry_fallback_assessment["extra_text_detected"],
+                    "retry_attempt_json_object_count": retry_fallback_assessment["json_object_count"],
                     "retry_attempt_failure_reason": retry_fallback_assessment["failure_reason"],
                 },
             )
             self._last_reply_capture_snapshot = snapshot
             return str(retry_fallback_assessment["selected_text"])
-        if fallback_candidate is not None and fallback_acceptance.accepted:
+        if fallback_candidate is not None and fallback_acceptance.accepted and not retry_attempt:
             self._log(
                 "reply_candidate_selected",
                 {
@@ -3449,16 +3517,33 @@ class BrowserChatGPTTransport:
         outside = outside.replace("ASTER_PATCH_BEGIN", " ").replace("ASTER_PATCH_END", " ")
         return " ".join(outside.split())
 
+    @staticmethod
+    def _count_retry_attempt_blocks(raw_text: str) -> int:
+        normalized = raw_text.upper()
+        return normalized.count("ASTER_PATCH_BEGIN")
+
     def _assess_retry_attempt_response(self, raw_text: str, *, candidate_source: str) -> dict[str, Any]:
         cleaned = raw_text.strip()
         extracted = extract_structured_block(cleaned).strip() if cleaned else ""
         lowered = _normalize(cleaned)
+        block_count = self._count_retry_attempt_blocks(cleaned) if cleaned else 0
         outside_text = self._retry_attempt_outside_block_text(cleaned, extracted) if cleaned else ""
+        exact_block_match = (
+            re.fullmatch(r"\s*ASTER_PATCH_BEGIN\s*(.*?)\s*ASTER_PATCH_END\s*", cleaned, flags=re.DOTALL)
+            if cleaned
+            else None
+        )
+        exact_block_only = exact_block_match is not None and not outside_text
         parseable = bool(extracted) and looks_like_patch_plan_json(extracted)
-        prose_contamination = bool(outside_text)
+        json_object_count = 1 if parseable else 0
+        prose_contamination = bool(outside_text) or self._retry_seed_contaminated(cleaned) or "retry mode for browser output" in lowered
+        marker_present = bool(
+            "aster_patch_begin" in lowered or "aster patch begin" in lowered or "aster_patch_end" in lowered or "aster patch end" in lowered
+        )
         wrapper_only = bool(
-            ("aster_patch_begin" in lowered or "aster patch begin" in lowered or "aster_patch_end" in lowered or "aster patch end" in lowered)
+            marker_present
             and not parseable
+            and not any(token in cleaned for token in ("{", '"summary"', '"operations"'))
         )
         code_only = (
             not bool(extracted)
@@ -3466,15 +3551,19 @@ class BrowserChatGPTTransport:
         )
         if not cleaned:
             failure_reason = "empty_retry_response"
-        elif parseable:
+        elif block_count > 1:
+            failure_reason = "multiple_retry_blocks"
+        elif parseable and exact_block_only and json_object_count == 1:
             failure_reason = ""
+        elif parseable and not exact_block_only:
+            failure_reason = "prose_contaminated_retry_response"
         elif wrapper_only:
             failure_reason = "wrapper_without_valid_json"
         elif extracted:
-            failure_reason = "malformed_structured_retry_response"
+            failure_reason = "malformed_json_inside_retry_block"
         elif code_only:
             failure_reason = "code_only_retry_response"
-        elif self._retry_seed_contaminated(cleaned) or "retry mode for browser output" in lowered:
+        elif prose_contamination:
             failure_reason = "prose_contaminated_retry_response"
         else:
             failure_reason = "malformed_structured_retry_response"
@@ -3484,12 +3573,27 @@ class BrowserChatGPTTransport:
             "parseable": parseable,
             "prose_contamination": prose_contamination,
             "wrapper_only": wrapper_only,
+            "block_count": block_count,
+            "exact_block_only": exact_block_only,
+            "extra_text_detected": bool(outside_text),
+            "json_object_count": json_object_count,
             "failure_reason": failure_reason,
-            "selected_text": extracted if parseable else "",
-            "acceptance_tier": "retry_structured_cleaned" if parseable and prose_contamination else (
-                "retry_structured_exact" if parseable else "blocked_or_ambiguous"
-            ),
+            "selected_text": extracted if parseable and exact_block_only and json_object_count == 1 else "",
+            "acceptance_tier": "retry_structured_exact" if parseable and exact_block_only and json_object_count == 1 else "blocked_or_ambiguous",
         }
+
+    @staticmethod
+    def _apply_retry_attempt_assessment(diagnostics: dict[str, Any], assessment: dict[str, Any]) -> None:
+        diagnostics["retry_attempt_acceptance_tier"] = str(assessment["acceptance_tier"])
+        diagnostics["retry_attempt_failure_reason"] = str(assessment["failure_reason"])
+        diagnostics["retry_attempt_structured_block_found"] = bool(assessment["structured_block_found"])
+        diagnostics["retry_attempt_parseable"] = bool(assessment["parseable"])
+        diagnostics["retry_attempt_prose_contamination"] = bool(assessment["prose_contamination"])
+        diagnostics["retry_attempt_wrapper_only"] = bool(assessment["wrapper_only"])
+        diagnostics["retry_attempt_block_count"] = int(assessment["block_count"])
+        diagnostics["retry_attempt_exact_block_only"] = bool(assessment["exact_block_only"])
+        diagnostics["retry_attempt_extra_text_detected"] = bool(assessment["extra_text_detected"])
+        diagnostics["retry_attempt_json_object_count"] = int(assessment["json_object_count"])
 
     def _build_structured_reply_candidate(
         self,
@@ -3651,38 +3755,39 @@ class BrowserChatGPTTransport:
                 bool(retry_assessment["prose_contamination"]) if retry_assessment is not None else False
             ),
             "retry_attempt_wrapper_only": bool(retry_assessment["wrapper_only"]) if retry_assessment is not None else False,
+            "retry_attempt_block_count": int(retry_assessment["block_count"]) if retry_assessment is not None else 0,
+            "retry_attempt_exact_block_only": (
+                bool(retry_assessment["exact_block_only"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_extra_text_detected": (
+                bool(retry_assessment["extra_text_detected"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_json_object_count": (
+                int(retry_assessment["json_object_count"]) if retry_assessment is not None else 0
+            ),
             "final_capture_failure_reason": "",
         }
-        if retry_assessment is not None and retry_assessment["selected_text"]:
+        retry_assessment_selected = bool(retry_assessment is not None and retry_assessment["selected_text"])
+        if retry_assessment_selected:
             diagnostics["retry_seed_valid"] = True
             diagnostics["retry_seed_validity_reason"] = "parseable_structured_json"
             diagnostics["retry_seed_validity_reason_source"] = "final_reply"
             return str(retry_assessment["selected_text"]), diagnostics
-        if parsed.strip() and final_reply_retry_safe:
+        if parsed.strip() and final_reply_retry_safe and not retry_attempt:
             diagnostics["retry_seed_valid"] = True
             return parsed, diagnostics
 
         diagnostics["salvage_attempted"] = best_structured is not None
-        if best_retry_safe is not None and best_retry_safe.parsed_text.strip():
-            retry_safe_assessment = (
-                self._assess_retry_attempt_response(best_retry_safe.raw_text, candidate_source=best_retry_safe.source)
-                if retry_attempt
-                else None
-            )
-            if retry_safe_assessment is not None and not retry_safe_assessment["selected_text"]:
-                diagnostics["retry_attempt_acceptance_tier"] = str(retry_safe_assessment["acceptance_tier"])
-                diagnostics["retry_attempt_failure_reason"] = str(retry_safe_assessment["failure_reason"])
-                diagnostics["retry_attempt_structured_block_found"] = bool(retry_safe_assessment["structured_block_found"])
-                diagnostics["retry_attempt_parseable"] = bool(retry_safe_assessment["parseable"])
-                diagnostics["retry_attempt_prose_contamination"] = bool(retry_safe_assessment["prose_contamination"])
-                diagnostics["retry_attempt_wrapper_only"] = bool(retry_safe_assessment["wrapper_only"])
-            elif retry_safe_assessment is not None:
-                diagnostics["retry_attempt_acceptance_tier"] = str(retry_safe_assessment["acceptance_tier"])
-                diagnostics["retry_attempt_failure_reason"] = str(retry_safe_assessment["failure_reason"])
-                diagnostics["retry_attempt_structured_block_found"] = bool(retry_safe_assessment["structured_block_found"])
-                diagnostics["retry_attempt_parseable"] = bool(retry_safe_assessment["parseable"])
-                diagnostics["retry_attempt_prose_contamination"] = bool(retry_safe_assessment["prose_contamination"])
-                diagnostics["retry_attempt_wrapper_only"] = bool(retry_safe_assessment["wrapper_only"])
+        retry_safe_assessment = (
+            self._assess_retry_attempt_response(best_retry_safe.raw_text, candidate_source=best_retry_safe.source)
+            if retry_attempt and best_retry_safe is not None and best_retry_safe.parsed_text.strip()
+            else None
+        )
+        if best_retry_safe is not None and best_retry_safe.parsed_text.strip() and (
+            not retry_attempt or (retry_safe_assessment is not None and retry_safe_assessment["selected_text"])
+        ):
+            if retry_safe_assessment is not None:
+                self._apply_retry_attempt_assessment(diagnostics, retry_safe_assessment)
             diagnostics["salvage_succeeded"] = True
             diagnostics["salvage_source"] = best_retry_safe.source
             diagnostics["retry_seed_valid"] = True
@@ -3699,12 +3804,7 @@ class BrowserChatGPTTransport:
                 else None
             )
             if salvage_assessment is not None:
-                diagnostics["retry_attempt_acceptance_tier"] = str(salvage_assessment["acceptance_tier"])
-                diagnostics["retry_attempt_failure_reason"] = str(salvage_assessment["failure_reason"])
-                diagnostics["retry_attempt_structured_block_found"] = bool(salvage_assessment["structured_block_found"])
-                diagnostics["retry_attempt_parseable"] = bool(salvage_assessment["parseable"])
-                diagnostics["retry_attempt_prose_contamination"] = bool(salvage_assessment["prose_contamination"])
-                diagnostics["retry_attempt_wrapper_only"] = bool(salvage_assessment["wrapper_only"])
+                self._apply_retry_attempt_assessment(diagnostics, salvage_assessment)
             diagnostics["salvage_preserved_for_diagnostics_only"] = True
             diagnostics["retry_seed_validity_reason"] = best_salvageable.retry_seed_validity_reason
             diagnostics["retry_seed_validity_reason_source"] = "best_salvageable_candidate"

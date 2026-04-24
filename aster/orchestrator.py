@@ -317,6 +317,7 @@ class AsterOrchestrator:
                     "retry_prompt_reason": prompt_package.retry_prompt_reason,
                     "retry_prompt_length": prompt_package.retry_prompt_length,
                     "retry_prompt_compacted_relative_to_original": prompt_package.retry_prompt_compacted_relative_to_original,
+                    "retry_output_strict_mode": bool(prompt_package.retry_prompt_mode),
                     **self._summarize_prompt_package(prompt_package),
                 },
             )
@@ -340,6 +341,7 @@ class AsterOrchestrator:
                         "retry_parse_text_source": "retry_text",
                         "retry_parse_failure_kind": retry_parse_failure_kind,
                         "retry_response_length": len(retried_raw),
+                        "retry_output_strict_mode": self._last_generation_metadata.get("retry_output_strict_mode", False),
                         "retry_attempt_capture_mode": self._last_generation_metadata.get("retry_attempt_capture_mode", ""),
                         "retry_attempt_acceptance_tier": self._last_generation_metadata.get(
                             "retry_attempt_acceptance_tier",
@@ -358,6 +360,19 @@ class AsterOrchestrator:
                         "retry_attempt_wrapper_only": self._last_generation_metadata.get(
                             "retry_attempt_wrapper_only",
                             False,
+                        ),
+                        "retry_attempt_block_count": self._last_generation_metadata.get("retry_attempt_block_count", 0),
+                        "retry_attempt_exact_block_only": self._last_generation_metadata.get(
+                            "retry_attempt_exact_block_only",
+                            False,
+                        ),
+                        "retry_attempt_extra_text_detected": self._last_generation_metadata.get(
+                            "retry_attempt_extra_text_detected",
+                            False,
+                        ),
+                        "retry_attempt_json_object_count": self._last_generation_metadata.get(
+                            "retry_attempt_json_object_count",
+                            0,
                         ),
                     },
                 )
@@ -588,7 +603,17 @@ class AsterOrchestrator:
         cleaned = raw_text.strip()
         if not cleaned:
             return "empty_text"
+        block_count = cleaned.upper().count("ASTER_PATCH_BEGIN")
+        if block_count > 1:
+            return "multiple_retry_blocks"
         extracted = extract_structured_block(raw_text).strip()
+        outside = cleaned
+        if extracted and extracted in outside:
+            outside = outside.replace(extracted, " ", 1)
+        outside = outside.replace("ASTER_PATCH_BEGIN", " ").replace("ASTER_PATCH_END", " ")
+        extra_text_detected = bool(" ".join(outside.split()))
+        if extracted and extra_text_detected:
+            return "prose_contamination"
         if extracted:
             return "malformed_structured_text"
         lowered = cleaned.lower()

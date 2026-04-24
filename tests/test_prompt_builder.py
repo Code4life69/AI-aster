@@ -104,12 +104,13 @@ def test_browser_retry_without_seed_uses_stricter_prompt_variant() -> None:
 
     retry_message = package.messages[-1]["content"]
     assert package.approx_chars <= 5_000
-    assert package.retry_prompt_mode == "browser_no_seed_retry"
-    assert package.retry_prompt_strategy == "browser_retry_without_prior_text"
+    assert package.retry_prompt_mode == "browser_structured_output_only_retry"
+    assert package.retry_prompt_strategy == "browser_retry_structured_output_only"
     assert package.retry_prompt_reason == "missing_required_schema_keys"
     assert "Rejected prior response excerpt:" not in retry_message
     assert "Required top-level keys" in retry_message
     assert "Return only one final ASTER_PATCH_BEGIN / ASTER_PATCH_END block." in retry_message
+    assert "Any text before or after the block will fail validation." in retry_message
 
 
 def test_browser_retry_prompt_varies_by_retry_reason() -> None:

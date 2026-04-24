@@ -176,7 +176,7 @@ class PromptBuilder:
         retry_rendered = self.estimate_rendered_length([retry_item])
         package_budget = max(
             1_600,
-            min(base_limit - retry_rendered - 2, int(base_limit * (0.62 if not retry_seed_used else 0.74))),
+            min(base_limit - retry_rendered - 2, int(base_limit * (0.5 if not retry_seed_used else 0.74))),
         )
         package = self.build(goal, context, history, mode="browser", max_chars=package_budget)
         available_retry_chars = max(200, base_limit - self.estimate_rendered_length(package.messages) - len("USER:\n"))
@@ -207,9 +207,15 @@ class PromptBuilder:
             included_files=package.included_files,
             omitted_files=package.omitted_files,
             compacted=True,
-            retry_prompt_mode="browser_seeded_retry" if retry_seed_used and prior_text else "browser_no_seed_retry",
+            retry_prompt_mode=(
+                "browser_seeded_retry"
+                if retry_seed_used and prior_text
+                else "browser_structured_output_only_retry"
+            ),
             retry_prompt_strategy=(
-                "browser_retry_with_prior_excerpt" if retry_seed_used and prior_text else "browser_retry_without_prior_text"
+                "browser_retry_with_prior_excerpt"
+                if retry_seed_used and prior_text
+                else "browser_retry_structured_output_only"
             ),
             retry_prompt_reason=retry_reason,
             retry_prompt_length=retry_prompt_length,
@@ -439,6 +445,7 @@ class PromptBuilder:
             f"- {self._retry_reason_instruction(retry_reason)}",
             "- Return only one final ASTER_PATCH_BEGIN / ASTER_PATCH_END block.",
             "- Inside the markers, output exactly one JSON object.",
+            "- Exactly one block is allowed. Any text before or after the block will fail validation.",
             '- Required top-level keys: "summary", "notes", "operations".',
             "- Do not add commentary, explanations, prose, markdown fences, or code outside the structured block.",
             "- Do not repeat prompt text, context listings, or browser instructions.",
