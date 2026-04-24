@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from aster.audit_logger import AuditLogger
+from aster.browser_core import extract_structured_block
 from aster.config import AsterConfig
 from aster.context_collector import CollectedContext, ContextCollector
 from aster.diff_preview import build_plan_preview
@@ -287,6 +288,8 @@ class AsterOrchestrator:
                 history,
                 mode,
                 prior_text=prior_text,
+                retry_reason=str(retry_seed_metadata["retry_seed_validity_reason"]),
+                retry_seed_used=prior_text is not None,
             )
             self.logger.log(
                 "prompt_retry",
@@ -298,12 +301,18 @@ class AsterOrchestrator:
                     "retry_seed_validity_reason": retry_seed_metadata["retry_seed_validity_reason"],
                     "retry_seed_validity_reason_source": retry_seed_metadata["retry_seed_validity_reason_source"],
                     "retry_prior_response_length": len(prior_text or ""),
+                    "retry_prompt_mode": prompt_package.retry_prompt_mode,
+                    "retry_prompt_strategy": prompt_package.retry_prompt_strategy,
+                    "retry_prompt_reason": prompt_package.retry_prompt_reason,
+                    "retry_prompt_length": prompt_package.retry_prompt_length,
+                    "retry_prompt_compacted_relative_to_original": prompt_package.retry_prompt_compacted_relative_to_original,
                     **self._summarize_prompt_package(prompt_package),
                 },
             )
             try:
                 return self.parser.parse(retried_raw)
             except Exception as retry_parse_error:
+                retry_parse_failure_kind = self._classify_retry_parse_failure_text(retried_raw)
                 self.logger.log(
                     "retry_parse_failure",
                     {
@@ -317,6 +326,8 @@ class AsterOrchestrator:
                         "original_parse_text_source": "original_text",
                         "retry_parse_failure_reason": self._format_parse_failure_reason(retry_parse_error),
                         "retry_parse_text_source": "retry_text",
+                        "retry_parse_failure_kind": retry_parse_failure_kind,
+                        "retry_response_length": len(retried_raw),
                     },
                 )
                 if mode == "browser":
@@ -327,7 +338,8 @@ class AsterOrchestrator:
                     )
                     raise RuntimeError(
                         "Browser retry response was not machine-parseable. "
-                        f"Aster retried {seed_state}, but the follow-up response still could not be parsed."
+                        f"Aster retried {seed_state}, but the follow-up response still could not be parsed "
+                        f"({retry_parse_failure_kind})."
                     ) from retry_parse_error
                 raise
 
@@ -384,6 +396,8 @@ class AsterOrchestrator:
         *,
         sync_log: list[str] | None = None,
         prior_text: str | None = None,
+        retry_reason: str = "",
+        retry_seed_used: bool = False,
     ):
         budgets = self._prompt_budgets(mode)
         for attempt_index, budget in enumerate(budgets, start=1):
@@ -394,6 +408,8 @@ class AsterOrchestrator:
                 mode=mode,
                 max_chars=budget,
                 prior_text=prior_text,
+                retry_reason=retry_reason,
+                retry_seed_used=retry_seed_used,
             )
             if mode == "browser":
                 self._activity(
@@ -416,7 +432,12 @@ class AsterOrchestrator:
                     "goal": goal,
                     "sync_log": sync_log or [],
                     "attempt_index": attempt_index,
-                    "retry_prompt": prior_text is not None,
+                    "retry_prompt": bool(retry_reason) or prior_text is not None,
+                    "retry_prompt_mode": prompt_package.retry_prompt_mode,
+                    "retry_prompt_strategy": prompt_package.retry_prompt_strategy,
+                    "retry_prompt_reason": prompt_package.retry_prompt_reason,
+                    "retry_prompt_length": prompt_package.retry_prompt_length,
+                    "retry_prompt_compacted_relative_to_original": prompt_package.retry_prompt_compacted_relative_to_original,
                     **self._summarize_prompt_package(prompt_package),
                 },
             )
@@ -458,8 +479,10 @@ class AsterOrchestrator:
         mode: str,
         max_chars: int,
         prior_text: str | None = None,
+        retry_reason: str = "",
+        retry_seed_used: bool = False,
     ):
-        if prior_text is None:
+        if prior_text is None and not retry_reason:
             return self.prompt_builder.build(
                 goal,
                 context,
@@ -474,6 +497,8 @@ class AsterOrchestrator:
             prior_text,
             mode=mode,
             max_chars=max_chars,
+            retry_reason=retry_reason,
+            retry_seed_used=retry_seed_used,
         )
 
     def _prompt_budgets(self, mode: str) -> list[int]:
@@ -519,3 +544,27 @@ class AsterOrchestrator:
             "compacted": prompt_package.compacted,
             "user_preview": user_message[:1200],
         }
+
+    @staticmethod
+    def _classify_retry_parse_failure_text(raw_text: str) -> str:
+        cleaned = raw_text.strip()
+        if not cleaned:
+            return "empty_text"
+        extracted = extract_structured_block(raw_text).strip()
+        if extracted:
+            return "malformed_structured_text"
+        lowered = cleaned.lower()
+        contamination_markers = (
+            "user goal:",
+            "project summary:",
+            "relevant file tree:",
+            "relevant file contents:",
+            "conversation history:",
+            "constraints:",
+            "context omitted for browser size safety",
+            "previous response was rejected",
+            "retry mode for browser output",
+        )
+        if any(marker in lowered for marker in contamination_markers):
+            return "prose_contamination"
+        return "non_json_text"

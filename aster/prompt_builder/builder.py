@@ -78,6 +78,11 @@ class PromptPackage:
     included_files: list[str]
     omitted_files: list[str]
     compacted: bool
+    retry_prompt_mode: str = ""
+    retry_prompt_strategy: str = ""
+    retry_prompt_reason: str = ""
+    retry_prompt_length: int = 0
+    retry_prompt_compacted_relative_to_original: bool = False
 
 
 class PromptBuilder:
@@ -109,16 +114,30 @@ class PromptBuilder:
         goal: str,
         context: CollectedContext,
         history: list[SessionTurn],
-        prior_text: str,
+        prior_text: str | None,
         *,
         mode: str = "api",
         max_chars: int | None = None,
+        retry_reason: str = "",
+        retry_seed_used: bool = True,
     ) -> PromptPackage:
         if mode == "browser":
-            return self._build_browser_retry(goal, context, history, prior_text, max_chars=max_chars)
+            return self._build_browser_retry(
+                goal,
+                context,
+                history,
+                prior_text,
+                max_chars=max_chars,
+                retry_reason=retry_reason,
+                retry_seed_used=retry_seed_used,
+            )
         retry_item = {
             "role": "user",
-            "content": self._build_retry_message(prior_text),
+            "content": self._build_retry_message(
+                prior_text or "",
+                retry_reason=retry_reason,
+                retry_seed_used=retry_seed_used,
+            ),
         }
         package = self.build(goal, context, history, mode=mode, max_chars=max_chars)
         messages = [*package.messages, retry_item]
@@ -128,6 +147,11 @@ class PromptBuilder:
             included_files=package.included_files,
             omitted_files=package.omitted_files,
             compacted=package.compacted,
+            retry_prompt_mode="seeded_retry" if retry_seed_used and prior_text else "no_seed_retry",
+            retry_prompt_strategy="strict_retry_prompt",
+            retry_prompt_reason=retry_reason,
+            retry_prompt_length=len(retry_item["content"]),
+            retry_prompt_compacted_relative_to_original=package.compacted,
         )
 
     def _build_browser_retry(
@@ -135,30 +159,47 @@ class PromptBuilder:
         goal: str,
         context: CollectedContext,
         history: list[SessionTurn],
-        prior_text: str,
+        prior_text: str | None,
         *,
         max_chars: int | None,
+        retry_reason: str,
+        retry_seed_used: bool,
     ) -> PromptPackage:
         base_limit = max_chars or BROWSER_PROMPT_CHAR_LIMIT
-        retry_message = self._build_retry_message(prior_text, max_chars=min(4_000, max(600, base_limit // 3)))
+        retry_message = self._build_browser_retry_message(
+            prior_text,
+            retry_reason=retry_reason,
+            retry_seed_used=retry_seed_used,
+            max_chars=min(4_000, max(900, base_limit // 3)),
+        )
         retry_item = {"role": "user", "content": retry_message}
         retry_rendered = self.estimate_rendered_length([retry_item])
-        package_budget = max(2_000, base_limit - retry_rendered - 2)
+        package_budget = max(
+            1_600,
+            min(base_limit - retry_rendered - 2, int(base_limit * (0.62 if not retry_seed_used else 0.74))),
+        )
         package = self.build(goal, context, history, mode="browser", max_chars=package_budget)
         available_retry_chars = max(200, base_limit - self.estimate_rendered_length(package.messages) - len("USER:\n"))
         retry_item = {
             "role": "user",
-            "content": self._build_retry_message(prior_text, max_chars=available_retry_chars),
+            "content": self._build_browser_retry_message(
+                prior_text,
+                retry_reason=retry_reason,
+                retry_seed_used=retry_seed_used,
+                max_chars=available_retry_chars,
+            ),
         }
         messages = [*package.messages, retry_item]
         if self.estimate_rendered_length(messages) > base_limit:
             package_budget = max(1_200, base_limit - self.estimate_rendered_length([retry_item]) - 2)
             package = self.build(goal, context, history, mode="browser", max_chars=package_budget)
             messages = [*package.messages, retry_item]
-        messages = self._shrink_messages_to_limit(
+        messages, retry_prompt_length = self._shrink_messages_to_limit(
             package.messages,
             prior_text,
             base_limit=base_limit,
+            retry_reason=retry_reason,
+            retry_seed_used=retry_seed_used,
         )
         return PromptPackage(
             messages=messages,
@@ -166,6 +207,13 @@ class PromptBuilder:
             included_files=package.included_files,
             omitted_files=package.omitted_files,
             compacted=True,
+            retry_prompt_mode="browser_seeded_retry" if retry_seed_used and prior_text else "browser_no_seed_retry",
+            retry_prompt_strategy=(
+                "browser_retry_with_prior_excerpt" if retry_seed_used and prior_text else "browser_retry_without_prior_text"
+            ),
+            retry_prompt_reason=retry_reason,
+            retry_prompt_length=retry_prompt_length,
+            retry_prompt_compacted_relative_to_original=True,
         )
 
     @staticmethod
@@ -334,35 +382,120 @@ class PromptBuilder:
         return "\n".join(entries) or "[none]"
 
     @staticmethod
-    def _build_retry_message(prior_text: str, max_chars: int = 4_000) -> str:
+    def _retry_reason_instruction(retry_reason: str) -> str:
+        if retry_reason == "unbalanced_structure":
+            return (
+                "The previous browser reply looked truncated. "
+                "Return one complete structured response with balanced braces/brackets and a finished operations array."
+            )
+        if retry_reason == "missing_required_schema_keys":
+            return (
+                "The previous browser reply was missing required schema keys. "
+                "Include summary, notes, and operations, and ensure every operation includes type, path, and reason."
+            )
+        if retry_reason == "prompt_or_preamble_contamination":
+            return (
+                "The previous browser reply included prompt or preamble contamination. "
+                "Return only the final structured response, with no copied prompt text."
+            )
+        if retry_reason == "empty_response":
+            return "The previous browser reply did not produce usable structured output. Return the final structured response only."
+        return "The previous browser reply was not machine-parseable. Return one complete structured response only."
+
+    def _build_retry_message(
+        self,
+        prior_text: str,
+        *,
+        max_chars: int = 4_000,
+        retry_reason: str = "",
+        retry_seed_used: bool = True,
+    ) -> str:
         header = (
-            "Your previous response was rejected because it was vague or not actionable.\n"
+            "Your previous response was rejected because it was not machine-parseable.\n"
+            f"{self._retry_reason_instruction(retry_reason)}\n"
             "Return JSON only with one or more exact operations.\n"
-            "Previous response:\n"
         )
+        if not retry_seed_used or not prior_text.strip():
+            return header
+        header += "Previous response:\n"
         available = max(0, max_chars - len(header))
         excerpt = prior_text[:available]
         if available < len(prior_text):
             excerpt = excerpt.rstrip() + "...[TRUNCATED]"
         return header + excerpt
 
+    def _build_browser_retry_message(
+        self,
+        prior_text: str | None,
+        *,
+        retry_reason: str,
+        retry_seed_used: bool,
+        max_chars: int,
+    ) -> str:
+        lines = [
+            "Retry mode for browser output:",
+            "- The previous browser response was invalid or incomplete.",
+            f"- Failure mode: {retry_reason or 'not_machine_parseable'}.",
+            f"- {self._retry_reason_instruction(retry_reason)}",
+            "- Return only one final ASTER_PATCH_BEGIN / ASTER_PATCH_END block.",
+            "- Inside the markers, output exactly one JSON object.",
+            '- Required top-level keys: "summary", "notes", "operations".',
+            "- Do not add commentary, explanations, prose, markdown fences, or code outside the structured block.",
+            "- Do not repeat prompt text, context listings, or browser instructions.",
+            "- If the provided context is insufficient, return NEED THESE FILES FIRST operations inside the JSON object.",
+        ]
+        if retry_seed_used and prior_text and prior_text.strip():
+            lines.extend(
+                [
+                    "",
+                    "Rejected prior response excerpt:",
+                    prior_text,
+                ]
+            )
+        raw = "\n".join(lines)
+        if len(raw) <= max_chars:
+            return raw
+        if retry_seed_used and prior_text and prior_text.strip():
+            prefix = "\n".join(lines[:-1])
+            excerpt_header = "\nRejected prior response excerpt:\n"
+            available = max(0, max_chars - len(prefix) - len(excerpt_header))
+            excerpt = prior_text[:available]
+            if available < len(prior_text):
+                excerpt = excerpt.rstrip() + "...[TRUNCATED]"
+            return prefix + excerpt_header + excerpt
+        return raw[:max_chars].rstrip()
+
     def _shrink_messages_to_limit(
         self,
         base_messages: list[dict[str, str]],
-        prior_text: str,
+        prior_text: str | None,
         *,
         base_limit: int,
-    ) -> list[dict[str, str]]:
+        retry_reason: str,
+        retry_seed_used: bool,
+    ) -> tuple[list[dict[str, str]], int]:
         retry_limit = max(200, base_limit)
-        messages = [*base_messages, {"role": "user", "content": self._build_retry_message(prior_text, max_chars=retry_limit)}]
+        retry_message = self._build_browser_retry_message(
+            prior_text,
+            retry_reason=retry_reason,
+            retry_seed_used=retry_seed_used,
+            max_chars=retry_limit,
+        )
+        messages = [*base_messages, {"role": "user", "content": retry_message}]
         while self.estimate_rendered_length(messages) > base_limit and retry_limit > 200:
             excess = self.estimate_rendered_length(messages) - base_limit
             next_limit = max(200, retry_limit - excess - 24)
             if next_limit >= retry_limit:
                 break
             retry_limit = next_limit
+            retry_message = self._build_browser_retry_message(
+                prior_text,
+                retry_reason=retry_reason,
+                retry_seed_used=retry_seed_used,
+                max_chars=retry_limit,
+            )
             messages = [
                 *base_messages,
-                {"role": "user", "content": self._build_retry_message(prior_text, max_chars=retry_limit)},
+                {"role": "user", "content": retry_message},
             ]
-        return messages
+        return messages, len(retry_message)

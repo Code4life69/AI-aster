@@ -252,6 +252,8 @@ def test_parse_with_retry_omits_invalid_browser_retry_seed(tmp_path: Path) -> No
 
     def _retry_generate(*_args, **kwargs):
         calls.append(kwargs.get("prior_text"))
+        calls.append(kwargs.get("retry_reason"))
+        calls.append(kwargs.get("retry_seed_used"))
 
         class _PromptPackage:
             messages = [{"role": "user", "content": "retry"}]
@@ -259,6 +261,11 @@ def test_parse_with_retry_omits_invalid_browser_retry_seed(tmp_path: Path) -> No
             included_files = []
             omitted_files = []
             compacted = False
+            retry_prompt_mode = "browser_no_seed_retry"
+            retry_prompt_strategy = "browser_retry_without_prior_text"
+            retry_prompt_reason = "unbalanced_structure"
+            retry_prompt_length = 5
+            retry_prompt_compacted_relative_to_original = True
 
         return (
             '{"summary":"ok","notes":[],"operations":[{"type":"NEED THESE FILES FIRST","path":"README.md","reason":"need context"}]}',
@@ -276,13 +283,16 @@ def test_parse_with_retry_omits_invalid_browser_retry_seed(tmp_path: Path) -> No
 
     plan = orchestrator._parse_with_retry("build app", context, [], "browser", "")
 
-    assert calls == [None]
+    assert calls == [None, "unbalanced_structure", False]
     assert plan.requires_more_files() is True
     prompt_retry_payload = next(payload for namespace, payload in logger.entries if namespace == "prompt_retry")
     assert prompt_retry_payload["retry_seed_used"] is False
     assert prompt_retry_payload["retry_seed_validity_reason"] == "unbalanced_structure"
     assert prompt_retry_payload["retry_seed_validity_reason_source"] == "best_salvageable_candidate"
     assert prompt_retry_payload["retry_prior_response_length"] == 0
+    assert prompt_retry_payload["retry_prompt_mode"] == "browser_no_seed_retry"
+    assert prompt_retry_payload["retry_prompt_strategy"] == "browser_retry_without_prior_text"
+    assert prompt_retry_payload["retry_prompt_reason"] == "unbalanced_structure"
 
 
 def test_parse_with_retry_wraps_non_parseable_browser_retry_response(tmp_path: Path) -> None:
@@ -305,6 +315,8 @@ def test_parse_with_retry_wraps_non_parseable_browser_retry_response(tmp_path: P
 
     def _retry_generate(*_args, **kwargs):
         retry_calls.append(kwargs.get("prior_text"))
+        retry_calls.append(kwargs.get("retry_reason"))
+        retry_calls.append(kwargs.get("retry_seed_used"))
 
         class _PromptPackage:
             messages = [{"role": "user", "content": "retry"}]
@@ -312,8 +324,13 @@ def test_parse_with_retry_wraps_non_parseable_browser_retry_response(tmp_path: P
             included_files = []
             omitted_files = []
             compacted = False
+            retry_prompt_mode = "browser_no_seed_retry"
+            retry_prompt_strategy = "browser_retry_without_prior_text"
+            retry_prompt_reason = "missing_required_schema_keys"
+            retry_prompt_length = 5
+            retry_prompt_compacted_relative_to_original = True
 
-        return ("not json", _PromptPackage())
+        return ("assistant reply without any structured payload", _PromptPackage())
 
     orchestrator._generate_with_prompt_retries = _retry_generate
     context = CollectedContext(
@@ -327,10 +344,11 @@ def test_parse_with_retry_wraps_non_parseable_browser_retry_response(tmp_path: P
     with pytest.raises(RuntimeError, match="Browser retry response was not machine-parseable"):
         orchestrator._parse_with_retry("build app", context, [], "browser", "")
 
-    assert retry_calls == [None]
+    assert retry_calls == [None, "missing_required_schema_keys", False]
     retry_parse_failure = next(payload for namespace, payload in logger.entries if namespace == "retry_parse_failure")
     assert retry_parse_failure["retry_seed_used"] is False
     assert retry_parse_failure["retry_prior_response_length"] == 0
     assert retry_parse_failure["retry_seed_validity_reason"] == "missing_required_schema_keys"
     assert retry_parse_failure["retry_seed_validity_reason_source"] == "best_salvageable_candidate"
     assert retry_parse_failure["retry_parse_text_source"] == "retry_text"
+    assert retry_parse_failure["retry_parse_failure_kind"] == "malformed_structured_text"
