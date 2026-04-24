@@ -709,6 +709,43 @@ def test_finalize_captured_reply_preserves_partial_structured_candidate_for_diag
     assert diagnostics["final_capture_failure_reason"] == "structured_block_seen_but_not_retry_safe"
 
 
+def test_finalize_captured_reply_retry_attempt_cleans_parseable_block_with_prose() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "Here is the corrected result.\n"
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}\n'
+            "ASTER_PATCH_END\n"
+            "No other commentary is needed."
+        ),
+        retry_attempt=True,
+    )
+
+    assert looks_like_patch_plan_json(parsed) is True
+    assert '"saved.py"' in parsed
+    assert diagnostics["retry_attempt_capture_mode"] == "structured_block_first"
+    assert diagnostics["retry_attempt_acceptance_tier"] == "retry_structured_cleaned"
+    assert diagnostics["retry_attempt_parseable"] is True
+    assert diagnostics["retry_attempt_prose_contamination"] is True
+    assert diagnostics["retry_attempt_wrapper_only"] is False
+
+
+def test_finalize_captured_reply_retry_attempt_classifies_wrapper_only() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        "ASTER_PATCH_BEGIN\n{\"summary\":\"ok\"\nASTER_PATCH_END",
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
+    assert diagnostics["retry_attempt_failure_reason"] == "wrapper_without_valid_json"
+    assert diagnostics["retry_attempt_wrapper_only"] is True
+    assert diagnostics["retry_attempt_structured_block_found"] is True
+
+
 def test_capture_reply_text_does_not_require_anchor_when_thread_was_not_reused(monkeypatch) -> None:
     transport = BrowserChatGPTTransport(thread_reuse_enabled=True)
     transport._executor = _FakeExecutor("")
@@ -840,6 +877,49 @@ def test_capture_reply_text_blocks_one_shot_scrolled_structured_candidate(monkey
     assert scroll_events
     assert scroll_events[-1]["acceptance_tier"] == "scrolled_structured"
     assert scroll_events[-1]["accepted"] is False
+
+
+def test_capture_reply_text_retry_attempt_prefers_exact_structured_block(monkeypatch) -> None:
+    transport = BrowserChatGPTTransport()
+    transport._executor = _FakeExecutor("")
+    transport._capture = _FakeCaptureService()
+    transport._ocr = _FakeOCR()
+    transport._ui_state = lambda target: {
+        "show_in_text_field_present": False,
+        "send_prompt_present": False,
+        "send_prompt_enabled": None,
+        "stop_streaming_present": False,
+    }
+    transport._raise_for_browser_error = lambda lines, ui_state, stage: None
+    reply_text = (
+        "Sure, here is the final answer.\n"
+        "ASTER_PATCH_BEGIN\n"
+        '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}\n'
+        "ASTER_PATCH_END\n"
+        "Done."
+    )
+    replies = iter([("", reply_text)])
+    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: next(replies)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("aster.transport_browser.browser_transport.time.monotonic", _MonotonicClock())
+
+    class _Target:
+        left = 0
+        top = 0
+        width = 1200
+        height = 900
+
+    reply = transport._capture_reply_text(
+        _Target(),
+        before_lines=[],
+        prompt="retry create app",
+        timeout_sec=4.0,
+        retry_attempt=True,
+    )
+
+    assert looks_like_patch_plan_json(reply) is True
+    assert reply.strip().startswith("{")
+    assert "ASTER_PATCH_BEGIN" not in reply
 
 
 def test_generate_salvages_final_structured_block_from_trusted_capture(monkeypatch) -> None:

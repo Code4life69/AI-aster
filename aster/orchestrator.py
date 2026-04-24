@@ -247,7 +247,15 @@ class AsterOrchestrator:
     def sync_runtime_logs(self, message: str = "Aster runtime sync") -> list[str]:
         return self._sync_repo_state(message, paths=list(self.RUNTIME_LOG_PATHS))
 
-    def _generate(self, mode: str, messages: list[dict[str, str]]) -> str:
+    def _generate(
+        self,
+        mode: str,
+        messages: list[dict[str, str]],
+        *,
+        retry_attempt: bool = False,
+        retry_prompt_mode: str = "",
+        retry_prompt_reason: str = "",
+    ) -> str:
         if mode == "browser":
             if not self.config.browser_mode_enabled:
                 raise RuntimeError("Browser mode is disabled in configuration.")
@@ -256,6 +264,9 @@ class AsterOrchestrator:
                 prompt,
                 chatgpt_url=self.config.chatgpt_url,
                 launch_timeout_sec=float(self.config.browser_launch_timeout_seconds),
+                retry_attempt=retry_attempt,
+                retry_prompt_mode=retry_prompt_mode,
+                retry_reason=retry_prompt_reason,
             )
             self._last_generation_metadata = dict(result.metadata)
             self.logger.log("browser_result", result.metadata)
@@ -313,6 +324,7 @@ class AsterOrchestrator:
                 return self.parser.parse(retried_raw)
             except Exception as retry_parse_error:
                 retry_parse_failure_kind = self._classify_retry_parse_failure_text(retried_raw)
+                retry_attempt_failure_reason = str(self._last_generation_metadata.get("retry_attempt_failure_reason", ""))
                 self.logger.log(
                     "retry_parse_failure",
                     {
@@ -328,6 +340,25 @@ class AsterOrchestrator:
                         "retry_parse_text_source": "retry_text",
                         "retry_parse_failure_kind": retry_parse_failure_kind,
                         "retry_response_length": len(retried_raw),
+                        "retry_attempt_capture_mode": self._last_generation_metadata.get("retry_attempt_capture_mode", ""),
+                        "retry_attempt_acceptance_tier": self._last_generation_metadata.get(
+                            "retry_attempt_acceptance_tier",
+                            "",
+                        ),
+                        "retry_attempt_failure_reason": retry_attempt_failure_reason,
+                        "retry_attempt_structured_block_found": self._last_generation_metadata.get(
+                            "retry_attempt_structured_block_found",
+                            False,
+                        ),
+                        "retry_attempt_parseable": self._last_generation_metadata.get("retry_attempt_parseable", False),
+                        "retry_attempt_prose_contamination": self._last_generation_metadata.get(
+                            "retry_attempt_prose_contamination",
+                            False,
+                        ),
+                        "retry_attempt_wrapper_only": self._last_generation_metadata.get(
+                            "retry_attempt_wrapper_only",
+                            False,
+                        ),
                     },
                 )
                 if mode == "browser":
@@ -336,10 +367,11 @@ class AsterOrchestrator:
                         if prior_text is not None
                         else "without reusing any preserved retry seed"
                     )
+                    failure_label = retry_attempt_failure_reason or retry_parse_failure_kind
                     raise RuntimeError(
                         "Browser retry response was not machine-parseable. "
                         f"Aster retried {seed_state}, but the follow-up response still could not be parsed "
-                        f"({retry_parse_failure_kind})."
+                        f"({failure_label})."
                     ) from retry_parse_error
                 raise
 
@@ -448,7 +480,13 @@ class AsterOrchestrator:
                 details={"attempt_index": attempt_index},
             )
             try:
-                return self._generate(mode, prompt_package.messages), prompt_package
+                return self._generate(
+                    mode,
+                    prompt_package.messages,
+                    retry_attempt=bool(prompt_package.retry_prompt_mode),
+                    retry_prompt_mode=prompt_package.retry_prompt_mode,
+                    retry_prompt_reason=prompt_package.retry_prompt_reason,
+                ), prompt_package
             except RuntimeError as exc:
                 if mode != "browser" or not self._is_prompt_too_large_error(exc) or attempt_index >= len(budgets):
                     raise

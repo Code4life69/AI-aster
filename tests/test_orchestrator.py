@@ -352,3 +352,56 @@ def test_parse_with_retry_wraps_non_parseable_browser_retry_response(tmp_path: P
     assert retry_parse_failure["retry_seed_validity_reason_source"] == "best_salvageable_candidate"
     assert retry_parse_failure["retry_parse_text_source"] == "retry_text"
     assert retry_parse_failure["retry_parse_failure_kind"] == "malformed_structured_text"
+
+
+def test_parse_with_retry_uses_retry_attempt_failure_reason_in_browser_error(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sync_with_remote = False
+    orchestrator = AsterOrchestrator(config)
+    orchestrator._last_generation_metadata = {
+        "retry_seed_valid": False,
+        "retry_seed_validity_reason": "unbalanced_structure",
+        "retry_seed_validity_reason_source": "best_salvageable_candidate",
+    }
+
+    def _parse(raw_text: str):
+        raise json.JSONDecodeError("bad json", raw_text or "", 0)
+
+    orchestrator.parser.parse = _parse
+
+    def _retry_generate(*_args, **_kwargs):
+        orchestrator._last_generation_metadata = {
+            "retry_attempt_capture_mode": "structured_block_first",
+            "retry_attempt_acceptance_tier": "blocked_or_ambiguous",
+            "retry_attempt_failure_reason": "wrapper_without_valid_json",
+            "retry_attempt_structured_block_found": True,
+            "retry_attempt_parseable": False,
+            "retry_attempt_prose_contamination": False,
+            "retry_attempt_wrapper_only": True,
+        }
+
+        class _PromptPackage:
+            messages = [{"role": "user", "content": "retry"}]
+            approx_chars = 5
+            included_files = []
+            omitted_files = []
+            compacted = False
+            retry_prompt_mode = "browser_no_seed_retry"
+            retry_prompt_strategy = "browser_retry_without_prior_text"
+            retry_prompt_reason = "unbalanced_structure"
+            retry_prompt_length = 5
+            retry_prompt_compacted_relative_to_original = True
+
+        return ("ASTER_PATCH_BEGIN\n{\"summary\":\"bad\"\nASTER_PATCH_END", _PromptPackage())
+
+    orchestrator._generate_with_prompt_retries = _retry_generate
+    context = CollectedContext(
+        project_root=tmp_path,
+        project_summary="demo",
+        file_tree="demo/",
+        relevant_files=[],
+        skipped_files=[],
+    )
+
+    with pytest.raises(RuntimeError, match="wrapper_without_valid_json"):
+        orchestrator._parse_with_retry("build app", context, [], "browser", "")
