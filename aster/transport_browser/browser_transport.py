@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import re
 import subprocess
@@ -1203,6 +1204,22 @@ class BrowserChatGPTTransport:
                     "retry_attempt_json_object_count": final_capture_diagnostics.get(
                         "retry_attempt_json_object_count",
                         0,
+                    ),
+                    "retry_attempt_selected_block_index": final_capture_diagnostics.get(
+                        "retry_attempt_selected_block_index",
+                        None,
+                    ),
+                    "retry_attempt_block_selection_reason": final_capture_diagnostics.get(
+                        "retry_attempt_block_selection_reason",
+                        "",
+                    ),
+                    "retry_attempt_multiple_blocks_ambiguous": final_capture_diagnostics.get(
+                        "retry_attempt_multiple_blocks_ambiguous",
+                        False,
+                    ),
+                    "retry_attempt_multiple_blocks_recovered": final_capture_diagnostics.get(
+                        "retry_attempt_multiple_blocks_recovered",
+                        False,
                     ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
@@ -3522,11 +3539,140 @@ class BrowserChatGPTTransport:
         normalized = raw_text.upper()
         return normalized.count("ASTER_PATCH_BEGIN")
 
+    @staticmethod
+    def _extract_retry_attempt_blocks(raw_text: str) -> list[dict[str, Any]]:
+        if not raw_text.strip():
+            return []
+        blocks: list[dict[str, Any]] = []
+        for index, match in enumerate(
+            re.finditer(
+                r"ASTER[_ ]PATCH[_ ]BEGIN\s*(.*?)\s*ASTER[_ ]PATCH[_ ]END",
+                raw_text,
+                flags=re.DOTALL | re.IGNORECASE,
+            ),
+            start=1,
+        ):
+            raw_block = match.group(0).strip()
+            extracted = extract_structured_block(raw_block).strip()
+            parseable = bool(extracted) and looks_like_patch_plan_json(extracted)
+            canonical_json = ""
+            if parseable:
+                try:
+                    canonical_json = json.dumps(json.loads(extracted), sort_keys=True, separators=(",", ":"))
+                except Exception:
+                    canonical_json = extracted
+            blocks.append(
+                {
+                    "index": index,
+                    "raw_block": raw_block,
+                    "extracted": extracted,
+                    "parseable": parseable,
+                    "canonical_json": canonical_json,
+                    "schema_hits": sum(1 for token in ('"summary"', '"notes"', '"operations"') if token in extracted),
+                    "brace_balance": extracted.count("{") - extracted.count("}"),
+                    "bracket_balance": extracted.count("[") - extracted.count("]"),
+                    "length": len(extracted),
+                }
+            )
+        return blocks
+
+    @staticmethod
+    def _select_single_retry_attempt_block(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(blocks) <= 1:
+            return {
+                "recovered": False,
+                "ambiguous": False,
+                "selected_block_index": None,
+                "selection_reason": "",
+                "failure_reason": "",
+                "selected_text": "",
+            }
+        parseable_blocks = [block for block in blocks if block["parseable"]]
+        if len(parseable_blocks) == 1:
+            selected = parseable_blocks[0]
+            return {
+                "recovered": True,
+                "ambiguous": False,
+                "selected_block_index": int(selected["index"]),
+                "selection_reason": "single_parseable_retry_block",
+                "failure_reason": "",
+                "selected_text": str(selected["extracted"]),
+            }
+        if len(parseable_blocks) > 1:
+            canonical = {str(block["canonical_json"]) for block in parseable_blocks if str(block["canonical_json"]).strip()}
+            if len(canonical) == 1:
+                selected = parseable_blocks[-1]
+                return {
+                    "recovered": True,
+                    "ambiguous": False,
+                    "selected_block_index": int(selected["index"]),
+                    "selection_reason": "duplicate_parseable_retry_blocks",
+                    "failure_reason": "",
+                    "selected_text": str(selected["extracted"]),
+                }
+            return {
+                "recovered": False,
+                "ambiguous": True,
+                "selected_block_index": None,
+                "selection_reason": "multiple_distinct_parseable_retry_blocks",
+                "failure_reason": "ambiguous_multiple_retry_blocks",
+                "selected_text": "",
+            }
+        ranked = sorted(
+            blocks,
+            key=lambda block: (
+                int(block["schema_hits"]),
+                -abs(int(block["brace_balance"])),
+                -abs(int(block["bracket_balance"])),
+                int(block["length"]),
+            ),
+            reverse=True,
+        )
+        if len(ranked) >= 2:
+            top = ranked[0]
+            second = ranked[1]
+            top_signature = (
+                int(top["schema_hits"]),
+                abs(int(top["brace_balance"])),
+                abs(int(top["bracket_balance"])),
+            )
+            second_signature = (
+                int(second["schema_hits"]),
+                abs(int(second["brace_balance"])),
+                abs(int(second["bracket_balance"])),
+            )
+            if top_signature == second_signature:
+                return {
+                    "recovered": False,
+                    "ambiguous": True,
+                    "selected_block_index": None,
+                    "selection_reason": "multiple_malformed_retry_blocks_tied",
+                    "failure_reason": "ambiguous_multiple_retry_blocks",
+                    "selected_text": "",
+                }
+        return {
+            "recovered": False,
+            "ambiguous": False,
+            "selected_block_index": int(ranked[0]["index"]) if ranked else None,
+            "selection_reason": "no_parseable_retry_block_selected",
+            "failure_reason": "no_single_retry_block_selected",
+            "selected_text": "",
+        }
+
     def _assess_retry_attempt_response(self, raw_text: str, *, candidate_source: str) -> dict[str, Any]:
         cleaned = raw_text.strip()
         extracted = extract_structured_block(cleaned).strip() if cleaned else ""
         lowered = _normalize(cleaned)
         block_count = self._count_retry_attempt_blocks(cleaned) if cleaned else 0
+        blocks = self._extract_retry_attempt_blocks(cleaned) if cleaned else []
+        block_selection = self._select_single_retry_attempt_block(blocks) if blocks else {
+            "recovered": False,
+            "ambiguous": False,
+            "selected_block_index": None,
+            "selection_reason": "",
+            "failure_reason": "",
+            "selected_text": "",
+        }
         outside_text = self._retry_attempt_outside_block_text(cleaned, extracted) if cleaned else ""
         exact_block_match = (
             re.fullmatch(r"\s*ASTER_PATCH_BEGIN\s*(.*?)\s*ASTER_PATCH_END\s*", cleaned, flags=re.DOTALL)
@@ -3535,7 +3681,9 @@ class BrowserChatGPTTransport:
         )
         exact_block_only = exact_block_match is not None and not outside_text
         parseable = bool(extracted) and looks_like_patch_plan_json(extracted)
-        json_object_count = 1 if parseable else 0
+        recovered_single_block = bool(block_count > 1 and block_selection["recovered"])
+        effective_parseable = parseable or recovered_single_block
+        json_object_count = 1 if effective_parseable else 0
         prose_contamination = bool(outside_text) or self._retry_seed_contaminated(cleaned) or "retry mode for browser output" in lowered
         marker_present = bool(
             "aster_patch_begin" in lowered or "aster patch begin" in lowered or "aster_patch_end" in lowered or "aster patch end" in lowered
@@ -3551,8 +3699,10 @@ class BrowserChatGPTTransport:
         )
         if not cleaned:
             failure_reason = "empty_retry_response"
+        elif block_count > 1 and block_selection["recovered"]:
+            failure_reason = ""
         elif block_count > 1:
-            failure_reason = "multiple_retry_blocks"
+            failure_reason = str(block_selection["failure_reason"] or "multiple_retry_blocks")
         elif parseable and exact_block_only and json_object_count == 1:
             failure_reason = ""
         elif parseable and not exact_block_only:
@@ -3570,7 +3720,7 @@ class BrowserChatGPTTransport:
         return {
             "candidate_source": candidate_source,
             "structured_block_found": bool(extracted),
-            "parseable": parseable,
+            "parseable": effective_parseable,
             "prose_contamination": prose_contamination,
             "wrapper_only": wrapper_only,
             "block_count": block_count,
@@ -3578,8 +3728,22 @@ class BrowserChatGPTTransport:
             "extra_text_detected": bool(outside_text),
             "json_object_count": json_object_count,
             "failure_reason": failure_reason,
-            "selected_text": extracted if parseable and exact_block_only and json_object_count == 1 else "",
-            "acceptance_tier": "retry_structured_exact" if parseable and exact_block_only and json_object_count == 1 else "blocked_or_ambiguous",
+            "selected_text": (
+                str(block_selection["selected_text"])
+                if recovered_single_block
+                else extracted if parseable and exact_block_only and json_object_count == 1 else ""
+            ),
+            "acceptance_tier": (
+                "retry_structured_recovered_single_block"
+                if recovered_single_block
+                else "retry_structured_exact"
+                if parseable and exact_block_only and json_object_count == 1
+                else "blocked_or_ambiguous"
+            ),
+            "selected_block_index": block_selection["selected_block_index"],
+            "block_selection_reason": str(block_selection["selection_reason"]),
+            "multiple_blocks_ambiguous": bool(block_count > 1 and block_selection["ambiguous"]),
+            "multiple_blocks_recovered": recovered_single_block,
         }
 
     @staticmethod
@@ -3594,6 +3758,10 @@ class BrowserChatGPTTransport:
         diagnostics["retry_attempt_exact_block_only"] = bool(assessment["exact_block_only"])
         diagnostics["retry_attempt_extra_text_detected"] = bool(assessment["extra_text_detected"])
         diagnostics["retry_attempt_json_object_count"] = int(assessment["json_object_count"])
+        diagnostics["retry_attempt_selected_block_index"] = assessment["selected_block_index"]
+        diagnostics["retry_attempt_block_selection_reason"] = str(assessment["block_selection_reason"])
+        diagnostics["retry_attempt_multiple_blocks_ambiguous"] = bool(assessment["multiple_blocks_ambiguous"])
+        diagnostics["retry_attempt_multiple_blocks_recovered"] = bool(assessment["multiple_blocks_recovered"])
 
     def _build_structured_reply_candidate(
         self,
@@ -3764,6 +3932,18 @@ class BrowserChatGPTTransport:
             ),
             "retry_attempt_json_object_count": (
                 int(retry_assessment["json_object_count"]) if retry_assessment is not None else 0
+            ),
+            "retry_attempt_selected_block_index": (
+                retry_assessment["selected_block_index"] if retry_assessment is not None else None
+            ),
+            "retry_attempt_block_selection_reason": (
+                str(retry_assessment["block_selection_reason"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_multiple_blocks_ambiguous": (
+                bool(retry_assessment["multiple_blocks_ambiguous"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_multiple_blocks_recovered": (
+                bool(retry_assessment["multiple_blocks_recovered"]) if retry_assessment is not None else False
             ),
             "final_capture_failure_reason": "",
         }

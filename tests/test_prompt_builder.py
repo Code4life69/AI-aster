@@ -111,6 +111,7 @@ def test_browser_retry_without_seed_uses_stricter_prompt_variant() -> None:
     assert "Required top-level keys" in retry_message
     assert "Return only one final ASTER_PATCH_BEGIN / ASTER_PATCH_END block." in retry_message
     assert "Any text before or after the block will fail validation." in retry_message
+    assert "Never repeat the block" in retry_message
 
 
 def test_browser_retry_prompt_varies_by_retry_reason() -> None:

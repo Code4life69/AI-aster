@@ -446,6 +446,7 @@ class PromptBuilder:
             "- Return only one final ASTER_PATCH_BEGIN / ASTER_PATCH_END block.",
             "- Inside the markers, output exactly one JSON object.",
             "- Exactly one block is allowed. Any text before or after the block will fail validation.",
+            "- Never repeat the block, provide alternatives, or output multiple versions.",
             '- Required top-level keys: "summary", "notes", "operations".',
             "- Do not add commentary, explanations, prose, markdown fences, or code outside the structured block.",
             "- Do not repeat prompt text, context listings, or browser instructions.",

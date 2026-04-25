@@ -374,6 +374,22 @@ class AsterOrchestrator:
                             "retry_attempt_json_object_count",
                             0,
                         ),
+                        "retry_attempt_selected_block_index": self._last_generation_metadata.get(
+                            "retry_attempt_selected_block_index",
+                            None,
+                        ),
+                        "retry_attempt_block_selection_reason": self._last_generation_metadata.get(
+                            "retry_attempt_block_selection_reason",
+                            "",
+                        ),
+                        "retry_attempt_multiple_blocks_ambiguous": self._last_generation_metadata.get(
+                            "retry_attempt_multiple_blocks_ambiguous",
+                            False,
+                        ),
+                        "retry_attempt_multiple_blocks_recovered": self._last_generation_metadata.get(
+                            "retry_attempt_multiple_blocks_recovered",
+                            False,
+                        ),
                     },
                 )
                 if mode == "browser":
