@@ -848,23 +848,28 @@ def test_finalize_captured_reply_retry_attempt_classifies_fragmented_multi_block
 
     parsed, diagnostics = transport._finalize_captured_reply(
         (
-            "ASTER_PATCH_BEGIN\n"
-            '{"summary":"first","notes":[],"operations":[{"type":"CREATE FILE","path":"one.txt","reason":"add","content":"one"}]\n'
-            "ASTER_PATCH_BEGIN\n"
-            '{"summary":"first","notes":[],"operations":[{"type":"CREATE FILE","path":"one.txt","reason":"add","content":"one"}]'
+            "ASTER_PATCH_BEGIN\nASTER_PATCH_END\n"
+            'ASTER_PATCH_BEGIN\n"summary":"first","notes":[],"operations":[{"type":"CREATE FILE","path":"one.txt","reason":"add","content":"one"}],,"extra":"bad"'
         ),
         retry_attempt=True,
     )
 
     assert parsed == ""
     assert diagnostics["retry_attempt_block_count"] == 2
-    assert diagnostics["retry_attempt_failure_reason"] == "fragmented_multi_block_retry_output"
+    assert diagnostics["retry_attempt_failure_reason"] == "fragment_repair_not_parseable"
     assert diagnostics["retry_attempt_multiple_blocks_recovered"] is False
     assert diagnostics["retry_attempt_multiple_blocks_ambiguous"] is False
-    assert diagnostics["retry_attempt_block_selection_reason"] == "fragmented_multi_block_fragments"
-    assert diagnostics["retry_attempt_block_relationship"] == "fragmented_blocks"
-    assert diagnostics["retry_attempt_block_forensics"][0]["has_end_marker"] is False
-    assert diagnostics["retry_attempt_block_forensics"][0]["payload_state"] == "partial_payload"
+    assert diagnostics["retry_attempt_block_selection_reason"] == "fragment_repair_not_parseable"
+    assert diagnostics["retry_attempt_block_relationship"] == "wrapper_only_plus_fragmented_block"
+    assert diagnostics["retry_attempt_block_forensics"][0]["block_kind"] == "wrapper_only_block"
+    assert diagnostics["retry_attempt_block_forensics"][1]["has_end_marker"] is False
+    assert diagnostics["retry_attempt_block_forensics"][1]["payload_state"] == "partial_payload"
+    assert diagnostics["retry_attempt_fragment_repair_pattern_matched"] is True
+    assert diagnostics["retry_attempt_fragment_repair_attempted"] is True
+    assert diagnostics["retry_attempt_fragment_repair_succeeded"] is False
+    assert diagnostics["retry_attempt_fragment_repair_reason"] == "repair_candidate_not_parseable"
+    assert diagnostics["retry_attempt_repaired_from_block_index"] == 2
+    assert diagnostics["retry_attempt_discarded_wrapper_only_block_index"] == 1
 
 
 def test_finalize_captured_reply_retry_attempt_classifies_wrapper_only_multi_block_output() -> None:
@@ -886,6 +891,53 @@ def test_finalize_captured_reply_retry_attempt_classifies_wrapper_only_multi_blo
     assert diagnostics["retry_attempt_block_selection_reason"] == "wrapper_only_multi_block_fragments"
     assert diagnostics["retry_attempt_block_relationship"] == "wrapper_only_blocks"
     assert all(item["block_kind"] == "wrapper_only_block" for item in diagnostics["retry_attempt_block_forensics"])
+
+
+def test_finalize_captured_reply_retry_attempt_repairs_wrapper_plus_bare_object_fragment() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\nASTER_PATCH_END\n"
+            'ASTER_PATCH_BEGIN\n"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"ok.txt","reason":"add","content":"ok"}]'
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"ok.txt","reason":"add","content":"ok"}]}'
+    assert diagnostics["retry_attempt_failure_reason"] == ""
+    assert diagnostics["retry_attempt_acceptance_tier"] == "retry_structured_repaired_fragment"
+    assert diagnostics["retry_attempt_multiple_blocks_recovered"] is True
+    assert diagnostics["retry_attempt_multiple_blocks_ambiguous"] is False
+    assert diagnostics["retry_attempt_selected_block_index"] == 2
+    assert diagnostics["retry_attempt_block_selection_reason"] == "repaired_fragmented_retry_block"
+    assert diagnostics["retry_attempt_block_relationship"] == "wrapper_only_plus_repaired_fragment"
+    assert diagnostics["retry_attempt_fragment_repair_pattern_matched"] is True
+    assert diagnostics["retry_attempt_fragment_repair_attempted"] is True
+    assert diagnostics["retry_attempt_fragment_repair_succeeded"] is True
+    assert diagnostics["retry_attempt_fragment_repair_reason"] == "wrapped_object_body_and_appended_end_marker"
+    assert diagnostics["retry_attempt_repaired_from_block_index"] == 2
+    assert diagnostics["retry_attempt_discarded_wrapper_only_block_index"] == 1
+
+
+def test_finalize_captured_reply_retry_attempt_does_not_repair_weak_fragment() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\nASTER_PATCH_END\n"
+            'ASTER_PATCH_BEGIN\n"summary":"weak fragment only"'
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
+    assert diagnostics["retry_attempt_failure_reason"] == "fragment_repair_insufficient_structure"
+    assert diagnostics["retry_attempt_multiple_blocks_recovered"] is False
+    assert diagnostics["retry_attempt_fragment_repair_pattern_matched"] is True
+    assert diagnostics["retry_attempt_fragment_repair_attempted"] is False
+    assert diagnostics["retry_attempt_fragment_repair_succeeded"] is False
+    assert diagnostics["retry_attempt_fragment_repair_reason"] == "insufficient_schema_hits"
 
 
 def test_capture_reply_text_does_not_require_anchor_when_thread_was_not_reused(monkeypatch) -> None:

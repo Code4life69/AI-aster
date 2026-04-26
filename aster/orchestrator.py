@@ -398,6 +398,30 @@ class AsterOrchestrator:
                             "retry_attempt_block_forensics",
                             [],
                         ),
+                        "retry_attempt_fragment_repair_pattern_matched": self._last_generation_metadata.get(
+                            "retry_attempt_fragment_repair_pattern_matched",
+                            False,
+                        ),
+                        "retry_attempt_fragment_repair_attempted": self._last_generation_metadata.get(
+                            "retry_attempt_fragment_repair_attempted",
+                            False,
+                        ),
+                        "retry_attempt_fragment_repair_succeeded": self._last_generation_metadata.get(
+                            "retry_attempt_fragment_repair_succeeded",
+                            False,
+                        ),
+                        "retry_attempt_fragment_repair_reason": self._last_generation_metadata.get(
+                            "retry_attempt_fragment_repair_reason",
+                            "",
+                        ),
+                        "retry_attempt_repaired_from_block_index": self._last_generation_metadata.get(
+                            "retry_attempt_repaired_from_block_index",
+                            None,
+                        ),
+                        "retry_attempt_discarded_wrapper_only_block_index": self._last_generation_metadata.get(
+                            "retry_attempt_discarded_wrapper_only_block_index",
+                            None,
+                        ),
                     },
                 )
                 if mode == "browser":

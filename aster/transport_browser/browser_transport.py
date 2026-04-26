@@ -1230,6 +1230,30 @@ class BrowserChatGPTTransport:
                         "retry_attempt_block_forensics",
                         [],
                     ),
+                    "retry_attempt_fragment_repair_pattern_matched": final_capture_diagnostics.get(
+                        "retry_attempt_fragment_repair_pattern_matched",
+                        False,
+                    ),
+                    "retry_attempt_fragment_repair_attempted": final_capture_diagnostics.get(
+                        "retry_attempt_fragment_repair_attempted",
+                        False,
+                    ),
+                    "retry_attempt_fragment_repair_succeeded": final_capture_diagnostics.get(
+                        "retry_attempt_fragment_repair_succeeded",
+                        False,
+                    ),
+                    "retry_attempt_fragment_repair_reason": final_capture_diagnostics.get(
+                        "retry_attempt_fragment_repair_reason",
+                        "",
+                    ),
+                    "retry_attempt_repaired_from_block_index": final_capture_diagnostics.get(
+                        "retry_attempt_repaired_from_block_index",
+                        None,
+                    ),
+                    "retry_attempt_discarded_wrapper_only_block_index": final_capture_diagnostics.get(
+                        "retry_attempt_discarded_wrapper_only_block_index",
+                        None,
+                    ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
                         "salvage_preserved_for_diagnostics_only",
@@ -3627,6 +3651,7 @@ class BrowserChatGPTTransport:
                 parseable=parseable,
                 has_end_marker=has_end_marker,
             )
+            raw_schema_hits = sum(1 for token in ('"summary"', '"notes"', '"operations"') if token in raw_block)
             blocks.append(
                 {
                     "index": index,
@@ -3636,6 +3661,7 @@ class BrowserChatGPTTransport:
                     "canonical_json": canonical_json,
                     "has_end_marker": has_end_marker,
                     "schema_hits": sum(1 for token in ('"summary"', '"notes"', '"operations"') if token in extracted),
+                    "raw_schema_hits": raw_schema_hits,
                     "brace_balance": extracted.count("{") - extracted.count("}"),
                     "bracket_balance": extracted.count("[") - extracted.count("]"),
                     "length": len(extracted),
@@ -3664,6 +3690,7 @@ class BrowserChatGPTTransport:
                     "payload_state": str(block["payload_state"]),
                     "block_kind": str(block["block_kind"]),
                     "schema_hits": int(block["schema_hits"]),
+                    "raw_schema_hits": int(block["raw_schema_hits"]),
                     "brace_balance": int(block["brace_balance"]),
                     "bracket_balance": int(block["bracket_balance"]),
                 }
@@ -3671,26 +3698,121 @@ class BrowserChatGPTTransport:
         return summary
 
     @staticmethod
+    def _default_retry_block_selection() -> dict[str, Any]:
+        return {
+            "recovered": False,
+            "ambiguous": False,
+            "selected_block_index": None,
+            "selection_reason": "",
+            "failure_reason": "",
+            "selected_text": "",
+            "relationship": "",
+            "fragment_repair_pattern_matched": False,
+            "fragment_repair_attempted": False,
+            "fragment_repair_succeeded": False,
+            "fragment_repair_reason": "",
+            "repaired_from_block_index": None,
+            "discarded_wrapper_only_block_index": None,
+        }
+
+    @classmethod
+    def _attempt_fragmented_retry_block_repair(cls, blocks: list[dict[str, Any]]) -> dict[str, Any]:
+        default = cls._default_retry_block_selection()
+        if len(blocks) != 2:
+            return default
+        wrapper_blocks = [
+            block
+            for block in blocks
+            if str(block["block_kind"]) == "wrapper_only_block"
+            and str(block["payload_state"]) == "empty_payload"
+            and bool(block["has_end_marker"])
+        ]
+        fragment_blocks = [
+            block
+            for block in blocks
+            if str(block["block_kind"]) == "fragment_without_end_marker"
+            and str(block["payload_state"]) == "partial_payload"
+            and not bool(block["has_end_marker"])
+        ]
+        if len(wrapper_blocks) != 1 or len(fragment_blocks) != 1:
+            return default
+        wrapper = wrapper_blocks[0]
+        fragment = fragment_blocks[0]
+        result = {
+            **default,
+            "relationship": "wrapper_only_plus_fragmented_block",
+            "fragment_repair_pattern_matched": True,
+            "repaired_from_block_index": int(fragment["index"]),
+            "discarded_wrapper_only_block_index": int(wrapper["index"]),
+        }
+        if int(fragment.get("raw_schema_hits", 0)) < 2:
+            result["selection_reason"] = "fragment_repair_insufficient_structure"
+            result["failure_reason"] = "fragment_repair_insufficient_structure"
+            result["fragment_repair_reason"] = "insufficient_schema_hits"
+            return result
+
+        raw_fragment = str(fragment["raw_block"]).strip()
+        repair_candidates: list[tuple[str, str]] = []
+        repair_candidates.append(
+            (
+                raw_fragment + "\nASTER_PATCH_END",
+                "appended_missing_end_marker",
+            )
+        )
+        fragment_body = re.sub(
+            r"^\s*ASTER[_ ]PATCH[_ ]BEGIN\s*",
+            "",
+            raw_fragment,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+        if (
+            fragment_body
+            and not fragment_body.startswith("{")
+            and fragment_body.startswith('"')
+        ):
+            repair_candidates.append(
+                (
+                    "ASTER_PATCH_BEGIN\n{" + fragment_body.rstrip() + "}\nASTER_PATCH_END",
+                    "wrapped_object_body_and_appended_end_marker",
+                )
+            )
+
+        result["fragment_repair_attempted"] = True
+        for candidate_text, reason in repair_candidates:
+            extracted = extract_structured_block(candidate_text).strip()
+            if extracted and looks_like_patch_plan_json(extracted):
+                result.update(
+                    {
+                        "recovered": True,
+                        "selected_block_index": int(fragment["index"]),
+                        "selection_reason": "repaired_fragmented_retry_block",
+                        "failure_reason": "",
+                        "selected_text": extracted,
+                        "relationship": "wrapper_only_plus_repaired_fragment",
+                        "fragment_repair_succeeded": True,
+                        "fragment_repair_reason": reason,
+                    }
+                )
+                return result
+
+        result["selection_reason"] = "fragment_repair_not_parseable"
+        result["failure_reason"] = "fragment_repair_not_parseable"
+        result["fragment_repair_reason"] = "repair_candidate_not_parseable"
+        return result
+
+    @staticmethod
     def _select_single_retry_attempt_block(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         if len(blocks) <= 1:
-            return {
-                "recovered": False,
-                "ambiguous": False,
-                "selected_block_index": None,
-                "selection_reason": "",
-                "failure_reason": "",
-                "selected_text": "",
-                "relationship": "",
-            }
+            return BrowserChatGPTTransport._default_retry_block_selection()
         parseable_blocks = [block for block in blocks if block["parseable"]]
         if len(parseable_blocks) == 1:
             selected = parseable_blocks[0]
             return {
+                **BrowserChatGPTTransport._default_retry_block_selection(),
                 "recovered": True,
-                "ambiguous": False,
                 "selected_block_index": int(selected["index"]),
                 "selection_reason": "single_parseable_retry_block",
-                "failure_reason": "",
                 "selected_text": str(selected["extracted"]),
                 "relationship": "single_parseable_plus_fragments",
             }
@@ -3699,32 +3821,29 @@ class BrowserChatGPTTransport:
             if len(canonical) == 1:
                 selected = parseable_blocks[-1]
                 return {
+                    **BrowserChatGPTTransport._default_retry_block_selection(),
                     "recovered": True,
-                    "ambiguous": False,
                     "selected_block_index": int(selected["index"]),
                     "selection_reason": "duplicate_parseable_retry_blocks",
-                    "failure_reason": "",
                     "selected_text": str(selected["extracted"]),
                     "relationship": "duplicate_parseable_blocks",
                 }
             return {
-                "recovered": False,
+                **BrowserChatGPTTransport._default_retry_block_selection(),
                 "ambiguous": True,
-                "selected_block_index": None,
                 "selection_reason": "multiple_distinct_parseable_retry_blocks",
                 "failure_reason": "ambiguous_multiple_retry_blocks",
-                "selected_text": "",
                 "relationship": "distinct_parseable_blocks",
             }
+        fragmented_repair = BrowserChatGPTTransport._attempt_fragmented_retry_block_repair(blocks)
+        if fragmented_repair["fragment_repair_pattern_matched"]:
+            return fragmented_repair
         block_kinds = {str(block["block_kind"]) for block in blocks}
         if block_kinds and block_kinds <= {"wrapper_only_block", "marker_only_block"}:
             return {
-                "recovered": False,
-                "ambiguous": False,
-                "selected_block_index": None,
+                **BrowserChatGPTTransport._default_retry_block_selection(),
                 "selection_reason": "wrapper_only_multi_block_fragments",
                 "failure_reason": "wrapper_only_multi_block_retry_output",
-                "selected_text": "",
                 "relationship": "wrapper_only_blocks",
             }
         if any(
@@ -3732,12 +3851,9 @@ class BrowserChatGPTTransport:
             for block in blocks
         ):
             return {
-                "recovered": False,
-                "ambiguous": False,
-                "selected_block_index": None,
+                **BrowserChatGPTTransport._default_retry_block_selection(),
                 "selection_reason": "fragmented_multi_block_fragments",
                 "failure_reason": "fragmented_multi_block_retry_output",
-                "selected_text": "",
                 "relationship": "fragmented_blocks",
             }
         ranked = sorted(
@@ -3765,21 +3881,17 @@ class BrowserChatGPTTransport:
             )
             if top_signature == second_signature:
                 return {
-                    "recovered": False,
+                    **BrowserChatGPTTransport._default_retry_block_selection(),
                     "ambiguous": True,
-                    "selected_block_index": None,
                     "selection_reason": "multiple_malformed_retry_blocks_tied",
                     "failure_reason": "ambiguous_multiple_retry_blocks",
-                    "selected_text": "",
                     "relationship": "malformed_blocks_tied",
                 }
         return {
-            "recovered": False,
-            "ambiguous": False,
+            **BrowserChatGPTTransport._default_retry_block_selection(),
             "selected_block_index": int(ranked[0]["index"]) if ranked else None,
             "selection_reason": "no_parseable_retry_block_selected",
             "failure_reason": "no_single_retry_block_selected",
-            "selected_text": "",
             "relationship": "malformed_blocks_without_safe_winner",
         }
 
@@ -3790,15 +3902,11 @@ class BrowserChatGPTTransport:
         block_count = self._count_retry_attempt_blocks(cleaned) if cleaned else 0
         blocks = self._extract_retry_attempt_blocks(cleaned) if cleaned else []
         block_forensics = self._summarize_retry_attempt_blocks(blocks) if blocks else []
-        block_selection = self._select_single_retry_attempt_block(blocks) if blocks else {
-            "recovered": False,
-            "ambiguous": False,
-            "selected_block_index": None,
-            "selection_reason": "",
-            "failure_reason": "",
-            "selected_text": "",
-            "relationship": "",
-        }
+        block_selection = (
+            self._select_single_retry_attempt_block(blocks)
+            if blocks
+            else self._default_retry_block_selection()
+        )
         outside_text = self._retry_attempt_outside_block_text(cleaned, extracted) if cleaned else ""
         exact_block_match = (
             re.fullmatch(r"\s*ASTER_PATCH_BEGIN\s*(.*?)\s*ASTER_PATCH_END\s*", cleaned, flags=re.DOTALL)
@@ -3861,6 +3969,9 @@ class BrowserChatGPTTransport:
                 else extracted if parseable and exact_block_only and json_object_count == 1 else ""
             ),
             "acceptance_tier": (
+                "retry_structured_repaired_fragment"
+                if recovered_single_block and bool(block_selection["fragment_repair_succeeded"])
+                else
                 "retry_structured_recovered_single_block"
                 if recovered_single_block
                 else "retry_structured_exact"
@@ -3873,6 +3984,12 @@ class BrowserChatGPTTransport:
             "multiple_blocks_recovered": recovered_single_block,
             "block_relationship": str(block_selection["relationship"]),
             "block_forensics": block_forensics,
+            "fragment_repair_pattern_matched": bool(block_selection["fragment_repair_pattern_matched"]),
+            "fragment_repair_attempted": bool(block_selection["fragment_repair_attempted"]),
+            "fragment_repair_succeeded": bool(block_selection["fragment_repair_succeeded"]),
+            "fragment_repair_reason": str(block_selection["fragment_repair_reason"]),
+            "repaired_from_block_index": block_selection["repaired_from_block_index"],
+            "discarded_wrapper_only_block_index": block_selection["discarded_wrapper_only_block_index"],
         }
 
     @staticmethod
@@ -3893,6 +4010,12 @@ class BrowserChatGPTTransport:
         diagnostics["retry_attempt_multiple_blocks_recovered"] = bool(assessment["multiple_blocks_recovered"])
         diagnostics["retry_attempt_block_relationship"] = str(assessment["block_relationship"])
         diagnostics["retry_attempt_block_forensics"] = list(assessment["block_forensics"])
+        diagnostics["retry_attempt_fragment_repair_pattern_matched"] = bool(assessment["fragment_repair_pattern_matched"])
+        diagnostics["retry_attempt_fragment_repair_attempted"] = bool(assessment["fragment_repair_attempted"])
+        diagnostics["retry_attempt_fragment_repair_succeeded"] = bool(assessment["fragment_repair_succeeded"])
+        diagnostics["retry_attempt_fragment_repair_reason"] = str(assessment["fragment_repair_reason"])
+        diagnostics["retry_attempt_repaired_from_block_index"] = assessment["repaired_from_block_index"]
+        diagnostics["retry_attempt_discarded_wrapper_only_block_index"] = assessment["discarded_wrapper_only_block_index"]
 
     def _build_structured_reply_candidate(
         self,
@@ -4081,6 +4204,24 @@ class BrowserChatGPTTransport:
             ),
             "retry_attempt_block_forensics": (
                 list(retry_assessment["block_forensics"]) if retry_assessment is not None else []
+            ),
+            "retry_attempt_fragment_repair_pattern_matched": (
+                bool(retry_assessment["fragment_repair_pattern_matched"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_fragment_repair_attempted": (
+                bool(retry_assessment["fragment_repair_attempted"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_fragment_repair_succeeded": (
+                bool(retry_assessment["fragment_repair_succeeded"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_fragment_repair_reason": (
+                str(retry_assessment["fragment_repair_reason"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_repaired_from_block_index": (
+                retry_assessment["repaired_from_block_index"] if retry_assessment is not None else None
+            ),
+            "retry_attempt_discarded_wrapper_only_block_index": (
+                retry_assessment["discarded_wrapper_only_block_index"] if retry_assessment is not None else None
             ),
             "final_capture_failure_reason": "",
         }
