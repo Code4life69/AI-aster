@@ -770,6 +770,8 @@ def test_finalize_captured_reply_retry_attempt_rejects_multiple_blocks() -> None
     assert diagnostics["retry_attempt_multiple_blocks_recovered"] is False
     assert diagnostics["retry_attempt_selected_block_index"] is None
     assert diagnostics["retry_attempt_block_selection_reason"] == "multiple_distinct_parseable_retry_blocks"
+    assert diagnostics["retry_attempt_block_relationship"] == "distinct_parseable_blocks"
+    assert len(diagnostics["retry_attempt_block_forensics"]) == 2
 
 
 def test_finalize_captured_reply_retry_attempt_recovers_single_parseable_block() -> None:
@@ -794,6 +796,7 @@ def test_finalize_captured_reply_retry_attempt_recovers_single_parseable_block()
     assert diagnostics["retry_attempt_multiple_blocks_ambiguous"] is False
     assert diagnostics["retry_attempt_selected_block_index"] == 2
     assert diagnostics["retry_attempt_block_selection_reason"] == "single_parseable_retry_block"
+    assert diagnostics["retry_attempt_block_relationship"] == "single_parseable_plus_fragments"
 
 
 def test_finalize_captured_reply_retry_attempt_recovers_duplicate_parseable_blocks() -> None:
@@ -814,6 +817,7 @@ def test_finalize_captured_reply_retry_attempt_recovers_duplicate_parseable_bloc
     assert diagnostics["retry_attempt_multiple_blocks_recovered"] is True
     assert diagnostics["retry_attempt_selected_block_index"] == 2
     assert diagnostics["retry_attempt_block_selection_reason"] == "duplicate_parseable_retry_blocks"
+    assert diagnostics["retry_attempt_block_relationship"] == "duplicate_parseable_blocks"
 
 
 def test_finalize_captured_reply_retry_attempt_ambiguates_multiple_malformed_blocks() -> None:
@@ -836,6 +840,52 @@ def test_finalize_captured_reply_retry_attempt_ambiguates_multiple_malformed_blo
     assert diagnostics["retry_attempt_multiple_blocks_ambiguous"] is True
     assert diagnostics["retry_attempt_multiple_blocks_recovered"] is False
     assert diagnostics["retry_attempt_block_selection_reason"] == "multiple_malformed_retry_blocks_tied"
+    assert diagnostics["retry_attempt_block_relationship"] == "malformed_blocks_tied"
+
+
+def test_finalize_captured_reply_retry_attempt_classifies_fragmented_multi_block_output() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"first","notes":[],"operations":[{"type":"CREATE FILE","path":"one.txt","reason":"add","content":"one"}]\n'
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"first","notes":[],"operations":[{"type":"CREATE FILE","path":"one.txt","reason":"add","content":"one"}]'
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
+    assert diagnostics["retry_attempt_block_count"] == 2
+    assert diagnostics["retry_attempt_failure_reason"] == "fragmented_multi_block_retry_output"
+    assert diagnostics["retry_attempt_multiple_blocks_recovered"] is False
+    assert diagnostics["retry_attempt_multiple_blocks_ambiguous"] is False
+    assert diagnostics["retry_attempt_block_selection_reason"] == "fragmented_multi_block_fragments"
+    assert diagnostics["retry_attempt_block_relationship"] == "fragmented_blocks"
+    assert diagnostics["retry_attempt_block_forensics"][0]["has_end_marker"] is False
+    assert diagnostics["retry_attempt_block_forensics"][0]["payload_state"] == "partial_payload"
+
+
+def test_finalize_captured_reply_retry_attempt_classifies_wrapper_only_multi_block_output() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\nASTER_PATCH_END\n"
+            "ASTER_PATCH_BEGIN\nASTER_PATCH_END"
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
+    assert diagnostics["retry_attempt_block_count"] == 2
+    assert diagnostics["retry_attempt_failure_reason"] == "wrapper_only_multi_block_retry_output"
+    assert diagnostics["retry_attempt_multiple_blocks_recovered"] is False
+    assert diagnostics["retry_attempt_multiple_blocks_ambiguous"] is False
+    assert diagnostics["retry_attempt_block_selection_reason"] == "wrapper_only_multi_block_fragments"
+    assert diagnostics["retry_attempt_block_relationship"] == "wrapper_only_blocks"
+    assert all(item["block_kind"] == "wrapper_only_block" for item in diagnostics["retry_attempt_block_forensics"])
 
 
 def test_capture_reply_text_does_not_require_anchor_when_thread_was_not_reused(monkeypatch) -> None:

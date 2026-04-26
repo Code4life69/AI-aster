@@ -405,3 +405,78 @@ def test_parse_with_retry_uses_retry_attempt_failure_reason_in_browser_error(tmp
 
     with pytest.raises(RuntimeError, match="wrapper_without_valid_json"):
         orchestrator._parse_with_retry("build app", context, [], "browser", "")
+
+
+def test_parse_with_retry_uses_fragmented_multi_block_reason_in_browser_error(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sync_with_remote = False
+    orchestrator = AsterOrchestrator(config)
+    orchestrator._last_generation_metadata = {
+        "retry_seed_valid": False,
+        "retry_seed_validity_reason": "unbalanced_structure",
+        "retry_seed_validity_reason_source": "best_salvageable_candidate",
+    }
+
+    def _parse(raw_text: str):
+        raise json.JSONDecodeError("bad json", raw_text or "", 0)
+
+    orchestrator.parser.parse = _parse
+
+    def _retry_generate(*_args, **_kwargs):
+        orchestrator._last_generation_metadata = {
+            "retry_attempt_capture_mode": "structured_block_first",
+            "retry_attempt_acceptance_tier": "blocked_or_ambiguous",
+            "retry_attempt_failure_reason": "fragmented_multi_block_retry_output",
+            "retry_attempt_structured_block_found": True,
+            "retry_attempt_parseable": False,
+            "retry_attempt_prose_contamination": False,
+            "retry_attempt_wrapper_only": False,
+            "retry_attempt_block_count": 2,
+            "retry_attempt_selected_block_index": None,
+            "retry_attempt_block_selection_reason": "fragmented_multi_block_fragments",
+            "retry_attempt_multiple_blocks_ambiguous": False,
+            "retry_attempt_multiple_blocks_recovered": False,
+            "retry_attempt_block_relationship": "fragmented_blocks",
+            "retry_attempt_block_forensics": [
+                {
+                    "index": 1,
+                    "block_hash": "abc123",
+                    "preview": "ASTER_PATCH_BEGIN {\"summary\":\"bad\"",
+                    "raw_length": 80,
+                    "extracted_length": 30,
+                    "has_end_marker": False,
+                    "parseable": False,
+                    "payload_state": "partial_payload",
+                    "block_kind": "fragment_without_end_marker",
+                    "schema_hits": 2,
+                    "brace_balance": 1,
+                    "bracket_balance": 0,
+                }
+            ],
+        }
+
+        class _PromptPackage:
+            messages = [{"role": "user", "content": "retry"}]
+            approx_chars = 5
+            included_files = []
+            omitted_files = []
+            compacted = False
+            retry_prompt_mode = "browser_structured_output_only_retry"
+            retry_prompt_strategy = "browser_retry_structured_output_only"
+            retry_prompt_reason = "unbalanced_structure"
+            retry_prompt_length = 5
+            retry_prompt_compacted_relative_to_original = True
+
+        return ("ASTER_PATCH_BEGIN\n{\"summary\":\"bad\"", _PromptPackage())
+
+    orchestrator._generate_with_prompt_retries = _retry_generate
+    context = CollectedContext(
+        project_root=tmp_path,
+        project_summary="demo",
+        file_tree="demo/",
+        relevant_files=[],
+        skipped_files=[],
+    )
+
+    with pytest.raises(RuntimeError, match="fragmented_multi_block_retry_output"):
+        orchestrator._parse_with_retry("build app", context, [], "browser", "")

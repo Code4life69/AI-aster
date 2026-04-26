@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -1220,6 +1221,14 @@ class BrowserChatGPTTransport:
                     "retry_attempt_multiple_blocks_recovered": final_capture_diagnostics.get(
                         "retry_attempt_multiple_blocks_recovered",
                         False,
+                    ),
+                    "retry_attempt_block_relationship": final_capture_diagnostics.get(
+                        "retry_attempt_block_relationship",
+                        "",
+                    ),
+                    "retry_attempt_block_forensics": final_capture_diagnostics.get(
+                        "retry_attempt_block_forensics",
+                        [],
                     ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
@@ -3540,19 +3549,70 @@ class BrowserChatGPTTransport:
         return normalized.count("ASTER_PATCH_BEGIN")
 
     @staticmethod
+    def _retry_attempt_block_hash(text: str) -> str:
+        normalized = " ".join(text.split())
+        return hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+    @staticmethod
+    def _retry_attempt_preview(text: str, limit: int = 160) -> str:
+        preview = " ".join(text.split())
+        if len(preview) <= limit:
+            return preview
+        return preview[:limit].rstrip() + "..."
+
+    @staticmethod
+    def _classify_retry_attempt_block_fragment(
+        *,
+        raw_block: str,
+        extracted: str,
+        parseable: bool,
+        has_end_marker: bool,
+    ) -> tuple[str, str]:
+        lowered = _normalize(raw_block)
+        wrapper_only = (
+            "aster_patch_begin" in lowered or "aster patch begin" in lowered
+        ) and not any(token in raw_block for token in ("{", '"summary"', '"operations"'))
+        code_only = any(marker in lowered for marker in ("def ", "class ", "import ", "self.", "tkinter", "assert "))
+        has_jsonish = any(token in raw_block for token in ("{", "}", '"summary"', '"operations"', '"notes"'))
+        if parseable:
+            return "parseable_json", "parseable_json_block"
+        if wrapper_only:
+            return "empty_payload", "wrapper_only_block"
+        if not extracted.strip():
+            if code_only:
+                return "non_json_payload", "code_only_block"
+            return "empty_payload", "marker_only_block"
+        if not has_end_marker:
+            if has_jsonish:
+                return "partial_payload", "fragment_without_end_marker"
+            return "partial_payload", "truncated_non_json_fragment"
+        if has_jsonish:
+            return "non_parseable_json", "malformed_json_block"
+        if code_only:
+            return "non_json_payload", "code_only_block"
+        return "non_json_payload", "non_json_block"
+
+    @staticmethod
     def _extract_retry_attempt_blocks(raw_text: str) -> list[dict[str, Any]]:
         if not raw_text.strip():
             return []
+        begin_pattern = re.compile(r"ASTER[_ ]PATCH[_ ]BEGIN", flags=re.IGNORECASE)
+        end_pattern = re.compile(r"ASTER[_ ]PATCH[_ ]END", flags=re.IGNORECASE)
+        begins = list(begin_pattern.finditer(raw_text))
+        if not begins:
+            return []
         blocks: list[dict[str, Any]] = []
-        for index, match in enumerate(
-            re.finditer(
-                r"ASTER[_ ]PATCH[_ ]BEGIN\s*(.*?)\s*ASTER[_ ]PATCH[_ ]END",
-                raw_text,
-                flags=re.DOTALL | re.IGNORECASE,
-            ),
-            start=1,
-        ):
-            raw_block = match.group(0).strip()
+        for index, match in enumerate(begins, start=1):
+            next_start = begins[index].start() if index < len(begins) else len(raw_text)
+            search_region = raw_text[match.end() : next_start]
+            end_match = end_pattern.search(search_region)
+            if end_match is not None:
+                block_end = match.end() + end_match.end()
+                has_end_marker = True
+            else:
+                block_end = next_start
+                has_end_marker = False
+            raw_block = raw_text[match.start() : block_end].strip()
             extracted = extract_structured_block(raw_block).strip()
             parseable = bool(extracted) and looks_like_patch_plan_json(extracted)
             canonical_json = ""
@@ -3561,6 +3621,12 @@ class BrowserChatGPTTransport:
                     canonical_json = json.dumps(json.loads(extracted), sort_keys=True, separators=(",", ":"))
                 except Exception:
                     canonical_json = extracted
+            payload_state, block_kind = BrowserChatGPTTransport._classify_retry_attempt_block_fragment(
+                raw_block=raw_block,
+                extracted=extracted,
+                parseable=parseable,
+                has_end_marker=has_end_marker,
+            )
             blocks.append(
                 {
                     "index": index,
@@ -3568,13 +3634,41 @@ class BrowserChatGPTTransport:
                     "extracted": extracted,
                     "parseable": parseable,
                     "canonical_json": canonical_json,
+                    "has_end_marker": has_end_marker,
                     "schema_hits": sum(1 for token in ('"summary"', '"notes"', '"operations"') if token in extracted),
                     "brace_balance": extracted.count("{") - extracted.count("}"),
                     "bracket_balance": extracted.count("[") - extracted.count("]"),
                     "length": len(extracted),
+                    "raw_length": len(raw_block),
+                    "payload_state": payload_state,
+                    "block_kind": block_kind,
+                    "preview": BrowserChatGPTTransport._retry_attempt_preview(extracted or raw_block),
+                    "block_hash": BrowserChatGPTTransport._retry_attempt_block_hash(extracted or raw_block),
                 }
             )
         return blocks
+
+    @staticmethod
+    def _summarize_retry_attempt_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        summary: list[dict[str, Any]] = []
+        for block in blocks[:4]:
+            summary.append(
+                {
+                    "index": int(block["index"]),
+                    "block_hash": str(block["block_hash"]),
+                    "preview": str(block["preview"]),
+                    "raw_length": int(block["raw_length"]),
+                    "extracted_length": int(block["length"]),
+                    "has_end_marker": bool(block["has_end_marker"]),
+                    "parseable": bool(block["parseable"]),
+                    "payload_state": str(block["payload_state"]),
+                    "block_kind": str(block["block_kind"]),
+                    "schema_hits": int(block["schema_hits"]),
+                    "brace_balance": int(block["brace_balance"]),
+                    "bracket_balance": int(block["bracket_balance"]),
+                }
+            )
+        return summary
 
     @staticmethod
     def _select_single_retry_attempt_block(blocks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3586,6 +3680,7 @@ class BrowserChatGPTTransport:
                 "selection_reason": "",
                 "failure_reason": "",
                 "selected_text": "",
+                "relationship": "",
             }
         parseable_blocks = [block for block in blocks if block["parseable"]]
         if len(parseable_blocks) == 1:
@@ -3597,6 +3692,7 @@ class BrowserChatGPTTransport:
                 "selection_reason": "single_parseable_retry_block",
                 "failure_reason": "",
                 "selected_text": str(selected["extracted"]),
+                "relationship": "single_parseable_plus_fragments",
             }
         if len(parseable_blocks) > 1:
             canonical = {str(block["canonical_json"]) for block in parseable_blocks if str(block["canonical_json"]).strip()}
@@ -3609,6 +3705,7 @@ class BrowserChatGPTTransport:
                     "selection_reason": "duplicate_parseable_retry_blocks",
                     "failure_reason": "",
                     "selected_text": str(selected["extracted"]),
+                    "relationship": "duplicate_parseable_blocks",
                 }
             return {
                 "recovered": False,
@@ -3617,6 +3714,31 @@ class BrowserChatGPTTransport:
                 "selection_reason": "multiple_distinct_parseable_retry_blocks",
                 "failure_reason": "ambiguous_multiple_retry_blocks",
                 "selected_text": "",
+                "relationship": "distinct_parseable_blocks",
+            }
+        block_kinds = {str(block["block_kind"]) for block in blocks}
+        if block_kinds and block_kinds <= {"wrapper_only_block", "marker_only_block"}:
+            return {
+                "recovered": False,
+                "ambiguous": False,
+                "selected_block_index": None,
+                "selection_reason": "wrapper_only_multi_block_fragments",
+                "failure_reason": "wrapper_only_multi_block_retry_output",
+                "selected_text": "",
+                "relationship": "wrapper_only_blocks",
+            }
+        if any(
+            str(block["block_kind"]) in {"fragment_without_end_marker", "truncated_non_json_fragment"}
+            for block in blocks
+        ):
+            return {
+                "recovered": False,
+                "ambiguous": False,
+                "selected_block_index": None,
+                "selection_reason": "fragmented_multi_block_fragments",
+                "failure_reason": "fragmented_multi_block_retry_output",
+                "selected_text": "",
+                "relationship": "fragmented_blocks",
             }
         ranked = sorted(
             blocks,
@@ -3649,6 +3771,7 @@ class BrowserChatGPTTransport:
                     "selection_reason": "multiple_malformed_retry_blocks_tied",
                     "failure_reason": "ambiguous_multiple_retry_blocks",
                     "selected_text": "",
+                    "relationship": "malformed_blocks_tied",
                 }
         return {
             "recovered": False,
@@ -3657,6 +3780,7 @@ class BrowserChatGPTTransport:
             "selection_reason": "no_parseable_retry_block_selected",
             "failure_reason": "no_single_retry_block_selected",
             "selected_text": "",
+            "relationship": "malformed_blocks_without_safe_winner",
         }
 
     def _assess_retry_attempt_response(self, raw_text: str, *, candidate_source: str) -> dict[str, Any]:
@@ -3665,6 +3789,7 @@ class BrowserChatGPTTransport:
         lowered = _normalize(cleaned)
         block_count = self._count_retry_attempt_blocks(cleaned) if cleaned else 0
         blocks = self._extract_retry_attempt_blocks(cleaned) if cleaned else []
+        block_forensics = self._summarize_retry_attempt_blocks(blocks) if blocks else []
         block_selection = self._select_single_retry_attempt_block(blocks) if blocks else {
             "recovered": False,
             "ambiguous": False,
@@ -3672,6 +3797,7 @@ class BrowserChatGPTTransport:
             "selection_reason": "",
             "failure_reason": "",
             "selected_text": "",
+            "relationship": "",
         }
         outside_text = self._retry_attempt_outside_block_text(cleaned, extracted) if cleaned else ""
         exact_block_match = (
@@ -3697,6 +3823,7 @@ class BrowserChatGPTTransport:
             not bool(extracted)
             and any(marker in lowered for marker in ("def ", "class ", "import ", "self.", "tkinter", "assert "))
         )
+        structured_block_found = bool(extracted) or any(bool(block.get("extracted", "").strip()) for block in blocks)
         if not cleaned:
             failure_reason = "empty_retry_response"
         elif block_count > 1 and block_selection["recovered"]:
@@ -3719,7 +3846,7 @@ class BrowserChatGPTTransport:
             failure_reason = "malformed_structured_retry_response"
         return {
             "candidate_source": candidate_source,
-            "structured_block_found": bool(extracted),
+            "structured_block_found": structured_block_found,
             "parseable": effective_parseable,
             "prose_contamination": prose_contamination,
             "wrapper_only": wrapper_only,
@@ -3744,6 +3871,8 @@ class BrowserChatGPTTransport:
             "block_selection_reason": str(block_selection["selection_reason"]),
             "multiple_blocks_ambiguous": bool(block_count > 1 and block_selection["ambiguous"]),
             "multiple_blocks_recovered": recovered_single_block,
+            "block_relationship": str(block_selection["relationship"]),
+            "block_forensics": block_forensics,
         }
 
     @staticmethod
@@ -3762,6 +3891,8 @@ class BrowserChatGPTTransport:
         diagnostics["retry_attempt_block_selection_reason"] = str(assessment["block_selection_reason"])
         diagnostics["retry_attempt_multiple_blocks_ambiguous"] = bool(assessment["multiple_blocks_ambiguous"])
         diagnostics["retry_attempt_multiple_blocks_recovered"] = bool(assessment["multiple_blocks_recovered"])
+        diagnostics["retry_attempt_block_relationship"] = str(assessment["block_relationship"])
+        diagnostics["retry_attempt_block_forensics"] = list(assessment["block_forensics"])
 
     def _build_structured_reply_candidate(
         self,
@@ -3944,6 +4075,12 @@ class BrowserChatGPTTransport:
             ),
             "retry_attempt_multiple_blocks_recovered": (
                 bool(retry_assessment["multiple_blocks_recovered"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_block_relationship": (
+                str(retry_assessment["block_relationship"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_block_forensics": (
+                list(retry_assessment["block_forensics"]) if retry_assessment is not None else []
             ),
             "final_capture_failure_reason": "",
         }

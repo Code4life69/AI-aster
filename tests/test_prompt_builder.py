@@ -144,6 +144,18 @@ def test_browser_retry_prompt_varies_by_retry_reason() -> None:
         retry_reason="unbalanced_structure",
         retry_seed_used=False,
     )
+    multi_block = builder.build_retry(
+        "make me a calculator app",
+        context,
+        [],
+        None,
+        mode="browser",
+        max_chars=5_000,
+        retry_reason="multiple_retry_blocks",
+        retry_seed_used=False,
+    )
 
     assert "missing required schema keys" in missing_keys.messages[-1]["content"].lower()
     assert "balanced braces/brackets" in unbalanced.messages[-1]["content"].lower()
+    assert "returned more than one aster block" in multi_block.messages[-1]["content"].lower()
+    assert "never repeat the block" in multi_block.messages[-1]["content"].lower()

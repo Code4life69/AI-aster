@@ -390,6 +390,14 @@ class AsterOrchestrator:
                             "retry_attempt_multiple_blocks_recovered",
                             False,
                         ),
+                        "retry_attempt_block_relationship": self._last_generation_metadata.get(
+                            "retry_attempt_block_relationship",
+                            "",
+                        ),
+                        "retry_attempt_block_forensics": self._last_generation_metadata.get(
+                            "retry_attempt_block_forensics",
+                            [],
+                        ),
                     },
                 )
                 if mode == "browser":

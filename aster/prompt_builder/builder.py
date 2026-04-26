@@ -404,6 +404,17 @@ class PromptBuilder:
                 "The previous browser reply included prompt or preamble contamination. "
                 "Return only the final structured response, with no copied prompt text."
             )
+        if retry_reason in {
+            "multiple_retry_blocks",
+            "ambiguous_multiple_retry_blocks",
+            "fragmented_multi_block_retry_output",
+            "wrapper_only_multi_block_retry_output",
+            "no_single_retry_block_selected",
+        }:
+            return (
+                "The previous browser reply returned more than one ASTER block or fragmented wrappers. "
+                "Return exactly one final ASTER block, never a draft plus revised copy, and never repeat the block."
+            )
         if retry_reason == "empty_response":
             return "The previous browser reply did not produce usable structured output. Return the final structured response only."
         return "The previous browser reply was not machine-parseable. Return one complete structured response only."
