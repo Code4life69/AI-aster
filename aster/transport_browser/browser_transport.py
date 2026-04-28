@@ -1230,6 +1230,38 @@ class BrowserChatGPTTransport:
                         "retry_attempt_block_forensics",
                         [],
                     ),
+                    "retry_attempt_wrapper_only_block_count": final_capture_diagnostics.get(
+                        "retry_attempt_wrapper_only_block_count",
+                        0,
+                    ),
+                    "retry_attempt_wrapper_only_payload_lengths": final_capture_diagnostics.get(
+                        "retry_attempt_wrapper_only_payload_lengths",
+                        [],
+                    ),
+                    "retry_attempt_wrapper_only_has_internal_text": final_capture_diagnostics.get(
+                        "retry_attempt_wrapper_only_has_internal_text",
+                        False,
+                    ),
+                    "retry_attempt_wrapper_only_noise_detected": final_capture_diagnostics.get(
+                        "retry_attempt_wrapper_only_noise_detected",
+                        False,
+                    ),
+                    "retry_attempt_wrapper_only_boundary_suspected": final_capture_diagnostics.get(
+                        "retry_attempt_wrapper_only_boundary_suspected",
+                        False,
+                    ),
+                    "retry_wrapper_recheck_attempted": final_capture_diagnostics.get(
+                        "retry_wrapper_recheck_attempted",
+                        False,
+                    ),
+                    "retry_wrapper_recheck_found_payload": final_capture_diagnostics.get(
+                        "retry_wrapper_recheck_found_payload",
+                        False,
+                    ),
+                    "retry_wrapper_recheck_reason": final_capture_diagnostics.get(
+                        "retry_wrapper_recheck_reason",
+                        "",
+                    ),
                     "retry_attempt_fragment_repair_pattern_matched": final_capture_diagnostics.get(
                         "retry_attempt_fragment_repair_pattern_matched",
                         False,
@@ -3713,7 +3745,123 @@ class BrowserChatGPTTransport:
             "fragment_repair_reason": "",
             "repaired_from_block_index": None,
             "discarded_wrapper_only_block_index": None,
+            "wrapper_only_block_count": 0,
+            "wrapper_only_payload_lengths": [],
+            "wrapper_only_has_internal_text": False,
+            "wrapper_only_noise_detected": False,
+            "wrapper_only_boundary_suspected": False,
+            "wrapper_recheck_attempted": False,
+            "wrapper_recheck_found_payload": False,
+            "wrapper_recheck_reason": "",
         }
+
+    @staticmethod
+    def _retry_attempt_inner_payload(raw_block: str) -> str:
+        text = raw_block.strip()
+        text = re.sub(
+            r"^\s*ASTER[_ ]PATCH[_ ]BEGIN\s*",
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"\s*ASTER[_ ]PATCH[_ ]END\s*$",
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        return text
+
+    @classmethod
+    def _analyze_wrapper_only_retry_blocks(
+        cls,
+        raw_text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        outside_text: str,
+    ) -> dict[str, Any]:
+        wrapper_like_blocks = [
+            block
+            for block in blocks
+            if str(block["block_kind"]) in {"wrapper_only_block", "marker_only_block"}
+        ]
+        payloads = [cls._retry_attempt_inner_payload(str(block["raw_block"])) for block in wrapper_like_blocks]
+        payload_lengths = [len(payload.strip()) for payload in payloads]
+        has_internal_text = any(length > 0 for length in payload_lengths)
+        raw_lowered = raw_text.lower()
+        noise_detected = bool(outside_text.strip()) or any(payload.strip() for payload in payloads)
+        boundary_suspected = has_internal_text or any(
+            token in raw_lowered
+            for token in ('"summary"', '"notes"', '"operations"', "{", "[")
+        )
+        return {
+            "wrapper_only_block_count": len(wrapper_like_blocks),
+            "wrapper_only_payload_lengths": payload_lengths,
+            "wrapper_only_has_internal_text": has_internal_text,
+            "wrapper_only_noise_detected": noise_detected,
+            "wrapper_only_boundary_suspected": boundary_suspected,
+        }
+
+    @classmethod
+    def _attempt_wrapper_only_retry_recheck(
+        cls,
+        raw_text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        outside_text: str,
+    ) -> dict[str, Any]:
+        analysis = cls._analyze_wrapper_only_retry_blocks(raw_text, blocks, outside_text=outside_text)
+        result = {
+            **cls._default_retry_block_selection(),
+            **analysis,
+        }
+        if not analysis["wrapper_only_block_count"]:
+            return result
+        if not analysis["wrapper_only_boundary_suspected"]:
+            result["wrapper_recheck_reason"] = "no_boundary_signal"
+            return result
+
+        result["wrapper_recheck_attempted"] = True
+        for block in blocks:
+            if str(block["block_kind"]) not in {"wrapper_only_block", "marker_only_block"}:
+                continue
+            inner_payload = cls._retry_attempt_inner_payload(str(block["raw_block"])).strip()
+            if not inner_payload:
+                continue
+            extracted = extract_structured_block(inner_payload).strip()
+            if extracted and looks_like_patch_plan_json(extracted):
+                result.update(
+                    {
+                        "recovered": True,
+                        "selected_block_index": int(block["index"]),
+                        "selection_reason": "wrapper_only_recheck_hidden_payload",
+                        "selected_text": extracted,
+                        "relationship": "wrapper_only_block_with_hidden_payload",
+                        "wrapper_recheck_found_payload": True,
+                        "wrapper_recheck_reason": "inner_payload_parseable",
+                    }
+                )
+                return result
+
+        whole_text_extracted = extract_structured_block(raw_text).strip()
+        if whole_text_extracted and looks_like_patch_plan_json(whole_text_extracted):
+            result.update(
+                {
+                    "recovered": True,
+                    "selected_block_index": None,
+                    "selection_reason": "wrapper_only_recheck_full_text_payload",
+                    "selected_text": whole_text_extracted,
+                    "relationship": "wrapper_only_boundary_recheck_recovered",
+                    "wrapper_recheck_found_payload": True,
+                    "wrapper_recheck_reason": "full_text_parseable",
+                }
+            )
+            return result
+
+        result["wrapper_recheck_reason"] = "boundary_suspected_but_no_payload"
+        return result
 
     @classmethod
     def _attempt_fragmented_retry_block_repair(cls, blocks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3802,7 +3950,12 @@ class BrowserChatGPTTransport:
         return result
 
     @staticmethod
-    def _select_single_retry_attempt_block(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    def _select_single_retry_attempt_block(
+        raw_text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        outside_text: str,
+    ) -> dict[str, Any]:
         if len(blocks) <= 1:
             return BrowserChatGPTTransport._default_retry_block_selection()
         parseable_blocks = [block for block in blocks if block["parseable"]]
@@ -3839,9 +3992,16 @@ class BrowserChatGPTTransport:
         if fragmented_repair["fragment_repair_pattern_matched"]:
             return fragmented_repair
         block_kinds = {str(block["block_kind"]) for block in blocks}
+        wrapper_recheck = BrowserChatGPTTransport._attempt_wrapper_only_retry_recheck(
+            raw_text,
+            blocks,
+            outside_text=outside_text,
+        )
         if block_kinds and block_kinds <= {"wrapper_only_block", "marker_only_block"}:
+            if wrapper_recheck["recovered"]:
+                return wrapper_recheck
             return {
-                **BrowserChatGPTTransport._default_retry_block_selection(),
+                **wrapper_recheck,
                 "selection_reason": "wrapper_only_multi_block_fragments",
                 "failure_reason": "wrapper_only_multi_block_retry_output",
                 "relationship": "wrapper_only_blocks",
@@ -3902,12 +4062,22 @@ class BrowserChatGPTTransport:
         block_count = self._count_retry_attempt_blocks(cleaned) if cleaned else 0
         blocks = self._extract_retry_attempt_blocks(cleaned) if cleaned else []
         block_forensics = self._summarize_retry_attempt_blocks(blocks) if blocks else []
-        block_selection = (
-            self._select_single_retry_attempt_block(blocks)
+        outside_text = self._retry_attempt_outside_block_text(cleaned, extracted) if cleaned else ""
+        wrapper_details = (
+            self._analyze_wrapper_only_retry_blocks(cleaned, blocks, outside_text=outside_text)
             if blocks
             else self._default_retry_block_selection()
         )
-        outside_text = self._retry_attempt_outside_block_text(cleaned, extracted) if cleaned else ""
+        wrapper_recheck = (
+            self._attempt_wrapper_only_retry_recheck(cleaned, blocks, outside_text=outside_text)
+            if blocks
+            else self._default_retry_block_selection()
+        )
+        block_selection = (
+            self._select_single_retry_attempt_block(cleaned, blocks, outside_text=outside_text)
+            if blocks
+            else self._default_retry_block_selection()
+        )
         exact_block_match = (
             re.fullmatch(r"\s*ASTER_PATCH_BEGIN\s*(.*?)\s*ASTER_PATCH_END\s*", cleaned, flags=re.DOTALL)
             if cleaned
@@ -3916,7 +4086,13 @@ class BrowserChatGPTTransport:
         exact_block_only = exact_block_match is not None and not outside_text
         parseable = bool(extracted) and looks_like_patch_plan_json(extracted)
         recovered_single_block = bool(block_count > 1 and block_selection["recovered"])
-        effective_parseable = parseable or recovered_single_block
+        recovered_wrapper_payload = bool(
+            not recovered_single_block
+            and wrapper_recheck["recovered"]
+            and wrapper_recheck["selected_text"]
+            and block_count <= 1
+        )
+        effective_parseable = parseable or recovered_single_block or recovered_wrapper_payload
         json_object_count = 1 if effective_parseable else 0
         prose_contamination = bool(outside_text) or self._retry_seed_contaminated(cleaned) or "retry mode for browser output" in lowered
         marker_present = bool(
@@ -3935,6 +4111,8 @@ class BrowserChatGPTTransport:
         if not cleaned:
             failure_reason = "empty_retry_response"
         elif block_count > 1 and block_selection["recovered"]:
+            failure_reason = ""
+        elif recovered_wrapper_payload:
             failure_reason = ""
         elif block_count > 1:
             failure_reason = str(block_selection["failure_reason"] or "multiple_retry_blocks")
@@ -3966,9 +4144,14 @@ class BrowserChatGPTTransport:
             "selected_text": (
                 str(block_selection["selected_text"])
                 if recovered_single_block
+                else str(wrapper_recheck["selected_text"])
+                if recovered_wrapper_payload
                 else extracted if parseable and exact_block_only and json_object_count == 1 else ""
             ),
             "acceptance_tier": (
+                "retry_structured_wrapper_recheck"
+                if recovered_wrapper_payload
+                else
                 "retry_structured_repaired_fragment"
                 if recovered_single_block and bool(block_selection["fragment_repair_succeeded"])
                 else
@@ -3978,12 +4161,32 @@ class BrowserChatGPTTransport:
                 if parseable and exact_block_only and json_object_count == 1
                 else "blocked_or_ambiguous"
             ),
-            "selected_block_index": block_selection["selected_block_index"],
-            "block_selection_reason": str(block_selection["selection_reason"]),
+            "selected_block_index": (
+                wrapper_recheck["selected_block_index"]
+                if recovered_wrapper_payload
+                else block_selection["selected_block_index"]
+            ),
+            "block_selection_reason": (
+                str(wrapper_recheck["selection_reason"])
+                if recovered_wrapper_payload
+                else str(block_selection["selection_reason"])
+            ),
             "multiple_blocks_ambiguous": bool(block_count > 1 and block_selection["ambiguous"]),
             "multiple_blocks_recovered": recovered_single_block,
-            "block_relationship": str(block_selection["relationship"]),
+            "block_relationship": (
+                str(wrapper_recheck["relationship"])
+                if recovered_wrapper_payload
+                else str(block_selection["relationship"])
+            ),
             "block_forensics": block_forensics,
+            "wrapper_only_block_count": int(wrapper_details["wrapper_only_block_count"]),
+            "wrapper_only_payload_lengths": list(wrapper_details["wrapper_only_payload_lengths"]),
+            "wrapper_only_has_internal_text": bool(wrapper_details["wrapper_only_has_internal_text"]),
+            "wrapper_only_noise_detected": bool(wrapper_details["wrapper_only_noise_detected"]),
+            "wrapper_only_boundary_suspected": bool(wrapper_details["wrapper_only_boundary_suspected"]),
+            "wrapper_recheck_attempted": bool(wrapper_recheck["wrapper_recheck_attempted"]),
+            "wrapper_recheck_found_payload": bool(wrapper_recheck["wrapper_recheck_found_payload"]),
+            "wrapper_recheck_reason": str(wrapper_recheck["wrapper_recheck_reason"]),
             "fragment_repair_pattern_matched": bool(block_selection["fragment_repair_pattern_matched"]),
             "fragment_repair_attempted": bool(block_selection["fragment_repair_attempted"]),
             "fragment_repair_succeeded": bool(block_selection["fragment_repair_succeeded"]),
@@ -4010,6 +4213,14 @@ class BrowserChatGPTTransport:
         diagnostics["retry_attempt_multiple_blocks_recovered"] = bool(assessment["multiple_blocks_recovered"])
         diagnostics["retry_attempt_block_relationship"] = str(assessment["block_relationship"])
         diagnostics["retry_attempt_block_forensics"] = list(assessment["block_forensics"])
+        diagnostics["retry_attempt_wrapper_only_block_count"] = int(assessment["wrapper_only_block_count"])
+        diagnostics["retry_attempt_wrapper_only_payload_lengths"] = list(assessment["wrapper_only_payload_lengths"])
+        diagnostics["retry_attempt_wrapper_only_has_internal_text"] = bool(assessment["wrapper_only_has_internal_text"])
+        diagnostics["retry_attempt_wrapper_only_noise_detected"] = bool(assessment["wrapper_only_noise_detected"])
+        diagnostics["retry_attempt_wrapper_only_boundary_suspected"] = bool(assessment["wrapper_only_boundary_suspected"])
+        diagnostics["retry_wrapper_recheck_attempted"] = bool(assessment["wrapper_recheck_attempted"])
+        diagnostics["retry_wrapper_recheck_found_payload"] = bool(assessment["wrapper_recheck_found_payload"])
+        diagnostics["retry_wrapper_recheck_reason"] = str(assessment["wrapper_recheck_reason"])
         diagnostics["retry_attempt_fragment_repair_pattern_matched"] = bool(assessment["fragment_repair_pattern_matched"])
         diagnostics["retry_attempt_fragment_repair_attempted"] = bool(assessment["fragment_repair_attempted"])
         diagnostics["retry_attempt_fragment_repair_succeeded"] = bool(assessment["fragment_repair_succeeded"])
@@ -4204,6 +4415,30 @@ class BrowserChatGPTTransport:
             ),
             "retry_attempt_block_forensics": (
                 list(retry_assessment["block_forensics"]) if retry_assessment is not None else []
+            ),
+            "retry_attempt_wrapper_only_block_count": (
+                int(retry_assessment["wrapper_only_block_count"]) if retry_assessment is not None else 0
+            ),
+            "retry_attempt_wrapper_only_payload_lengths": (
+                list(retry_assessment["wrapper_only_payload_lengths"]) if retry_assessment is not None else []
+            ),
+            "retry_attempt_wrapper_only_has_internal_text": (
+                bool(retry_assessment["wrapper_only_has_internal_text"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_wrapper_only_noise_detected": (
+                bool(retry_assessment["wrapper_only_noise_detected"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_wrapper_only_boundary_suspected": (
+                bool(retry_assessment["wrapper_only_boundary_suspected"]) if retry_assessment is not None else False
+            ),
+            "retry_wrapper_recheck_attempted": (
+                bool(retry_assessment["wrapper_recheck_attempted"]) if retry_assessment is not None else False
+            ),
+            "retry_wrapper_recheck_found_payload": (
+                bool(retry_assessment["wrapper_recheck_found_payload"]) if retry_assessment is not None else False
+            ),
+            "retry_wrapper_recheck_reason": (
+                str(retry_assessment["wrapper_recheck_reason"]) if retry_assessment is not None else ""
             ),
             "retry_attempt_fragment_repair_pattern_matched": (
                 bool(retry_assessment["fragment_repair_pattern_matched"]) if retry_assessment is not None else False

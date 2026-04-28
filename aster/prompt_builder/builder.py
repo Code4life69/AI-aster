@@ -120,6 +120,7 @@ class PromptBuilder:
         max_chars: int | None = None,
         retry_reason: str = "",
         retry_seed_used: bool = True,
+        wrapper_followup: bool = False,
     ) -> PromptPackage:
         if mode == "browser":
             return self._build_browser_retry(
@@ -130,6 +131,7 @@ class PromptBuilder:
                 max_chars=max_chars,
                 retry_reason=retry_reason,
                 retry_seed_used=retry_seed_used,
+                wrapper_followup=wrapper_followup,
             )
         retry_item = {
             "role": "user",
@@ -164,12 +166,14 @@ class PromptBuilder:
         max_chars: int | None,
         retry_reason: str,
         retry_seed_used: bool,
+        wrapper_followup: bool,
     ) -> PromptPackage:
         base_limit = max_chars or BROWSER_PROMPT_CHAR_LIMIT
         retry_message = self._build_browser_retry_message(
             prior_text,
             retry_reason=retry_reason,
             retry_seed_used=retry_seed_used,
+            wrapper_followup=wrapper_followup,
             max_chars=min(4_000, max(900, base_limit // 3)),
         )
         retry_item = {"role": "user", "content": retry_message}
@@ -186,6 +190,7 @@ class PromptBuilder:
                 prior_text,
                 retry_reason=retry_reason,
                 retry_seed_used=retry_seed_used,
+                wrapper_followup=wrapper_followup,
                 max_chars=available_retry_chars,
             ),
         }
@@ -200,6 +205,7 @@ class PromptBuilder:
             base_limit=base_limit,
             retry_reason=retry_reason,
             retry_seed_used=retry_seed_used,
+            wrapper_followup=wrapper_followup,
         )
         return PromptPackage(
             messages=messages,
@@ -208,11 +214,17 @@ class PromptBuilder:
             omitted_files=package.omitted_files,
             compacted=True,
             retry_prompt_mode=(
+                "browser_wrapper_only_retry_followup"
+                if wrapper_followup
+                else
                 "browser_seeded_retry"
                 if retry_seed_used and prior_text
                 else "browser_structured_output_only_retry"
             ),
             retry_prompt_strategy=(
+                "browser_retry_wrapper_only_corrective"
+                if wrapper_followup
+                else
                 "browser_retry_with_prior_excerpt"
                 if retry_seed_used and prior_text
                 else "browser_retry_structured_output_only"
@@ -408,12 +420,16 @@ class PromptBuilder:
             "multiple_retry_blocks",
             "ambiguous_multiple_retry_blocks",
             "fragmented_multi_block_retry_output",
-            "wrapper_only_multi_block_retry_output",
             "no_single_retry_block_selected",
         }:
             return (
                 "The previous browser reply returned more than one ASTER block or fragmented wrappers. "
                 "Return exactly one final ASTER block, never a draft plus revised copy, and never repeat the block."
+            )
+        if retry_reason == "wrapper_only_multi_block_retry_output":
+            return (
+                "The previous browser reply returned empty ASTER wrapper blocks without any JSON payload. "
+                "Return exactly one non-empty ASTER block with one complete JSON object inside it."
             )
         if retry_reason == "empty_response":
             return "The previous browser reply did not produce usable structured output. Return the final structured response only."
@@ -447,22 +463,35 @@ class PromptBuilder:
         *,
         retry_reason: str,
         retry_seed_used: bool,
+        wrapper_followup: bool,
         max_chars: int,
     ) -> str:
-        lines = [
-            "Retry mode for browser output:",
-            "- The previous browser response was invalid or incomplete.",
-            f"- Failure mode: {retry_reason or 'not_machine_parseable'}.",
-            f"- {self._retry_reason_instruction(retry_reason)}",
-            "- Return only one final ASTER_PATCH_BEGIN / ASTER_PATCH_END block.",
-            "- Inside the markers, output exactly one JSON object.",
-            "- Exactly one block is allowed. Any text before or after the block will fail validation.",
-            "- Never repeat the block, provide alternatives, or output multiple versions.",
-            '- Required top-level keys: "summary", "notes", "operations".',
-            "- Do not add commentary, explanations, prose, markdown fences, or code outside the structured block.",
-            "- Do not repeat prompt text, context listings, or browser instructions.",
-            "- If the provided context is insufficient, return NEED THESE FILES FIRST operations inside the JSON object.",
-        ]
+        if wrapper_followup:
+            lines = [
+                "Corrective retry mode for browser output:",
+                "- The previous retry returned empty ASTER wrapper blocks.",
+                "- Return exactly one ASTER_PATCH_BEGIN / ASTER_PATCH_END block.",
+                "- The block must contain one complete JSON object and must not be empty.",
+                "- Never output an empty wrapper, a second wrapper, a draft, or an alternative version.",
+                '- Required top-level keys: "summary", "notes", "operations".',
+                "- Do not add commentary, prose, markdown, or code outside the single block.",
+                "- If context is insufficient, return NEED THESE FILES FIRST operations inside the JSON object.",
+            ]
+        else:
+            lines = [
+                "Retry mode for browser output:",
+                "- The previous browser response was invalid or incomplete.",
+                f"- Failure mode: {retry_reason or 'not_machine_parseable'}.",
+                f"- {self._retry_reason_instruction(retry_reason)}",
+                "- Return only one final ASTER_PATCH_BEGIN / ASTER_PATCH_END block.",
+                "- Inside the markers, output exactly one JSON object.",
+                "- Exactly one block is allowed. Any text before or after the block will fail validation.",
+                "- Never repeat the block, provide alternatives, or output multiple versions.",
+                '- Required top-level keys: "summary", "notes", "operations".',
+                "- Do not add commentary, explanations, prose, markdown fences, or code outside the structured block.",
+                "- Do not repeat prompt text, context listings, or browser instructions.",
+                "- If the provided context is insufficient, return NEED THESE FILES FIRST operations inside the JSON object.",
+            ]
         if retry_seed_used and prior_text and prior_text.strip():
             lines.extend(
                 [
@@ -492,12 +521,14 @@ class PromptBuilder:
         base_limit: int,
         retry_reason: str,
         retry_seed_used: bool,
+        wrapper_followup: bool,
     ) -> tuple[list[dict[str, str]], int]:
         retry_limit = max(200, base_limit)
         retry_message = self._build_browser_retry_message(
             prior_text,
             retry_reason=retry_reason,
             retry_seed_used=retry_seed_used,
+            wrapper_followup=wrapper_followup,
             max_chars=retry_limit,
         )
         messages = [*base_messages, {"role": "user", "content": retry_message}]
@@ -511,6 +542,7 @@ class PromptBuilder:
                 prior_text,
                 retry_reason=retry_reason,
                 retry_seed_used=retry_seed_used,
+                wrapper_followup=wrapper_followup,
                 max_chars=retry_limit,
             )
             messages = [

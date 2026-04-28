@@ -159,3 +159,33 @@ def test_browser_retry_prompt_varies_by_retry_reason() -> None:
     assert "balanced braces/brackets" in unbalanced.messages[-1]["content"].lower()
     assert "returned more than one aster block" in multi_block.messages[-1]["content"].lower()
     assert "never repeat the block" in multi_block.messages[-1]["content"].lower()
+
+
+def test_browser_wrapper_only_followup_prompt_is_more_explicit() -> None:
+    builder = PromptBuilder()
+    context = CollectedContext(
+        project_root=Path("C:/demo"),
+        project_summary="Project root: C:/demo.",
+        file_tree="demo/\n- app.py",
+        relevant_files=[ContextFile(path="app.py", reason="source_or_related_file", content="print('ok')")],
+        skipped_files=[],
+    )
+
+    package = builder.build_retry(
+        "make me a calculator app",
+        context,
+        [],
+        None,
+        mode="browser",
+        max_chars=5_000,
+        retry_reason="wrapper_only_multi_block_retry_output",
+        retry_seed_used=False,
+        wrapper_followup=True,
+    )
+
+    retry_message = package.messages[-1]["content"].lower()
+    assert package.retry_prompt_mode == "browser_wrapper_only_retry_followup"
+    assert package.retry_prompt_strategy == "browser_retry_wrapper_only_corrective"
+    assert "empty aster wrapper blocks" in retry_message
+    assert "must not be empty" in retry_message
+    assert "never output an empty wrapper" in retry_message

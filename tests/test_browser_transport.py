@@ -890,7 +890,67 @@ def test_finalize_captured_reply_retry_attempt_classifies_wrapper_only_multi_blo
     assert diagnostics["retry_attempt_multiple_blocks_ambiguous"] is False
     assert diagnostics["retry_attempt_block_selection_reason"] == "wrapper_only_multi_block_fragments"
     assert diagnostics["retry_attempt_block_relationship"] == "wrapper_only_blocks"
+    assert diagnostics["retry_attempt_wrapper_only_block_count"] == 2
+    assert diagnostics["retry_attempt_wrapper_only_payload_lengths"] == [0, 0]
+    assert diagnostics["retry_attempt_wrapper_only_has_internal_text"] is False
+    assert diagnostics["retry_attempt_wrapper_only_noise_detected"] is False
+    assert diagnostics["retry_attempt_wrapper_only_boundary_suspected"] is False
+    assert diagnostics["retry_wrapper_recheck_attempted"] is False
+    assert diagnostics["retry_wrapper_recheck_found_payload"] is False
+    assert diagnostics["retry_wrapper_recheck_reason"] == "no_boundary_signal"
     assert all(item["block_kind"] == "wrapper_only_block" for item in diagnostics["retry_attempt_block_forensics"])
+
+
+def test_finalize_captured_reply_retry_attempt_characterizes_wrapper_only_internal_noise() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\nhello from a bad wrapper\nASTER_PATCH_END\n"
+            "ASTER_PATCH_BEGIN\nASTER_PATCH_END"
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
+    assert diagnostics["retry_attempt_failure_reason"] == "wrapper_only_multi_block_retry_output"
+    assert diagnostics["retry_attempt_wrapper_only_block_count"] == 2
+    assert diagnostics["retry_attempt_wrapper_only_payload_lengths"] == [24, 0]
+    assert diagnostics["retry_attempt_wrapper_only_has_internal_text"] is True
+    assert diagnostics["retry_attempt_wrapper_only_noise_detected"] is True
+    assert diagnostics["retry_attempt_wrapper_only_boundary_suspected"] is True
+    assert diagnostics["retry_wrapper_recheck_attempted"] is True
+    assert diagnostics["retry_wrapper_recheck_found_payload"] is False
+    assert diagnostics["retry_wrapper_recheck_reason"] == "boundary_suspected_but_no_payload"
+
+
+def test_wrapper_only_retry_recheck_recovers_hidden_payload_when_same_text_contains_it() -> None:
+    blocks = [
+        {
+            "index": 1,
+            "raw_block": (
+                "ASTER_PATCH_BEGIN\n"
+                '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"ok.txt","reason":"add","content":"ok"}]}\n'
+                "ASTER_PATCH_END"
+            ),
+            "block_kind": "wrapper_only_block",
+            "payload_state": "empty_payload",
+            "has_end_marker": True,
+        }
+    ]
+
+    selection = BrowserChatGPTTransport._attempt_wrapper_only_retry_recheck(
+        blocks[0]["raw_block"],
+        blocks,
+        outside_text="",
+    )
+
+    assert selection["recovered"] is True
+    assert selection["selection_reason"] == "wrapper_only_recheck_hidden_payload"
+    assert selection["wrapper_recheck_attempted"] is True
+    assert selection["wrapper_recheck_found_payload"] is True
+    assert selection["wrapper_recheck_reason"] == "inner_payload_parseable"
+    assert selection["selected_text"] == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"ok.txt","reason":"add","content":"ok"}]}'
 
 
 def test_finalize_captured_reply_retry_attempt_repairs_wrapper_plus_bare_object_fragment() -> None:

@@ -301,129 +301,98 @@ class AsterOrchestrator:
                 prior_text=prior_text,
                 retry_reason=str(retry_seed_metadata["retry_seed_validity_reason"]),
                 retry_seed_used=prior_text is not None,
+                wrapper_followup=False,
             )
-            self.logger.log(
-                "prompt_retry",
-                {
-                    "mode": mode,
-                    "prior_response_preview": raw[:500],
-                    "retry_seed_used": prior_text is not None,
-                    "retry_seed_valid": retry_seed_metadata["retry_seed_valid"],
-                    "retry_seed_validity_reason": retry_seed_metadata["retry_seed_validity_reason"],
-                    "retry_seed_validity_reason_source": retry_seed_metadata["retry_seed_validity_reason_source"],
-                    "retry_prior_response_length": len(prior_text or ""),
-                    "retry_prompt_mode": prompt_package.retry_prompt_mode,
-                    "retry_prompt_strategy": prompt_package.retry_prompt_strategy,
-                    "retry_prompt_reason": prompt_package.retry_prompt_reason,
-                    "retry_prompt_length": prompt_package.retry_prompt_length,
-                    "retry_prompt_compacted_relative_to_original": prompt_package.retry_prompt_compacted_relative_to_original,
-                    "retry_output_strict_mode": bool(prompt_package.retry_prompt_mode),
-                    **self._summarize_prompt_package(prompt_package),
-                },
+            self._log_prompt_retry_event(
+                mode=mode,
+                raw=raw,
+                prior_text=prior_text,
+                retry_seed_metadata=retry_seed_metadata,
+                prompt_package=prompt_package,
             )
             try:
                 return self.parser.parse(retried_raw)
             except Exception as retry_parse_error:
                 retry_parse_failure_kind = self._classify_retry_parse_failure_text(retried_raw)
                 retry_attempt_failure_reason = str(self._last_generation_metadata.get("retry_attempt_failure_reason", ""))
-                self.logger.log(
-                    "retry_parse_failure",
-                    {
-                        "mode": mode,
-                        "retry_seed_used": prior_text is not None,
-                        "retry_prior_response_length": len(prior_text or ""),
-                        "retry_seed_valid": retry_seed_metadata["retry_seed_valid"],
-                        "retry_seed_validity_reason": retry_seed_metadata["retry_seed_validity_reason"],
-                        "retry_seed_validity_reason_source": retry_seed_metadata["retry_seed_validity_reason_source"],
-                        "original_parse_failure_reason": self._format_parse_failure_reason(original_parse_error),
-                        "original_parse_text_source": "original_text",
-                        "retry_parse_failure_reason": self._format_parse_failure_reason(retry_parse_error),
-                        "retry_parse_text_source": "retry_text",
-                        "retry_parse_failure_kind": retry_parse_failure_kind,
-                        "retry_response_length": len(retried_raw),
-                        "retry_output_strict_mode": self._last_generation_metadata.get("retry_output_strict_mode", False),
-                        "retry_attempt_capture_mode": self._last_generation_metadata.get("retry_attempt_capture_mode", ""),
-                        "retry_attempt_acceptance_tier": self._last_generation_metadata.get(
-                            "retry_attempt_acceptance_tier",
-                            "",
-                        ),
-                        "retry_attempt_failure_reason": retry_attempt_failure_reason,
-                        "retry_attempt_structured_block_found": self._last_generation_metadata.get(
-                            "retry_attempt_structured_block_found",
-                            False,
-                        ),
-                        "retry_attempt_parseable": self._last_generation_metadata.get("retry_attempt_parseable", False),
-                        "retry_attempt_prose_contamination": self._last_generation_metadata.get(
-                            "retry_attempt_prose_contamination",
-                            False,
-                        ),
-                        "retry_attempt_wrapper_only": self._last_generation_metadata.get(
-                            "retry_attempt_wrapper_only",
-                            False,
-                        ),
-                        "retry_attempt_block_count": self._last_generation_metadata.get("retry_attempt_block_count", 0),
-                        "retry_attempt_exact_block_only": self._last_generation_metadata.get(
-                            "retry_attempt_exact_block_only",
-                            False,
-                        ),
-                        "retry_attempt_extra_text_detected": self._last_generation_metadata.get(
-                            "retry_attempt_extra_text_detected",
-                            False,
-                        ),
-                        "retry_attempt_json_object_count": self._last_generation_metadata.get(
-                            "retry_attempt_json_object_count",
-                            0,
-                        ),
-                        "retry_attempt_selected_block_index": self._last_generation_metadata.get(
-                            "retry_attempt_selected_block_index",
-                            None,
-                        ),
-                        "retry_attempt_block_selection_reason": self._last_generation_metadata.get(
-                            "retry_attempt_block_selection_reason",
-                            "",
-                        ),
-                        "retry_attempt_multiple_blocks_ambiguous": self._last_generation_metadata.get(
-                            "retry_attempt_multiple_blocks_ambiguous",
-                            False,
-                        ),
-                        "retry_attempt_multiple_blocks_recovered": self._last_generation_metadata.get(
-                            "retry_attempt_multiple_blocks_recovered",
-                            False,
-                        ),
-                        "retry_attempt_block_relationship": self._last_generation_metadata.get(
-                            "retry_attempt_block_relationship",
-                            "",
-                        ),
-                        "retry_attempt_block_forensics": self._last_generation_metadata.get(
-                            "retry_attempt_block_forensics",
-                            [],
-                        ),
-                        "retry_attempt_fragment_repair_pattern_matched": self._last_generation_metadata.get(
-                            "retry_attempt_fragment_repair_pattern_matched",
-                            False,
-                        ),
-                        "retry_attempt_fragment_repair_attempted": self._last_generation_metadata.get(
-                            "retry_attempt_fragment_repair_attempted",
-                            False,
-                        ),
-                        "retry_attempt_fragment_repair_succeeded": self._last_generation_metadata.get(
-                            "retry_attempt_fragment_repair_succeeded",
-                            False,
-                        ),
-                        "retry_attempt_fragment_repair_reason": self._last_generation_metadata.get(
-                            "retry_attempt_fragment_repair_reason",
-                            "",
-                        ),
-                        "retry_attempt_repaired_from_block_index": self._last_generation_metadata.get(
-                            "retry_attempt_repaired_from_block_index",
-                            None,
-                        ),
-                        "retry_attempt_discarded_wrapper_only_block_index": self._last_generation_metadata.get(
-                            "retry_attempt_discarded_wrapper_only_block_index",
-                            None,
-                        ),
-                    },
+                self._log_retry_parse_failure_event(
+                    mode=mode,
+                    prior_text=prior_text,
+                    retry_seed_metadata=retry_seed_metadata,
+                    original_parse_error=original_parse_error,
+                    retry_parse_error=retry_parse_error,
+                    retried_raw=retried_raw,
+                    retry_parse_failure_kind=retry_parse_failure_kind,
                 )
+                if self._should_try_wrapper_only_followup(mode, prior_text, retry_attempt_failure_reason):
+                    followup_retry_metadata = {
+                        "retry_seed_valid": False,
+                        "retry_seed_validity_reason": "wrapper_only_multi_block_retry_output",
+                        "retry_seed_validity_reason_source": "retry_attempt_failure_reason",
+                    }
+                    self._activity(
+                        "retry_wrapper_followup",
+                        "The strict retry returned empty ASTER wrapper blocks, so Aster is sending one corrective follow-up.",
+                        "This follow-up is limited to one extra attempt and only targets the wrapper-only retry shape.",
+                        status="warning",
+                    )
+                    followup_raw, followup_prompt_package = self._generate_with_prompt_retries(
+                        goal,
+                        context,
+                        history,
+                        mode,
+                        prior_text=None,
+                        retry_reason="wrapper_only_multi_block_retry_output",
+                        retry_seed_used=False,
+                        wrapper_followup=True,
+                    )
+                    self._log_prompt_retry_event(
+                        mode=mode,
+                        raw=retried_raw,
+                        prior_text=None,
+                        retry_seed_metadata=followup_retry_metadata,
+                        prompt_package=followup_prompt_package,
+                        wrapper_followup_attempted=True,
+                        wrapper_followup_reason="wrapper_only_multi_block_retry_output",
+                    )
+                    try:
+                        plan = self.parser.parse(followup_raw)
+                    except Exception as followup_parse_error:
+                        followup_parse_failure_kind = self._classify_retry_parse_failure_text(followup_raw)
+                        followup_failure_reason = str(self._last_generation_metadata.get("retry_attempt_failure_reason", ""))
+                        self._log_retry_parse_failure_event(
+                            mode=mode,
+                            prior_text=None,
+                            retry_seed_metadata=followup_retry_metadata,
+                            original_parse_error=original_parse_error,
+                            retry_parse_error=followup_parse_error,
+                            retried_raw=followup_raw,
+                            retry_parse_failure_kind=followup_parse_failure_kind,
+                            wrapper_followup_attempted=True,
+                            wrapper_followup_prompt_mode=followup_prompt_package.retry_prompt_mode,
+                            wrapper_followup_reason="wrapper_only_multi_block_retry_output",
+                            wrapper_followup_succeeded=False,
+                            wrapper_followup_failure_reason=(followup_failure_reason or followup_parse_failure_kind),
+                            retry_text_source="retry_text_followup",
+                        )
+                        raise RuntimeError(
+                            "Browser retry response was not machine-parseable. "
+                            "Aster retried without reusing any preserved retry seed, and the wrapper-only corrective "
+                            "follow-up still could not be parsed "
+                            f"({self._wrapper_followup_failure_label(followup_failure_reason, followup_parse_failure_kind)})."
+                        ) from followup_parse_error
+                    self.logger.log(
+                        "retry_wrapper_followup_result",
+                        {
+                            "mode": mode,
+                            "retry_wrapper_followup_attempted": True,
+                            "retry_wrapper_followup_prompt_mode": followup_prompt_package.retry_prompt_mode,
+                            "retry_wrapper_followup_reason": "wrapper_only_multi_block_retry_output",
+                            "retry_wrapper_followup_succeeded": True,
+                            "retry_wrapper_followup_failure_reason": "",
+                        },
+                    )
+                    return plan
                 if mode == "browser":
                     seed_state = (
                         "after reusing a preserved retry seed"
@@ -464,6 +433,217 @@ class AsterOrchestrator:
         message = str(exc).strip()
         return type(exc).__name__ if not message else f"{type(exc).__name__}: {message}"
 
+    def _retry_attempt_metadata_fields(self) -> dict[str, object]:
+        return {
+            "retry_output_strict_mode": self._last_generation_metadata.get("retry_output_strict_mode", False),
+            "retry_attempt_capture_mode": self._last_generation_metadata.get("retry_attempt_capture_mode", ""),
+            "retry_attempt_acceptance_tier": self._last_generation_metadata.get(
+                "retry_attempt_acceptance_tier",
+                "",
+            ),
+            "retry_attempt_failure_reason": self._last_generation_metadata.get("retry_attempt_failure_reason", ""),
+            "retry_attempt_structured_block_found": self._last_generation_metadata.get(
+                "retry_attempt_structured_block_found",
+                False,
+            ),
+            "retry_attempt_parseable": self._last_generation_metadata.get("retry_attempt_parseable", False),
+            "retry_attempt_prose_contamination": self._last_generation_metadata.get(
+                "retry_attempt_prose_contamination",
+                False,
+            ),
+            "retry_attempt_wrapper_only": self._last_generation_metadata.get("retry_attempt_wrapper_only", False),
+            "retry_attempt_block_count": self._last_generation_metadata.get("retry_attempt_block_count", 0),
+            "retry_attempt_exact_block_only": self._last_generation_metadata.get(
+                "retry_attempt_exact_block_only",
+                False,
+            ),
+            "retry_attempt_extra_text_detected": self._last_generation_metadata.get(
+                "retry_attempt_extra_text_detected",
+                False,
+            ),
+            "retry_attempt_json_object_count": self._last_generation_metadata.get(
+                "retry_attempt_json_object_count",
+                0,
+            ),
+            "retry_attempt_selected_block_index": self._last_generation_metadata.get(
+                "retry_attempt_selected_block_index",
+                None,
+            ),
+            "retry_attempt_block_selection_reason": self._last_generation_metadata.get(
+                "retry_attempt_block_selection_reason",
+                "",
+            ),
+            "retry_attempt_multiple_blocks_ambiguous": self._last_generation_metadata.get(
+                "retry_attempt_multiple_blocks_ambiguous",
+                False,
+            ),
+            "retry_attempt_multiple_blocks_recovered": self._last_generation_metadata.get(
+                "retry_attempt_multiple_blocks_recovered",
+                False,
+            ),
+            "retry_attempt_block_relationship": self._last_generation_metadata.get(
+                "retry_attempt_block_relationship",
+                "",
+            ),
+            "retry_attempt_block_forensics": self._last_generation_metadata.get(
+                "retry_attempt_block_forensics",
+                [],
+            ),
+            "retry_attempt_wrapper_only_block_count": self._last_generation_metadata.get(
+                "retry_attempt_wrapper_only_block_count",
+                0,
+            ),
+            "retry_attempt_wrapper_only_payload_lengths": self._last_generation_metadata.get(
+                "retry_attempt_wrapper_only_payload_lengths",
+                [],
+            ),
+            "retry_attempt_wrapper_only_has_internal_text": self._last_generation_metadata.get(
+                "retry_attempt_wrapper_only_has_internal_text",
+                False,
+            ),
+            "retry_attempt_wrapper_only_noise_detected": self._last_generation_metadata.get(
+                "retry_attempt_wrapper_only_noise_detected",
+                False,
+            ),
+            "retry_attempt_wrapper_only_boundary_suspected": self._last_generation_metadata.get(
+                "retry_attempt_wrapper_only_boundary_suspected",
+                False,
+            ),
+            "retry_wrapper_recheck_attempted": self._last_generation_metadata.get(
+                "retry_wrapper_recheck_attempted",
+                False,
+            ),
+            "retry_wrapper_recheck_found_payload": self._last_generation_metadata.get(
+                "retry_wrapper_recheck_found_payload",
+                False,
+            ),
+            "retry_wrapper_recheck_reason": self._last_generation_metadata.get(
+                "retry_wrapper_recheck_reason",
+                "",
+            ),
+            "retry_attempt_fragment_repair_pattern_matched": self._last_generation_metadata.get(
+                "retry_attempt_fragment_repair_pattern_matched",
+                False,
+            ),
+            "retry_attempt_fragment_repair_attempted": self._last_generation_metadata.get(
+                "retry_attempt_fragment_repair_attempted",
+                False,
+            ),
+            "retry_attempt_fragment_repair_succeeded": self._last_generation_metadata.get(
+                "retry_attempt_fragment_repair_succeeded",
+                False,
+            ),
+            "retry_attempt_fragment_repair_reason": self._last_generation_metadata.get(
+                "retry_attempt_fragment_repair_reason",
+                "",
+            ),
+            "retry_attempt_repaired_from_block_index": self._last_generation_metadata.get(
+                "retry_attempt_repaired_from_block_index",
+                None,
+            ),
+            "retry_attempt_discarded_wrapper_only_block_index": self._last_generation_metadata.get(
+                "retry_attempt_discarded_wrapper_only_block_index",
+                None,
+            ),
+        }
+
+    def _log_prompt_retry_event(
+        self,
+        *,
+        mode: str,
+        raw: str,
+        prior_text: str | None,
+        retry_seed_metadata: dict[str, object],
+        prompt_package,
+        wrapper_followup_attempted: bool = False,
+        wrapper_followup_reason: str = "",
+        wrapper_followup_succeeded: bool = False,
+        wrapper_followup_failure_reason: str = "",
+    ) -> None:
+        self.logger.log(
+            "prompt_retry",
+            {
+                "mode": mode,
+                "prior_response_preview": raw[:500],
+                "retry_seed_used": prior_text is not None,
+                "retry_seed_valid": retry_seed_metadata["retry_seed_valid"],
+                "retry_seed_validity_reason": retry_seed_metadata["retry_seed_validity_reason"],
+                "retry_seed_validity_reason_source": retry_seed_metadata["retry_seed_validity_reason_source"],
+                "retry_prior_response_length": len(prior_text or ""),
+                "retry_prompt_mode": prompt_package.retry_prompt_mode,
+                "retry_prompt_strategy": prompt_package.retry_prompt_strategy,
+                "retry_prompt_reason": prompt_package.retry_prompt_reason,
+                "retry_prompt_length": prompt_package.retry_prompt_length,
+                "retry_prompt_compacted_relative_to_original": prompt_package.retry_prompt_compacted_relative_to_original,
+                "retry_output_strict_mode": bool(prompt_package.retry_prompt_mode),
+                "retry_wrapper_followup_attempted": wrapper_followup_attempted,
+                "retry_wrapper_followup_prompt_mode": (
+                    prompt_package.retry_prompt_mode if wrapper_followup_attempted else ""
+                ),
+                "retry_wrapper_followup_reason": wrapper_followup_reason,
+                "retry_wrapper_followup_succeeded": wrapper_followup_succeeded,
+                "retry_wrapper_followup_failure_reason": wrapper_followup_failure_reason,
+                **self._summarize_prompt_package(prompt_package),
+            },
+        )
+
+    def _log_retry_parse_failure_event(
+        self,
+        *,
+        mode: str,
+        prior_text: str | None,
+        retry_seed_metadata: dict[str, object],
+        original_parse_error: Exception,
+        retry_parse_error: Exception,
+        retried_raw: str,
+        retry_parse_failure_kind: str,
+        wrapper_followup_attempted: bool = False,
+        wrapper_followup_prompt_mode: str = "",
+        wrapper_followup_reason: str = "",
+        wrapper_followup_succeeded: bool = False,
+        wrapper_followup_failure_reason: str = "",
+        retry_text_source: str = "retry_text",
+    ) -> None:
+        self.logger.log(
+            "retry_parse_failure",
+            {
+                "mode": mode,
+                "retry_seed_used": prior_text is not None,
+                "retry_prior_response_length": len(prior_text or ""),
+                "retry_seed_valid": retry_seed_metadata["retry_seed_valid"],
+                "retry_seed_validity_reason": retry_seed_metadata["retry_seed_validity_reason"],
+                "retry_seed_validity_reason_source": retry_seed_metadata["retry_seed_validity_reason_source"],
+                "original_parse_failure_reason": self._format_parse_failure_reason(original_parse_error),
+                "original_parse_text_source": "original_text",
+                "retry_parse_failure_reason": self._format_parse_failure_reason(retry_parse_error),
+                "retry_parse_text_source": retry_text_source,
+                "retry_parse_failure_kind": retry_parse_failure_kind,
+                "retry_response_length": len(retried_raw),
+                "retry_wrapper_followup_attempted": wrapper_followup_attempted,
+                "retry_wrapper_followup_prompt_mode": wrapper_followup_prompt_mode,
+                "retry_wrapper_followup_reason": wrapper_followup_reason,
+                "retry_wrapper_followup_succeeded": wrapper_followup_succeeded,
+                "retry_wrapper_followup_failure_reason": wrapper_followup_failure_reason,
+                **self._retry_attempt_metadata_fields(),
+            },
+        )
+
+    @staticmethod
+    def _should_try_wrapper_only_followup(mode: str, prior_text: str | None, retry_attempt_failure_reason: str) -> bool:
+        return (
+            mode == "browser"
+            and prior_text is None
+            and retry_attempt_failure_reason == "wrapper_only_multi_block_retry_output"
+        )
+
+    @staticmethod
+    def _wrapper_followup_failure_label(retry_attempt_failure_reason: str, retry_parse_failure_kind: str) -> str:
+        if retry_attempt_failure_reason == "wrapper_only_multi_block_retry_output":
+            return "persistent_wrapper_only_retry_output"
+        if retry_attempt_failure_reason:
+            return "wrapper_only_followup_failed"
+        return "wrapper_only_followup_failed" if retry_parse_failure_kind else "wrapper_only_followup_failed"
+
     def _build_commit_message(self, plan: ParsedPlan) -> str:
         summary = " ".join(plan.summary.split()).strip()
         summary = summary[:72] if summary else "apply patch plan"
@@ -493,6 +673,7 @@ class AsterOrchestrator:
         prior_text: str | None = None,
         retry_reason: str = "",
         retry_seed_used: bool = False,
+        wrapper_followup: bool = False,
     ):
         budgets = self._prompt_budgets(mode)
         for attempt_index, budget in enumerate(budgets, start=1):
@@ -505,6 +686,7 @@ class AsterOrchestrator:
                 prior_text=prior_text,
                 retry_reason=retry_reason,
                 retry_seed_used=retry_seed_used,
+                wrapper_followup=wrapper_followup,
             )
             if mode == "browser":
                 self._activity(
@@ -582,6 +764,7 @@ class AsterOrchestrator:
         prior_text: str | None = None,
         retry_reason: str = "",
         retry_seed_used: bool = False,
+        wrapper_followup: bool = False,
     ):
         if prior_text is None and not retry_reason:
             return self.prompt_builder.build(
@@ -600,6 +783,7 @@ class AsterOrchestrator:
             max_chars=max_chars,
             retry_reason=retry_reason,
             retry_seed_used=retry_seed_used,
+            wrapper_followup=wrapper_followup,
         )
 
     def _prompt_budgets(self, mode: str) -> list[int]:
