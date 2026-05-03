@@ -482,6 +482,60 @@ def test_reply_detection_accepts_streaming_state_even_without_text_candidate() -
     assert started is True
 
 
+def test_reply_detection_accepts_idle_composer_reset_after_send_attempt_with_low_signal_candidate() -> None:
+    transport = BrowserChatGPTTransport()
+    transport._executor = _FakeExecutor(
+        'f"type":"CREATE FILE","path":"calculator_gui/README.md","reason":"Document how to run the calculator"}'
+    )
+    transport._capture = object()
+    transport._ocr = object()
+    transport._logger = None
+
+    started = transport._reply_started(
+        before_lines=[_Line("Ask anything")],
+        after_lines=[_Line("Calculator GUI Project"), _Line("Ask anything")],
+        target=object(),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        },
+        send_attempted=True,
+    )
+
+    assert started is True
+
+
+def test_reply_detection_does_not_accept_idle_composer_reset_without_send_attempt() -> None:
+    transport = BrowserChatGPTTransport()
+    transport._executor = _FakeExecutor(
+        'f"type":"CREATE FILE","path":"calculator_gui/README.md","reason":"Document how to run the calculator"}'
+    )
+    transport._capture = object()
+    transport._ocr = object()
+    transport._logger = None
+
+    started = transport._reply_started(
+        before_lines=[_Line("Ask anything")],
+        after_lines=[_Line("Calculator GUI Project"), _Line("Ask anything")],
+        target=object(),
+        ui_state={
+            "show_in_text_field_present": False,
+            "send_prompt_present": False,
+            "send_prompt_enabled": None,
+            "stop_streaming_present": False,
+            "composer_edit_length": 12,
+            "composer_edit_preview": "Ask anything",
+        },
+        send_attempted=False,
+    )
+
+    assert started is False
+
+
 def test_capture_reply_text_timeout_preserves_best_structured_candidate(monkeypatch) -> None:
     transport = BrowserChatGPTTransport()
     transport._executor = _FakeExecutor("")
@@ -1061,6 +1115,73 @@ def test_finalize_captured_reply_retry_attempt_does_not_repair_weak_fragment() -
     assert diagnostics["retry_attempt_fragment_repair_reason"] == "insufficient_schema_hits"
 
 
+def test_retry_attempt_prefers_uia_fragment_over_noisier_ocr_fragment() -> None:
+    transport = BrowserChatGPTTransport()
+
+    candidate, meta = transport._choose_retry_attempt_candidate_sources(
+        ocr_text=(
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"ok.txt","reason":"add","content":"ok"}'
+            "\nAdditional OCR junk line that should not outrank the cleaner UIA fragment.\n"
+        ),
+        uia_text=(
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"ok.txt","reason":"add","content":"ok"}]'
+        ),
+        prompt_anchor=None,
+    )
+
+    assert candidate is not None
+    assert candidate[0] == "uia"
+    assert meta["fragment_source_preference"] == "prefer_uia_fragment_over_ocr"
+    assert meta["fragment_source_chosen"] == "uia"
+    assert meta["fragment_uia_available"] is True
+    assert meta["fragment_ocr_available"] is True
+
+
+def test_retry_attempt_assessment_repairs_ocr_corrupted_fragment_when_cleanup_is_sufficient() -> None:
+    transport = BrowserChatGPTTransport()
+
+    assessment = transport._assess_retry_attempt_response(
+        (
+            "ASTER_PATCH_BEGIN\nASTER_PATCH_END\n"
+            'ASTER_PATCH_BEGIN\n{\u201csummary\u201d:\u201cok\u201d,\u201cn0tes\u201d:[],\u201c0perati0ns\u201d:[{\u201ctype\u201d:\u201cCREATE FILE\u201d,\u201cpath\u201d:\u201cok.txt\u201d,\u201creason\u201d:\u201cadd\u201d,\u201ccontent\u201d:\u201cok\u201d}]'
+        ),
+        candidate_source="ocr",
+    )
+
+    assert assessment["failure_reason"] == ""
+    assert assessment["selected_text"] == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"ok.txt","reason":"add","content":"ok"}]}'
+    assert assessment["fragment_repair_succeeded"] is True
+    assert assessment["fragment_repair_parseable_after_cleanup"] is True
+    assert assessment["ocr_cleanup_attempted"] is True
+    assert assessment["ocr_cleanup_succeeded"] is True
+    assert assessment["ocr_cleanup_reason"] == "ocr_cleanup_and_balanced_closure"
+    assert "smart_quotes" in assessment["ocr_defect_types"]
+    assert "schema_key_ocr" in assessment["ocr_defect_types"]
+
+
+def test_retry_attempt_assessment_rejects_deeply_corrupted_ocr_fragment() -> None:
+    transport = BrowserChatGPTTransport()
+
+    assessment = transport._assess_retry_attempt_response(
+        (
+            "ASTER_PATCH_BEGIN\nASTER_PATCH_END\n"
+            'ASTER_PATCH_BEGIN\n{\u201csummary\u201d:\u201cok\u201d,\u201cn0tes\u201d:[],\u201c0perati0ns\u201d:[{\u201ctype\u201d:\u201cCREATE FILE\u201d,\u201cpath\u201d:\u201cok.txt\u201d,\u201creason\u201d:\u201cadd\u201d,\u201ccontent\u201d:\u201cok\u201d,\u201cbadvalue\u201d:::\u201d???'
+        ),
+        candidate_source="ocr",
+    )
+
+    assert assessment["failure_reason"] == "fragment_repair_not_parseable"
+    assert assessment["selected_text"] == ""
+    assert assessment["fragment_repair_succeeded"] is False
+    assert assessment["fragment_repair_parseable_after_cleanup"] is False
+    assert assessment["ocr_cleanup_attempted"] is True
+    assert assessment["ocr_cleanup_succeeded"] is False
+    assert assessment["ocr_cleanup_reason"] == "cleanup_candidate_not_parseable"
+    assert assessment["block_relationship"] == "wrapper_only_plus_fragmented_block"
+
+
 def test_capture_reply_text_does_not_require_anchor_when_thread_was_not_reused(monkeypatch) -> None:
     transport = BrowserChatGPTTransport(thread_reuse_enabled=True)
     transport._executor = _FakeExecutor("")
@@ -1211,11 +1332,7 @@ def test_capture_reply_text_retry_attempt_prefers_exact_structured_block(monkeyp
         '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}\n'
         "ASTER_PATCH_END"
     )
-    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: ("", "")
-    monkeypatch.setattr(
-        "aster.transport_browser.browser_transport.choose_best_reply_candidate_for_policy",
-        lambda *_args, **_kwargs: ("uia", reply_text, 350.0),
-    )
+    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: ("", reply_text)
     monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("aster.transport_browser.browser_transport.time.monotonic", _MonotonicClock())
 
@@ -1238,7 +1355,7 @@ def test_capture_reply_text_retry_attempt_prefers_exact_structured_block(monkeyp
     assert "ASTER_PATCH_BEGIN" not in reply
 
 
-def test_capture_reply_text_retry_attempt_rejects_prose_wrapped_block(monkeypatch) -> None:
+def test_capture_reply_text_retry_attempt_recovers_prose_wrapped_block(monkeypatch) -> None:
     logger = _FakeAuditLogger()
     transport = BrowserChatGPTTransport(logger=logger)
     transport._executor = _FakeExecutor("")
@@ -1258,9 +1375,7 @@ def test_capture_reply_text_retry_attempt_rejects_prose_wrapped_block(monkeypatc
         "ASTER_PATCH_END\n"
         "Done."
     )
-    replies = iter([("", reply_text), ("", "")])
-    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: next(replies)
-    transport._capture_reply_text_by_scrolling = lambda *_args, **_kwargs: ""
+    transport._capture_visible_reply_sources = lambda target, before_lines, prompt, lines=None: ("", reply_text)
     monkeypatch.setattr("aster.transport_browser.browser_transport.time.sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("aster.transport_browser.browser_transport.time.monotonic", _MonotonicClock())
 
@@ -1278,10 +1393,11 @@ def test_capture_reply_text_retry_attempt_rejects_prose_wrapped_block(monkeypatc
         retry_attempt=True,
     )
 
-    assert reply == ""
-    timeout_events = _notice_events(logger, "reply_wait_timeout")
-    assert timeout_events
-    assert timeout_events[-1]["retry_attempt_failure_reason"] == "prose_contaminated_retry_response"
+    assert reply == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"app.py","reason":"add","content":"print(1)"}]}'
+    accepted_events = _notice_events(logger, "reply_candidate_accepted")
+    assert accepted_events
+    assert accepted_events[-1]["acceptance_tier"] == "retry_structured_embedded_block"
+    assert accepted_events[-1]["retry_attempt_failure_reason"] == ""
 
 
 def test_generate_salvages_final_structured_block_from_trusted_capture(monkeypatch) -> None:

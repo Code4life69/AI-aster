@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import difflib
 import hashlib
 import json
 import os
@@ -469,6 +470,7 @@ class BrowserChatGPTTransport:
         self._last_reply_capture_snapshot = _ReplyCaptureSnapshot()
         self._last_reply_region_visual_evidence: dict[str, Any] = {}
         self._last_scrolled_capture_meta: dict[str, Any] = {}
+        self._last_retry_fragment_source_meta: dict[str, Any] = self._retry_source_preference_defaults()
         self._last_uia_reply_read_diagnostics: dict[str, Any] = {
             "uia_read_failure_reason": "",
             "descendant_enumeration_guard_triggered": False,
@@ -1286,6 +1288,10 @@ class BrowserChatGPTTransport:
                         "retry_attempt_discarded_wrapper_only_block_index",
                         None,
                     ),
+                    "retry_attempt_fragment_repair_parseable_after_cleanup": final_capture_diagnostics.get(
+                        "retry_attempt_fragment_repair_parseable_after_cleanup",
+                        False,
+                    ),
                     "retry_attempt_json_cleanup_attempted": final_capture_diagnostics.get(
                         "retry_attempt_json_cleanup_attempted",
                         False,
@@ -1313,6 +1319,38 @@ class BrowserChatGPTTransport:
                     "retry_attempt_prose_recovery_reason": final_capture_diagnostics.get(
                         "retry_attempt_prose_recovery_reason",
                         "",
+                    ),
+                    "retry_attempt_fragment_source_preference": final_capture_diagnostics.get(
+                        "retry_attempt_fragment_source_preference",
+                        "",
+                    ),
+                    "retry_attempt_fragment_source_chosen": final_capture_diagnostics.get(
+                        "retry_attempt_fragment_source_chosen",
+                        "",
+                    ),
+                    "retry_attempt_fragment_uia_available": final_capture_diagnostics.get(
+                        "retry_attempt_fragment_uia_available",
+                        False,
+                    ),
+                    "retry_attempt_fragment_ocr_available": final_capture_diagnostics.get(
+                        "retry_attempt_fragment_ocr_available",
+                        False,
+                    ),
+                    "retry_attempt_ocr_cleanup_attempted": final_capture_diagnostics.get(
+                        "retry_attempt_ocr_cleanup_attempted",
+                        False,
+                    ),
+                    "retry_attempt_ocr_cleanup_succeeded": final_capture_diagnostics.get(
+                        "retry_attempt_ocr_cleanup_succeeded",
+                        False,
+                    ),
+                    "retry_attempt_ocr_cleanup_reason": final_capture_diagnostics.get(
+                        "retry_attempt_ocr_cleanup_reason",
+                        "",
+                    ),
+                    "retry_attempt_ocr_defect_types": final_capture_diagnostics.get(
+                        "retry_attempt_ocr_defect_types",
+                        [],
                     ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
@@ -1433,7 +1471,13 @@ class BrowserChatGPTTransport:
                 time.sleep(1.5)
                 continue
 
-            if send_attempt > 0 and self._reply_started(before_lines, lines, target, ui_state=ui_state):
+            if send_attempt > 0 and self._reply_started(
+                before_lines,
+                lines,
+                target,
+                ui_state=ui_state,
+                send_attempted=True,
+            ):
                 self._log("reply_started_before_send_retry", {"send_attempts": send_attempt})
                 self._activity(
                     "browser_reply_started",
@@ -1471,7 +1515,13 @@ class BrowserChatGPTTransport:
                     return
                 continue
 
-            if send_attempt > 0 and self._reply_started(before_lines, lines, target, ui_state=ui_state):
+            if send_attempt > 0 and self._reply_started(
+                before_lines,
+                lines,
+                target,
+                ui_state=ui_state,
+                send_attempted=True,
+            ):
                 self._log("reply_started_before_send_loop_exit", {"send_attempts": send_attempt})
                 self._activity(
                     "browser_reply_started",
@@ -1489,7 +1539,31 @@ class BrowserChatGPTTransport:
             "The browser page did not transition from composer state to reply state."
         )
 
-    def _reply_started(self, before_lines, after_lines, target, ui_state: dict[str, Any] | None = None) -> bool:
+    @staticmethod
+    def _composer_looks_idle_after_send(ui_state: dict[str, Any] | None) -> bool:
+        state = ui_state or {}
+        if state.get("send_prompt_present") or state.get("show_in_text_field_present"):
+            return False
+        preview = _normalize(str(state.get("composer_edit_preview", "")))
+        if not preview:
+            return False
+        idle_hints = ("ask anything", "message chatgpt", "type a message", "send a message")
+        if not any(hint in preview for hint in idle_hints):
+            return False
+        composer_length = state.get("composer_edit_length")
+        if isinstance(composer_length, int):
+            return composer_length <= 24
+        return composer_length in {None, "unknown"}
+
+    def _reply_started(
+        self,
+        before_lines,
+        after_lines,
+        target,
+        ui_state: dict[str, Any] | None = None,
+        *,
+        send_attempted: bool = False,
+    ) -> bool:
         state = ui_state or self._ui_state(target)
         if (
             state.get("stop_streaming_present")
@@ -1530,6 +1604,16 @@ class BrowserChatGPTTransport:
                         "ui_state": state,
                     },
                 )
+                if send_attempted and self._composer_looks_idle_after_send(state):
+                    self._log(
+                        "reply_started_after_composer_reset",
+                        {
+                            "reason": "low_signal_candidate_but_idle_composer_reset",
+                            "candidate_preview": candidate[:160],
+                            "ui_state": state,
+                        },
+                    )
+                    return True
                 return False
             return True
         before_text = {_normalize(line.text) for line in before_lines}
@@ -1567,6 +1651,16 @@ class BrowserChatGPTTransport:
                         "ui_state": state,
                     },
                 )
+                if send_attempted and self._composer_looks_idle_after_send(state):
+                    self._log(
+                        "reply_started_after_composer_reset",
+                        {
+                            "reason": "low_signal_line_but_idle_composer_reset",
+                            "line_preview": lowered[:160],
+                            "ui_state": state,
+                        },
+                    )
+                    return True
                 return False
             return True
         return False
@@ -2414,7 +2508,7 @@ class BrowserChatGPTTransport:
             image = self._capture.capture_region(target.left, target.top, target.width, target.height)
             lines = self._ocr.extract(image)
             ui_state = self._ui_state(target)
-            if self._reply_started(before_lines, lines, target, ui_state=ui_state):
+            if self._reply_started(before_lines, lines, target, ui_state=ui_state, send_attempted=True):
                 return True
             time.sleep(0.6)
         return False
@@ -2635,6 +2729,7 @@ class BrowserChatGPTTransport:
         deadline = time.monotonic() + timeout_sec
         self._last_reply_region_visual_evidence = {}
         self._last_scrolled_capture_meta = {}
+        self._last_retry_fragment_source_meta = self._retry_source_preference_defaults()
         best_text = ""
         best_source = ""
         best_score = float("-inf")
@@ -2659,14 +2754,22 @@ class BrowserChatGPTTransport:
             lines = self._ocr.extract(image)
             self._raise_for_browser_error(lines, ui_state, stage="reply_capture")
             ocr_text, uia_text = self._capture_visible_reply_sources(target, before_lines, prompt, lines=lines)
-            current_best = choose_best_reply_candidate_for_policy(
-                {
-                    "ocr": ocr_text,
-                    "uia": uia_text,
-                },
-                policy=REPLY_TRACKER_POLICY,
-                prompt_anchor=prompt_anchor,
-            )
+            if retry_attempt:
+                current_best, self._last_retry_fragment_source_meta = self._choose_retry_attempt_candidate_sources(
+                    ocr_text=ocr_text,
+                    uia_text=uia_text,
+                    prompt_anchor=prompt_anchor,
+                )
+            else:
+                self._last_retry_fragment_source_meta = self._retry_source_preference_defaults()
+                current_best = choose_best_reply_candidate_for_policy(
+                    {
+                        "ocr": ocr_text,
+                        "uia": uia_text,
+                    },
+                    policy=REPLY_TRACKER_POLICY,
+                    prompt_anchor=prompt_anchor,
+                )
             current_stable_hits = stable_structured_hits
             if current_best is not None and looks_like_patch_plan_json(current_best[1]):
                 current_stable_hits = stable_structured_hits + 1 if current_best[1] == last_structured else 0
@@ -3771,6 +3874,7 @@ class BrowserChatGPTTransport:
             "fragment_repair_attempted": False,
             "fragment_repair_succeeded": False,
             "fragment_repair_reason": "",
+            "fragment_repair_parseable_after_cleanup": False,
             "repaired_from_block_index": None,
             "discarded_wrapper_only_block_index": None,
             "wrapper_only_block_count": 0,
@@ -3788,6 +3892,10 @@ class BrowserChatGPTTransport:
             "prose_recovery_attempted": False,
             "prose_recovery_succeeded": False,
             "prose_recovery_reason": "",
+            "ocr_cleanup_attempted": False,
+            "ocr_cleanup_succeeded": False,
+            "ocr_cleanup_reason": "",
+            "ocr_defect_types": [],
         }
 
     @staticmethod
@@ -3808,6 +3916,191 @@ class BrowserChatGPTTransport:
             flags=re.IGNORECASE,
         )
         return text
+
+    @staticmethod
+    def _retry_source_preference_defaults() -> dict[str, Any]:
+        return {
+            "fragment_source_preference": "",
+            "fragment_source_chosen": "",
+            "fragment_uia_available": False,
+            "fragment_ocr_available": False,
+        }
+
+    @staticmethod
+    def _retry_fragment_assessment_metrics(assessment: dict[str, Any]) -> tuple[int, int]:
+        forensics = list(assessment.get("block_forensics", []))
+        max_schema_hits = 0
+        balance_penalty = 99
+        for item in forensics:
+            max_schema_hits = max(max_schema_hits, int(item.get("raw_schema_hits", item.get("schema_hits", 0))))
+            balance_penalty = min(
+                balance_penalty,
+                abs(int(item.get("brace_balance", 0))) + abs(int(item.get("bracket_balance", 0))),
+            )
+        if balance_penalty == 99:
+            balance_penalty = 0
+        return max_schema_hits, balance_penalty
+
+    @classmethod
+    def _retry_fragment_assessment_strength(cls, assessment: dict[str, Any], *, source: str) -> tuple[int, int, int, int, int, int]:
+        max_schema_hits, balance_penalty = cls._retry_fragment_assessment_metrics(assessment)
+        return (
+            int(bool(assessment.get("selected_text"))),
+            int(bool(assessment.get("parseable"))),
+            int(bool(assessment.get("structured_block_found"))),
+            max_schema_hits,
+            -balance_penalty,
+            int(source == "uia"),
+        )
+
+    def _choose_retry_attempt_candidate_sources(
+        self,
+        *,
+        ocr_text: str,
+        uia_text: str,
+        prompt_anchor,
+    ) -> tuple[tuple[str, str, float] | None, dict[str, Any]]:
+        meta = self._retry_source_preference_defaults()
+        available: dict[str, tuple[str, str, float]] = {}
+        assessments: dict[str, dict[str, Any]] = {}
+        for source, text in (("uia", uia_text), ("ocr", ocr_text)):
+            if not text.strip():
+                continue
+            candidate = choose_best_reply_candidate_for_policy(
+                {source: text},
+                policy=REPLY_TRACKER_POLICY,
+                prompt_anchor=prompt_anchor,
+            )
+            candidate_score = (
+                candidate[2]
+                if candidate is not None
+                else score_candidate_for_policy(text, policy=REPLY_TRACKER_POLICY)
+            )
+            # Retry-attempt assessment needs the raw captured source text so it can
+            # reason about wrapper completeness, prose contamination, and malformed
+            # multi-block fragments before any block extraction short-circuits that view.
+            available[source] = (source, text, candidate_score)
+            assessments[source] = self._assess_retry_attempt_response(text, candidate_source=source)
+        meta["fragment_uia_available"] = "uia" in available
+        meta["fragment_ocr_available"] = "ocr" in available
+        if not available:
+            return None, meta
+        if "uia" not in available:
+            meta["fragment_source_preference"] = "ocr_only_available"
+            meta["fragment_source_chosen"] = "ocr"
+            return available["ocr"], meta
+        if "ocr" not in available:
+            meta["fragment_source_preference"] = "uia_only_available"
+            meta["fragment_source_chosen"] = "uia"
+            return available["uia"], meta
+
+        uia_assessment = assessments["uia"]
+        ocr_assessment = assessments["ocr"]
+        if self._retry_fragment_assessment_strength(ocr_assessment, source="ocr") > self._retry_fragment_assessment_strength(
+            uia_assessment,
+            source="uia",
+        ):
+            ocr_schema_hits, ocr_balance_penalty = self._retry_fragment_assessment_metrics(ocr_assessment)
+            uia_schema_hits, uia_balance_penalty = self._retry_fragment_assessment_metrics(uia_assessment)
+            ocr_clearly_better = (
+                (bool(ocr_assessment.get("selected_text")) and not bool(uia_assessment.get("selected_text")))
+                or (bool(ocr_assessment.get("parseable")) and not bool(uia_assessment.get("parseable")))
+                or (
+                    ocr_schema_hits >= uia_schema_hits + 2
+                    and ocr_balance_penalty <= uia_balance_penalty
+                    and bool(ocr_assessment.get("structured_block_found"))
+                )
+            )
+            if ocr_clearly_better:
+                meta["fragment_source_preference"] = "ocr_clearly_better_structured_signal"
+                meta["fragment_source_chosen"] = "ocr"
+                return available["ocr"], meta
+
+        meta["fragment_source_preference"] = "prefer_uia_fragment_over_ocr"
+        meta["fragment_source_chosen"] = "uia"
+        return available["uia"], meta
+
+    @staticmethod
+    def _normalize_ocr_schema_key_candidate(token: str) -> str:
+        normalized = token.strip().lower()
+        normalized = normalized.translate(str.maketrans({"0": "o", "1": "i", "|": "l", "!": "i", "5": "s", "$": "s"}))
+        normalized = re.sub(r"[^a-z_]", "", normalized)
+        return normalized
+
+    @classmethod
+    def _cleanup_ocr_fragment_body(cls, fragment_text: str) -> tuple[str, list[str]]:
+        known_keys = [
+            "summary",
+            "notes",
+            "operations",
+            "type",
+            "path",
+            "reason",
+            "content",
+            "commands",
+            "packages",
+            "new_path",
+            "diff_hint",
+        ]
+        cleaned = fragment_text.strip()
+        defects: list[str] = []
+        normalized_quotes = (
+            cleaned.replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2018", "'")
+            .replace("\u2019", "'")
+        )
+        if normalized_quotes != cleaned:
+            cleaned = normalized_quotes
+            defects.append("smart_quotes")
+        without_markers = re.sub(
+            r"ASTER[_ ]PATCH[_ ](?:BEGIN|END)\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        if without_markers != cleaned:
+            cleaned = without_markers
+            defects.append("inner_wrapper_markers")
+
+        def _repair_key(match: re.Match[str]) -> str:
+            key = match.group(1)
+            normalized = cls._normalize_ocr_schema_key_candidate(key)
+            if normalized in known_keys:
+                repaired = normalized
+            else:
+                close = difflib.get_close_matches(normalized, known_keys, n=1, cutoff=0.75)
+                repaired = close[0] if close else key
+            if repaired != key:
+                defects.append("schema_key_ocr")
+            return f'"{repaired}":'
+
+        repaired_keys = re.sub(r'"([^"\n]{1,40})"\s*:', _repair_key, cleaned)
+        if repaired_keys != cleaned:
+            cleaned = repaired_keys
+
+        repaired_notes = re.sub(r'("notes"\s*:\s*)[lI|]\s*[:;]', r"\1[]", cleaned)
+        if repaired_notes != cleaned:
+            cleaned = repaired_notes
+            defects.append("array_opening_punctuation")
+        repaired_operations = re.sub(r'("operations"\s*:\s*)[lI|]\s*[:;]', r"\1[", cleaned)
+        if repaired_operations != cleaned:
+            cleaned = repaired_operations
+            defects.append("array_opening_punctuation")
+        repaired_commas = re.sub(r",\s*,+", ",", cleaned)
+        if repaired_commas != cleaned:
+            cleaned = repaired_commas
+            defects.append("duplicated_commas")
+        repaired_colons = re.sub(r":\s*:+", ":", cleaned)
+        if repaired_colons != cleaned:
+            cleaned = repaired_colons
+            defects.append("duplicated_colons")
+        repaired_braces = re.sub(r"{\s*{+", "{", cleaned)
+        if repaired_braces != cleaned:
+            cleaned = repaired_braces
+            defects.append("duplicated_braces")
+        deduped_defects = list(dict.fromkeys(defects))
+        return cleaned.strip(), deduped_defects
 
     @staticmethod
     def _sanitize_retry_json_candidate(candidate_text: str) -> tuple[str, list[str]]:
@@ -4042,7 +4335,12 @@ class BrowserChatGPTTransport:
         return result
 
     @classmethod
-    def _attempt_fragmented_retry_block_repair(cls, blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    def _attempt_fragmented_retry_block_repair(
+        cls,
+        blocks: list[dict[str, Any]],
+        *,
+        candidate_source: str = "",
+    ) -> dict[str, Any]:
         default = cls._default_retry_block_selection()
         if len(blocks) != 2:
             return default
@@ -4071,20 +4369,8 @@ class BrowserChatGPTTransport:
             "repaired_from_block_index": int(fragment["index"]),
             "discarded_wrapper_only_block_index": int(wrapper["index"]),
         }
-        if int(fragment.get("raw_schema_hits", 0)) < 2:
-            result["selection_reason"] = "fragment_repair_insufficient_structure"
-            result["failure_reason"] = "fragment_repair_insufficient_structure"
-            result["fragment_repair_reason"] = "insufficient_schema_hits"
-            return result
 
         raw_fragment = str(fragment["raw_block"]).strip()
-        repair_candidates: list[tuple[str, str]] = []
-        repair_candidates.append(
-            (
-                raw_fragment + "\nASTER_PATCH_END",
-                "appended_missing_end_marker",
-            )
-        )
         fragment_body = re.sub(
             r"^\s*ASTER[_ ]PATCH[_ ]BEGIN\s*",
             "",
@@ -4092,6 +4378,30 @@ class BrowserChatGPTTransport:
             count=1,
             flags=re.IGNORECASE,
         ).strip()
+        cleaned_fragment_body = ""
+        ocr_defect_types: list[str] = []
+        if candidate_source == "ocr":
+            cleaned_fragment_body, ocr_defect_types = cls._cleanup_ocr_fragment_body(fragment_body or raw_fragment)
+            result["ocr_cleanup_attempted"] = True
+            result["ocr_defect_types"] = list(ocr_defect_types)
+        raw_schema_hits = int(fragment.get("raw_schema_hits", 0))
+        cleaned_schema_hits = sum(1 for token in ('"summary"', '"notes"', '"operations"') if token in cleaned_fragment_body)
+        effective_schema_hits = max(raw_schema_hits, cleaned_schema_hits)
+        if effective_schema_hits < 2:
+            result["selection_reason"] = "fragment_repair_insufficient_structure"
+            result["failure_reason"] = "fragment_repair_insufficient_structure"
+            result["fragment_repair_reason"] = "insufficient_schema_hits"
+            if candidate_source == "ocr":
+                result["ocr_cleanup_reason"] = result["ocr_cleanup_reason"] or "insufficient_schema_hits_after_cleanup"
+            return result
+
+        repair_candidates: list[tuple[str, str]] = []
+        repair_candidates.append(
+            (
+                raw_fragment + "\nASTER_PATCH_END",
+                "appended_missing_end_marker",
+            )
+        )
         if (
             fragment_body
             and not fragment_body.startswith("{")
@@ -4103,6 +4413,34 @@ class BrowserChatGPTTransport:
                     "wrapped_object_body_and_appended_end_marker",
                 )
             )
+
+        if candidate_source == "ocr":
+            if cleaned_fragment_body and ocr_defect_types:
+                ocr_candidate_body = cleaned_fragment_body
+                if not ocr_candidate_body.startswith("{") and ocr_candidate_body.startswith('"'):
+                    ocr_candidate_body = "{" + ocr_candidate_body
+                missing_brackets = ocr_candidate_body.count("[") - ocr_candidate_body.count("]")
+                missing_braces = ocr_candidate_body.count("{") - ocr_candidate_body.count("}")
+                if 0 <= missing_brackets <= 2 and 0 <= missing_braces <= 2:
+                    repaired_body = (
+                        ocr_candidate_body
+                        + ("]" * missing_brackets)
+                        + ("}" * missing_braces)
+                    )
+                    repair_candidates.append(
+                        (
+                            "ASTER_PATCH_BEGIN\n" + repaired_body.rstrip() + "\nASTER_PATCH_END",
+                            "ocr_cleanup_and_balanced_closure",
+                        )
+                    )
+                repair_candidates.append(
+                    (
+                        "ASTER_PATCH_BEGIN\n" + ocr_candidate_body.rstrip() + "\nASTER_PATCH_END",
+                        "ocr_cleanup_and_appended_end_marker",
+                    )
+                )
+            else:
+                result["ocr_cleanup_reason"] = "no_safe_ocr_cleanup_available"
 
         result["fragment_repair_attempted"] = True
         for candidate_text, reason in repair_candidates:
@@ -4118,13 +4456,20 @@ class BrowserChatGPTTransport:
                         "relationship": "wrapper_only_plus_repaired_fragment",
                         "fragment_repair_succeeded": True,
                         "fragment_repair_reason": reason,
+                        "fragment_repair_parseable_after_cleanup": True,
                     }
                 )
+                if reason.startswith("ocr_cleanup"):
+                    result["ocr_cleanup_succeeded"] = True
+                    result["ocr_cleanup_reason"] = reason
                 return result
 
         result["selection_reason"] = "fragment_repair_not_parseable"
         result["failure_reason"] = "fragment_repair_not_parseable"
         result["fragment_repair_reason"] = "repair_candidate_not_parseable"
+        result["fragment_repair_parseable_after_cleanup"] = False
+        if candidate_source == "ocr":
+            result["ocr_cleanup_reason"] = result["ocr_cleanup_reason"] or "cleanup_candidate_not_parseable"
         return result
 
     @staticmethod
@@ -4133,6 +4478,7 @@ class BrowserChatGPTTransport:
         blocks: list[dict[str, Any]],
         *,
         outside_text: str,
+        candidate_source: str = "",
     ) -> dict[str, Any]:
         if len(blocks) <= 1:
             return BrowserChatGPTTransport._default_retry_block_selection()
@@ -4166,7 +4512,10 @@ class BrowserChatGPTTransport:
                 "failure_reason": "ambiguous_multiple_retry_blocks",
                 "relationship": "distinct_parseable_blocks",
             }
-        fragmented_repair = BrowserChatGPTTransport._attempt_fragmented_retry_block_repair(blocks)
+        fragmented_repair = BrowserChatGPTTransport._attempt_fragmented_retry_block_repair(
+            blocks,
+            candidate_source=candidate_source,
+        )
         if fragmented_repair["fragment_repair_pattern_matched"]:
             return fragmented_repair
         block_kinds = {str(block["block_kind"]) for block in blocks}
@@ -4262,7 +4611,12 @@ class BrowserChatGPTTransport:
             else self._default_retry_block_selection()
         )
         block_selection = (
-            self._select_single_retry_attempt_block(cleaned, blocks, outside_text=outside_text)
+            self._select_single_retry_attempt_block(
+                cleaned,
+                blocks,
+                outside_text=outside_text,
+                candidate_source=candidate_source,
+            )
             if blocks
             else self._default_retry_block_selection()
         )
@@ -4430,6 +4784,7 @@ class BrowserChatGPTTransport:
             "fragment_repair_attempted": bool(block_selection["fragment_repair_attempted"]),
             "fragment_repair_succeeded": bool(block_selection["fragment_repair_succeeded"]),
             "fragment_repair_reason": str(block_selection["fragment_repair_reason"]),
+            "fragment_repair_parseable_after_cleanup": bool(block_selection["fragment_repair_parseable_after_cleanup"]),
             "repaired_from_block_index": block_selection["repaired_from_block_index"],
             "discarded_wrapper_only_block_index": block_selection["discarded_wrapper_only_block_index"],
             "json_cleanup_attempted": bool(json_cleanup["json_cleanup_attempted"]),
@@ -4439,6 +4794,10 @@ class BrowserChatGPTTransport:
             "prose_recovery_attempted": bool(prose_recovery["prose_recovery_attempted"]),
             "prose_recovery_succeeded": bool(prose_recovery["prose_recovery_succeeded"]),
             "prose_recovery_reason": str(prose_recovery["prose_recovery_reason"]),
+            "ocr_cleanup_attempted": bool(block_selection["ocr_cleanup_attempted"]),
+            "ocr_cleanup_succeeded": bool(block_selection["ocr_cleanup_succeeded"]),
+            "ocr_cleanup_reason": str(block_selection["ocr_cleanup_reason"]),
+            "ocr_defect_types": list(block_selection["ocr_defect_types"]),
         }
 
     @staticmethod
@@ -4471,6 +4830,9 @@ class BrowserChatGPTTransport:
         diagnostics["retry_attempt_fragment_repair_attempted"] = bool(assessment["fragment_repair_attempted"])
         diagnostics["retry_attempt_fragment_repair_succeeded"] = bool(assessment["fragment_repair_succeeded"])
         diagnostics["retry_attempt_fragment_repair_reason"] = str(assessment["fragment_repair_reason"])
+        diagnostics["retry_attempt_fragment_repair_parseable_after_cleanup"] = bool(
+            assessment["fragment_repair_parseable_after_cleanup"]
+        )
         diagnostics["retry_attempt_repaired_from_block_index"] = assessment["repaired_from_block_index"]
         diagnostics["retry_attempt_discarded_wrapper_only_block_index"] = assessment["discarded_wrapper_only_block_index"]
         diagnostics["retry_attempt_json_cleanup_attempted"] = bool(assessment["json_cleanup_attempted"])
@@ -4480,6 +4842,10 @@ class BrowserChatGPTTransport:
         diagnostics["retry_attempt_prose_recovery_attempted"] = bool(assessment["prose_recovery_attempted"])
         diagnostics["retry_attempt_prose_recovery_succeeded"] = bool(assessment["prose_recovery_succeeded"])
         diagnostics["retry_attempt_prose_recovery_reason"] = str(assessment["prose_recovery_reason"])
+        diagnostics["retry_attempt_ocr_cleanup_attempted"] = bool(assessment["ocr_cleanup_attempted"])
+        diagnostics["retry_attempt_ocr_cleanup_succeeded"] = bool(assessment["ocr_cleanup_succeeded"])
+        diagnostics["retry_attempt_ocr_cleanup_reason"] = str(assessment["ocr_cleanup_reason"])
+        diagnostics["retry_attempt_ocr_defect_types"] = list(assessment["ocr_defect_types"])
 
     def _build_structured_reply_candidate(
         self,
@@ -4589,6 +4955,7 @@ class BrowserChatGPTTransport:
             region_trusted=True,
             salvage_allowed=True,
         )
+        retry_fragment_source_meta = dict(self._last_retry_fragment_source_meta)
         diagnostics: dict[str, Any] = {
             "best_structured_candidate_length": len(best_structured.parsed_text) if best_structured is not None else 0,
             "best_structured_candidate_source": best_structured.source if best_structured is not None else None,
@@ -4619,6 +4986,10 @@ class BrowserChatGPTTransport:
             "best_retry_safe_candidate_retry_seed_validity_reason": (
                 best_retry_safe.retry_seed_validity_reason if best_retry_safe is not None else ""
             ),
+            "retry_attempt_fragment_source_preference": retry_fragment_source_meta.get("fragment_source_preference", ""),
+            "retry_attempt_fragment_source_chosen": retry_fragment_source_meta.get("fragment_source_chosen", ""),
+            "retry_attempt_fragment_uia_available": retry_fragment_source_meta.get("fragment_uia_available", False),
+            "retry_attempt_fragment_ocr_available": retry_fragment_source_meta.get("fragment_ocr_available", False),
             "salvage_attempted": False,
             "salvage_succeeded": False,
             "salvage_source": None,

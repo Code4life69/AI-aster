@@ -617,6 +617,10 @@ class AsterOrchestrator:
                 "retry_attempt_discarded_wrapper_only_block_index",
                 None,
             ),
+            "retry_attempt_fragment_repair_parseable_after_cleanup": self._last_generation_metadata.get(
+                "retry_attempt_fragment_repair_parseable_after_cleanup",
+                False,
+            ),
             "retry_attempt_json_cleanup_attempted": self._last_generation_metadata.get(
                 "retry_attempt_json_cleanup_attempted",
                 False,
@@ -644,6 +648,38 @@ class AsterOrchestrator:
             "retry_attempt_prose_recovery_reason": self._last_generation_metadata.get(
                 "retry_attempt_prose_recovery_reason",
                 "",
+            ),
+            "retry_attempt_fragment_source_preference": self._last_generation_metadata.get(
+                "retry_attempt_fragment_source_preference",
+                "",
+            ),
+            "retry_attempt_fragment_source_chosen": self._last_generation_metadata.get(
+                "retry_attempt_fragment_source_chosen",
+                "",
+            ),
+            "retry_attempt_fragment_uia_available": self._last_generation_metadata.get(
+                "retry_attempt_fragment_uia_available",
+                False,
+            ),
+            "retry_attempt_fragment_ocr_available": self._last_generation_metadata.get(
+                "retry_attempt_fragment_ocr_available",
+                False,
+            ),
+            "retry_attempt_ocr_cleanup_attempted": self._last_generation_metadata.get(
+                "retry_attempt_ocr_cleanup_attempted",
+                False,
+            ),
+            "retry_attempt_ocr_cleanup_succeeded": self._last_generation_metadata.get(
+                "retry_attempt_ocr_cleanup_succeeded",
+                False,
+            ),
+            "retry_attempt_ocr_cleanup_reason": self._last_generation_metadata.get(
+                "retry_attempt_ocr_cleanup_reason",
+                "",
+            ),
+            "retry_attempt_ocr_defect_types": self._last_generation_metadata.get(
+                "retry_attempt_ocr_defect_types",
+                [],
             ),
         }
 
