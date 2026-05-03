@@ -1352,6 +1352,34 @@ class BrowserChatGPTTransport:
                         "retry_attempt_ocr_defect_types",
                         [],
                     ),
+                    "retry_attempt_single_block_completion_attempted": final_capture_diagnostics.get(
+                        "retry_attempt_single_block_completion_attempted",
+                        False,
+                    ),
+                    "retry_attempt_single_block_completion_succeeded": final_capture_diagnostics.get(
+                        "retry_attempt_single_block_completion_succeeded",
+                        False,
+                    ),
+                    "retry_attempt_single_block_completion_reason": final_capture_diagnostics.get(
+                        "retry_attempt_single_block_completion_reason",
+                        "",
+                    ),
+                    "retry_attempt_single_block_completion_defect_types": final_capture_diagnostics.get(
+                        "retry_attempt_single_block_completion_defect_types",
+                        [],
+                    ),
+                    "retry_attempt_single_block_completion_closure_added": final_capture_diagnostics.get(
+                        "retry_attempt_single_block_completion_closure_added",
+                        "",
+                    ),
+                    "retry_attempt_single_block_semantically_incomplete": final_capture_diagnostics.get(
+                        "retry_attempt_single_block_semantically_incomplete",
+                        False,
+                    ),
+                    "retry_attempt_single_block_parseable_after_completion": final_capture_diagnostics.get(
+                        "retry_attempt_single_block_parseable_after_completion",
+                        False,
+                    ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
                         "salvage_preserved_for_diagnostics_only",
@@ -3896,6 +3924,13 @@ class BrowserChatGPTTransport:
             "ocr_cleanup_succeeded": False,
             "ocr_cleanup_reason": "",
             "ocr_defect_types": [],
+            "single_block_completion_attempted": False,
+            "single_block_completion_succeeded": False,
+            "single_block_completion_reason": "",
+            "single_block_completion_defect_types": [],
+            "single_block_completion_closure_added": "",
+            "single_block_semantically_incomplete": False,
+            "single_block_parseable_after_completion": False,
         }
 
     @staticmethod
@@ -4136,6 +4171,256 @@ class BrowserChatGPTTransport:
             cleaned = without_trailing_commas
             changes.append("removed_trailing_commas")
         return cleaned.strip(), changes
+
+    @classmethod
+    def _analyze_single_retry_block_completion_candidate(cls, candidate_text: str) -> dict[str, Any]:
+        cleaned_candidate, cleanup_changes = cls._sanitize_retry_json_candidate(candidate_text)
+        defect_types = list(cleanup_changes)
+        stack: list[str] = []
+        inside_string = False
+        escaped = False
+        last_significant = ""
+        for char in cleaned_candidate:
+            if inside_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    inside_string = False
+                continue
+            if char.isspace():
+                continue
+            last_significant = char
+            if char == '"':
+                inside_string = True
+            elif char in "{[":
+                stack.append(char)
+            elif char in "}]":
+                if not stack:
+                    return {
+                        "safe_to_complete": False,
+                        "reason": "unexpected_closing_delimiter",
+                        "semantically_incomplete": False,
+                        "parseable_after_completion": False,
+                        "defect_types": list(dict.fromkeys(defect_types + ["unexpected_closing_delimiter"])),
+                        "completion_candidate": cleaned_candidate,
+                        "closure_tokens": "",
+                        "closure_added": "",
+                    }
+                expected = "{" if char == "}" else "["
+                if stack[-1] != expected:
+                    return {
+                        "safe_to_complete": False,
+                        "reason": "mismatched_closing_delimiter",
+                        "semantically_incomplete": False,
+                        "parseable_after_completion": False,
+                        "defect_types": list(dict.fromkeys(defect_types + ["mismatched_closing_delimiter"])),
+                        "completion_candidate": cleaned_candidate,
+                        "closure_tokens": "",
+                        "closure_added": "",
+                    }
+                stack.pop()
+
+        if escaped:
+            return {
+                "safe_to_complete": False,
+                "reason": "unterminated_escape",
+                "semantically_incomplete": True,
+                "parseable_after_completion": False,
+                "defect_types": list(dict.fromkeys(defect_types + ["unterminated_escape"])),
+                "completion_candidate": cleaned_candidate,
+                "closure_tokens": "",
+                "closure_added": "",
+            }
+        if inside_string:
+            return {
+                "safe_to_complete": False,
+                "reason": "unterminated_string",
+                "semantically_incomplete": True,
+                "parseable_after_completion": False,
+                "defect_types": list(dict.fromkeys(defect_types + ["unterminated_string"])),
+                "completion_candidate": cleaned_candidate,
+                "closure_tokens": "",
+                "closure_added": "",
+            }
+        if not stack:
+            return {
+                "safe_to_complete": False,
+                "reason": "no_missing_structural_closure",
+                "semantically_incomplete": False,
+                "parseable_after_completion": False,
+                "defect_types": defect_types,
+                "completion_candidate": cleaned_candidate,
+                "closure_tokens": "",
+                "closure_added": "",
+            }
+        if len(stack) > 4:
+            return {
+                "safe_to_complete": False,
+                "reason": "too_many_missing_closures",
+                "semantically_incomplete": False,
+                "parseable_after_completion": False,
+                "defect_types": list(dict.fromkeys(defect_types + ["too_many_missing_closures"])),
+                "completion_candidate": cleaned_candidate,
+                "closure_tokens": "",
+                "closure_added": "",
+            }
+        if last_significant == ":":
+            return {
+                "safe_to_complete": False,
+                "reason": "trailing_colon",
+                "semantically_incomplete": True,
+                "parseable_after_completion": False,
+                "defect_types": list(dict.fromkeys(defect_types + ["trailing_colon"])),
+                "completion_candidate": cleaned_candidate,
+                "closure_tokens": "",
+                "closure_added": "",
+            }
+        if last_significant == ",":
+            return {
+                "safe_to_complete": False,
+                "reason": "trailing_comma",
+                "semantically_incomplete": True,
+                "parseable_after_completion": False,
+                "defect_types": list(dict.fromkeys(defect_types + ["trailing_comma"])),
+                "completion_candidate": cleaned_candidate,
+                "closure_tokens": "",
+                "closure_added": "",
+            }
+        if last_significant == "{":
+            return {
+                "safe_to_complete": False,
+                "reason": "trailing_open_object",
+                "semantically_incomplete": True,
+                "parseable_after_completion": False,
+                "defect_types": list(dict.fromkeys(defect_types + ["trailing_open_object"])),
+                "completion_candidate": cleaned_candidate,
+                "closure_tokens": "",
+                "closure_added": "",
+            }
+        if last_significant == "[":
+            return {
+                "safe_to_complete": False,
+                "reason": "trailing_open_array",
+                "semantically_incomplete": True,
+                "parseable_after_completion": False,
+                "defect_types": list(dict.fromkeys(defect_types + ["trailing_open_array"])),
+                "completion_candidate": cleaned_candidate,
+                "closure_tokens": "",
+                "closure_added": "",
+            }
+
+        tail = cleaned_candidate[-160:]
+        invalid_bareword_patterns = (
+            r':\s*[A-Za-z_][A-Za-z0-9 _.\-]*$',
+            r',\s*[A-Za-z_][A-Za-z0-9 _.\-]*$',
+        )
+        if any(re.search(pattern, tail) for pattern in invalid_bareword_patterns) and not re.search(
+            r':\s*(true|false|null)\s*$',
+            tail,
+            flags=re.IGNORECASE,
+        ):
+            return {
+                "safe_to_complete": False,
+                "reason": "invalid_bareword_value_tail",
+                "semantically_incomplete": True,
+                "parseable_after_completion": False,
+                "defect_types": list(dict.fromkeys(defect_types + ["invalid_bareword_value_tail"])),
+                "completion_candidate": cleaned_candidate,
+                "closure_tokens": "",
+                "closure_added": "",
+            }
+
+        closure_tokens = "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+        closure_defects = ["missing_closing_brace" if opener == "{" else "missing_closing_bracket" for opener in reversed(stack)]
+        closure_added = closure_tokens + "\nASTER_PATCH_END"
+        return {
+            "safe_to_complete": True,
+            "reason": "balanced_structural_closure",
+            "semantically_incomplete": False,
+            "parseable_after_completion": False,
+            "defect_types": list(dict.fromkeys(defect_types + closure_defects + ["missing_end_marker"])),
+            "completion_candidate": cleaned_candidate + closure_tokens,
+            "closure_tokens": closure_tokens,
+            "closure_added": closure_added,
+        }
+
+    @classmethod
+    def _attempt_single_incomplete_retry_block_completion(
+        cls,
+        raw_text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        extracted: str,
+    ) -> dict[str, Any]:
+        result = cls._default_retry_block_selection()
+        if len(blocks) != 1:
+            return result
+        block = blocks[0]
+        if bool(block["has_end_marker"]):
+            return result
+        if str(block["block_kind"]) != "fragment_without_end_marker":
+            return result
+
+        candidate_text = str(block["extracted"]).strip() or cls._retry_attempt_inner_payload(str(block["raw_block"])).strip()
+        if not candidate_text:
+            result["single_block_completion_attempted"] = True
+            result["single_block_completion_reason"] = "no_completion_candidate"
+            result["failure_reason"] = "retry_block_not_safely_completable"
+            return result
+
+        result["single_block_completion_attempted"] = True
+        schema_hits = max(
+            int(block.get("raw_schema_hits", 0)),
+            int(block.get("schema_hits", 0)),
+            sum(1 for token in ('"summary"', '"notes"', '"operations"') if token in candidate_text),
+        )
+        if schema_hits < 2 or '"operations"' not in candidate_text:
+            result["single_block_completion_reason"] = "insufficient_structure"
+            result["failure_reason"] = "retry_block_not_safely_completable"
+            return result
+
+        analysis = cls._analyze_single_retry_block_completion_candidate(candidate_text)
+        result["single_block_completion_defect_types"] = list(analysis["defect_types"])
+        result["single_block_completion_closure_added"] = str(analysis["closure_added"])
+        result["single_block_semantically_incomplete"] = bool(analysis["semantically_incomplete"])
+        if not analysis["safe_to_complete"]:
+            result["single_block_completion_reason"] = str(analysis["reason"])
+            result["failure_reason"] = (
+                "retry_block_semantically_incomplete"
+                if analysis["semantically_incomplete"]
+                else "retry_block_not_safely_completable"
+            )
+            return result
+
+        try:
+            parsed_candidate = json.loads(str(analysis["completion_candidate"]))
+        except Exception:
+            result["single_block_completion_reason"] = "completion_candidate_not_parseable"
+            result["failure_reason"] = "retry_block_completion_not_parseable"
+            return result
+
+        canonical_candidate = json.dumps(parsed_candidate, separators=(",", ":"))
+        if not looks_like_patch_plan_json(canonical_candidate):
+            result["single_block_completion_reason"] = "completion_candidate_missing_required_schema"
+            result["failure_reason"] = "retry_block_not_safely_completable"
+            return result
+
+        result.update(
+            {
+                "recovered": True,
+                "selected_block_index": int(block["index"]),
+                "selection_reason": "single_incomplete_retry_block_completed",
+                "failure_reason": "",
+                "selected_text": canonical_candidate,
+                "relationship": "single_incomplete_retry_block",
+                "single_block_completion_succeeded": True,
+                "single_block_completion_reason": str(analysis["reason"]),
+                "single_block_parseable_after_completion": True,
+            }
+        )
+        return result
 
     @classmethod
     def _attempt_retry_json_cleanup(
@@ -4620,40 +4905,65 @@ class BrowserChatGPTTransport:
             if blocks
             else self._default_retry_block_selection()
         )
+        parseable = bool(extracted) and looks_like_patch_plan_json(extracted)
+        single_block_completion = (
+            self._attempt_single_incomplete_retry_block_completion(cleaned, blocks, extracted=extracted)
+            if cleaned and len(blocks) == 1 and not parseable
+            else self._default_retry_block_selection()
+        )
         exact_block_match = (
             re.fullmatch(r"\s*ASTER_PATCH_BEGIN\s*(.*?)\s*ASTER_PATCH_END\s*", cleaned, flags=re.DOTALL)
             if cleaned
             else None
         )
         exact_block_only = exact_block_match is not None and not outside_text
-        parseable = bool(extracted) and looks_like_patch_plan_json(extracted)
         recovered_single_block = bool(block_count > 1 and block_selection["recovered"])
+        recovered_single_block_completion = bool(
+            not recovered_single_block
+            and single_block_completion["recovered"]
+            and single_block_completion["selected_text"]
+        )
         recovered_wrapper_payload = bool(
             not recovered_single_block
+            and not recovered_single_block_completion
             and wrapper_recheck["recovered"]
             and wrapper_recheck["selected_text"]
             and block_count <= 1
         )
         json_cleanup = (
             self._attempt_retry_json_cleanup(cleaned, blocks, extracted=extracted)
-            if cleaned and block_count <= 1 and not parseable and bool(extracted) and "{" in extracted
+            if (
+                cleaned
+                and block_count <= 1
+                and not parseable
+                and not single_block_completion["single_block_completion_attempted"]
+                and bool(extracted)
+                and "{" in extracted
+            )
             else self._default_retry_block_selection()
         )
         recovered_json_cleanup = bool(
             not recovered_single_block
+            and not recovered_single_block_completion
             and not recovered_wrapper_payload
             and json_cleanup["recovered"]
             and json_cleanup["selected_text"]
         )
         recovered_prose_block = bool(
             not recovered_single_block
+            and not recovered_single_block_completion
             and not recovered_wrapper_payload
             and not recovered_json_cleanup
             and prose_recovery["recovered"]
             and prose_recovery["selected_text"]
         )
         effective_parseable = (
-            parseable or recovered_single_block or recovered_wrapper_payload or recovered_json_cleanup or recovered_prose_block
+            parseable
+            or recovered_single_block
+            or recovered_single_block_completion
+            or recovered_wrapper_payload
+            or recovered_json_cleanup
+            or recovered_prose_block
         )
         json_object_count = 1 if effective_parseable else 0
         prose_contamination = bool(outside_text) or self._retry_seed_contaminated(cleaned) or "retry mode for browser output" in lowered
@@ -4685,8 +4995,12 @@ class BrowserChatGPTTransport:
             failure_reason = ""
         elif recovered_json_cleanup:
             failure_reason = ""
+        elif recovered_single_block_completion:
+            failure_reason = ""
         elif block_count > 1:
             failure_reason = str(block_selection["failure_reason"] or "multiple_retry_blocks")
+        elif single_block_completion["single_block_completion_attempted"]:
+            failure_reason = str(single_block_completion["failure_reason"] or "retry_block_not_safely_completable")
         elif parseable and exact_block_only and json_object_count == 1:
             failure_reason = ""
         elif parseable and not exact_block_only:
@@ -4715,6 +5029,8 @@ class BrowserChatGPTTransport:
             "selected_text": (
                 str(block_selection["selected_text"])
                 if recovered_single_block
+                else str(single_block_completion["selected_text"])
+                if recovered_single_block_completion
                 else str(wrapper_recheck["selected_text"])
                 if recovered_wrapper_payload
                 else str(prose_recovery["selected_text"])
@@ -4732,6 +5048,9 @@ class BrowserChatGPTTransport:
                 else
                 "retry_structured_json_cleanup"
                 if recovered_json_cleanup
+                else
+                "retry_structured_single_block_completion"
+                if recovered_single_block_completion
                 else
                 "retry_structured_repaired_fragment"
                 if recovered_single_block and bool(block_selection["fragment_repair_succeeded"])
@@ -4756,6 +5075,8 @@ class BrowserChatGPTTransport:
                 if recovered_prose_block
                 else str(json_cleanup["selection_reason"])
                 if recovered_json_cleanup
+                else str(single_block_completion["selection_reason"])
+                if recovered_single_block_completion
                 else str(wrapper_recheck["selection_reason"])
                 if recovered_wrapper_payload
                 else str(block_selection["selection_reason"])
@@ -4767,6 +5088,8 @@ class BrowserChatGPTTransport:
                 if recovered_prose_block
                 else str(json_cleanup["relationship"])
                 if recovered_json_cleanup
+                else str(single_block_completion["relationship"])
+                if recovered_single_block_completion
                 else str(wrapper_recheck["relationship"])
                 if recovered_wrapper_payload
                 else str(block_selection["relationship"])
@@ -4798,6 +5121,13 @@ class BrowserChatGPTTransport:
             "ocr_cleanup_succeeded": bool(block_selection["ocr_cleanup_succeeded"]),
             "ocr_cleanup_reason": str(block_selection["ocr_cleanup_reason"]),
             "ocr_defect_types": list(block_selection["ocr_defect_types"]),
+            "single_block_completion_attempted": bool(single_block_completion["single_block_completion_attempted"]),
+            "single_block_completion_succeeded": bool(single_block_completion["single_block_completion_succeeded"]),
+            "single_block_completion_reason": str(single_block_completion["single_block_completion_reason"]),
+            "single_block_completion_defect_types": list(single_block_completion["single_block_completion_defect_types"]),
+            "single_block_completion_closure_added": str(single_block_completion["single_block_completion_closure_added"]),
+            "single_block_semantically_incomplete": bool(single_block_completion["single_block_semantically_incomplete"]),
+            "single_block_parseable_after_completion": bool(single_block_completion["single_block_parseable_after_completion"]),
         }
 
     @staticmethod
@@ -4846,6 +5176,27 @@ class BrowserChatGPTTransport:
         diagnostics["retry_attempt_ocr_cleanup_succeeded"] = bool(assessment["ocr_cleanup_succeeded"])
         diagnostics["retry_attempt_ocr_cleanup_reason"] = str(assessment["ocr_cleanup_reason"])
         diagnostics["retry_attempt_ocr_defect_types"] = list(assessment["ocr_defect_types"])
+        diagnostics["retry_attempt_single_block_completion_attempted"] = bool(
+            assessment["single_block_completion_attempted"]
+        )
+        diagnostics["retry_attempt_single_block_completion_succeeded"] = bool(
+            assessment["single_block_completion_succeeded"]
+        )
+        diagnostics["retry_attempt_single_block_completion_reason"] = str(
+            assessment["single_block_completion_reason"]
+        )
+        diagnostics["retry_attempt_single_block_completion_defect_types"] = list(
+            assessment["single_block_completion_defect_types"]
+        )
+        diagnostics["retry_attempt_single_block_completion_closure_added"] = str(
+            assessment["single_block_completion_closure_added"]
+        )
+        diagnostics["retry_attempt_single_block_semantically_incomplete"] = bool(
+            assessment["single_block_semantically_incomplete"]
+        )
+        diagnostics["retry_attempt_single_block_parseable_after_completion"] = bool(
+            assessment["single_block_parseable_after_completion"]
+        )
 
     def _build_structured_reply_candidate(
         self,
@@ -5102,6 +5453,27 @@ class BrowserChatGPTTransport:
             ),
             "retry_attempt_prose_recovery_reason": (
                 str(retry_assessment["prose_recovery_reason"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_single_block_completion_attempted": (
+                bool(retry_assessment["single_block_completion_attempted"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_single_block_completion_succeeded": (
+                bool(retry_assessment["single_block_completion_succeeded"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_single_block_completion_reason": (
+                str(retry_assessment["single_block_completion_reason"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_single_block_completion_defect_types": (
+                list(retry_assessment["single_block_completion_defect_types"]) if retry_assessment is not None else []
+            ),
+            "retry_attempt_single_block_completion_closure_added": (
+                str(retry_assessment["single_block_completion_closure_added"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_single_block_semantically_incomplete": (
+                bool(retry_assessment["single_block_semantically_incomplete"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_single_block_parseable_after_completion": (
+                bool(retry_assessment["single_block_parseable_after_completion"]) if retry_assessment is not None else False
             ),
             "final_capture_failure_reason": "",
         }

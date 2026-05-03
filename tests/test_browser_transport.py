@@ -815,6 +815,31 @@ def test_finalize_captured_reply_retry_attempt_recovers_single_block_with_safe_j
     assert "removed_trailing_commas" in diagnostics["retry_attempt_json_cleanup_reason"]
 
 
+def test_finalize_captured_reply_retry_attempt_recovers_safely_closable_single_block() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]'
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}'
+    assert diagnostics["retry_attempt_failure_reason"] == ""
+    assert diagnostics["retry_attempt_acceptance_tier"] == "retry_structured_single_block_completion"
+    assert diagnostics["retry_attempt_single_block_completion_attempted"] is True
+    assert diagnostics["retry_attempt_single_block_completion_succeeded"] is True
+    assert diagnostics["retry_attempt_single_block_completion_reason"] == "balanced_structural_closure"
+    assert "missing_closing_bracket" in diagnostics["retry_attempt_single_block_completion_defect_types"]
+    assert "missing_closing_brace" in diagnostics["retry_attempt_single_block_completion_defect_types"]
+    assert "missing_end_marker" in diagnostics["retry_attempt_single_block_completion_defect_types"]
+    assert diagnostics["retry_attempt_single_block_completion_closure_added"] == "]}\nASTER_PATCH_END"
+    assert diagnostics["retry_attempt_single_block_semantically_incomplete"] is False
+    assert diagnostics["retry_attempt_single_block_parseable_after_completion"] is True
+
+
 def test_finalize_captured_reply_retry_attempt_fails_when_json_cleanup_is_not_enough() -> None:
     transport = BrowserChatGPTTransport()
 
@@ -832,6 +857,46 @@ def test_finalize_captured_reply_retry_attempt_fails_when_json_cleanup_is_not_en
     assert diagnostics["retry_attempt_json_cleanup_attempted"] is True
     assert diagnostics["retry_attempt_json_cleanup_succeeded"] is False
     assert diagnostics["retry_attempt_json_cleanup_reason"] == "cleanup_candidate_not_parseable"
+
+
+def test_finalize_captured_reply_retry_attempt_rejects_semantically_incomplete_single_block() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations": Stop answering, Enter'
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
+    assert diagnostics["retry_attempt_failure_reason"] == "retry_block_semantically_incomplete"
+    assert diagnostics["retry_attempt_single_block_completion_attempted"] is True
+    assert diagnostics["retry_attempt_single_block_completion_succeeded"] is False
+    assert diagnostics["retry_attempt_single_block_completion_reason"] == "invalid_bareword_value_tail"
+    assert diagnostics["retry_attempt_single_block_semantically_incomplete"] is True
+    assert diagnostics["retry_attempt_single_block_parseable_after_completion"] is False
+
+
+def test_finalize_captured_reply_retry_attempt_rejects_mid_content_single_block_truncation() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"prin'
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
+    assert diagnostics["retry_attempt_failure_reason"] == "retry_block_semantically_incomplete"
+    assert diagnostics["retry_attempt_single_block_completion_attempted"] is True
+    assert diagnostics["retry_attempt_single_block_completion_succeeded"] is False
+    assert diagnostics["retry_attempt_single_block_completion_reason"] == "unterminated_string"
+    assert diagnostics["retry_attempt_single_block_semantically_incomplete"] is True
+    assert diagnostics["retry_attempt_single_block_parseable_after_completion"] is False
 
 
 def test_finalize_captured_reply_retry_attempt_keeps_plain_prose_as_prose_contamination() -> None:

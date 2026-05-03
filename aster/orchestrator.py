@@ -681,6 +681,34 @@ class AsterOrchestrator:
                 "retry_attempt_ocr_defect_types",
                 [],
             ),
+            "retry_attempt_single_block_completion_attempted": self._last_generation_metadata.get(
+                "retry_attempt_single_block_completion_attempted",
+                False,
+            ),
+            "retry_attempt_single_block_completion_succeeded": self._last_generation_metadata.get(
+                "retry_attempt_single_block_completion_succeeded",
+                False,
+            ),
+            "retry_attempt_single_block_completion_reason": self._last_generation_metadata.get(
+                "retry_attempt_single_block_completion_reason",
+                "",
+            ),
+            "retry_attempt_single_block_completion_defect_types": self._last_generation_metadata.get(
+                "retry_attempt_single_block_completion_defect_types",
+                [],
+            ),
+            "retry_attempt_single_block_completion_closure_added": self._last_generation_metadata.get(
+                "retry_attempt_single_block_completion_closure_added",
+                "",
+            ),
+            "retry_attempt_single_block_semantically_incomplete": self._last_generation_metadata.get(
+                "retry_attempt_single_block_semantically_incomplete",
+                False,
+            ),
+            "retry_attempt_single_block_parseable_after_completion": self._last_generation_metadata.get(
+                "retry_attempt_single_block_parseable_after_completion",
+                False,
+            ),
         }
 
     def _log_prompt_retry_event(
