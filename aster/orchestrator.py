@@ -302,6 +302,7 @@ class AsterOrchestrator:
                 retry_reason=str(retry_seed_metadata["retry_seed_validity_reason"]),
                 retry_seed_used=prior_text is not None,
                 wrapper_followup=False,
+                prose_followup=False,
             )
             self._log_prompt_retry_event(
                 mode=mode,
@@ -345,6 +346,7 @@ class AsterOrchestrator:
                         retry_reason="wrapper_only_multi_block_retry_output",
                         retry_seed_used=False,
                         wrapper_followup=True,
+                        prose_followup=False,
                     )
                     self._log_prompt_retry_event(
                         mode=mode,
@@ -390,6 +392,76 @@ class AsterOrchestrator:
                             "retry_wrapper_followup_reason": "wrapper_only_multi_block_retry_output",
                             "retry_wrapper_followup_succeeded": True,
                             "retry_wrapper_followup_failure_reason": "",
+                        },
+                    )
+                    return plan
+                if self._should_try_prose_followup(mode, prior_text, retry_attempt_failure_reason):
+                    followup_retry_metadata = {
+                        "retry_seed_valid": False,
+                        "retry_seed_validity_reason": "prose_contaminated_retry_response",
+                        "retry_seed_validity_reason_source": "retry_attempt_failure_reason",
+                    }
+                    self._activity(
+                        "retry_prose_followup",
+                        "The strict retry wrapped the answer in extra prose, so Aster is sending one corrective follow-up.",
+                        "This follow-up is limited to one extra attempt and only targets the prose-contaminated retry shape.",
+                        status="warning",
+                    )
+                    followup_raw, followup_prompt_package = self._generate_with_prompt_retries(
+                        goal,
+                        context,
+                        history,
+                        mode,
+                        prior_text=None,
+                        retry_reason="prose_contaminated_retry_response",
+                        retry_seed_used=False,
+                        wrapper_followup=False,
+                        prose_followup=True,
+                    )
+                    self._log_prompt_retry_event(
+                        mode=mode,
+                        raw=retried_raw,
+                        prior_text=None,
+                        retry_seed_metadata=followup_retry_metadata,
+                        prompt_package=followup_prompt_package,
+                        prose_followup_attempted=True,
+                        prose_followup_reason="prose_contaminated_retry_response",
+                    )
+                    try:
+                        plan = self.parser.parse(followup_raw)
+                    except Exception as followup_parse_error:
+                        followup_parse_failure_kind = self._classify_retry_parse_failure_text(followup_raw)
+                        followup_failure_reason = str(self._last_generation_metadata.get("retry_attempt_failure_reason", ""))
+                        self._log_retry_parse_failure_event(
+                            mode=mode,
+                            prior_text=None,
+                            retry_seed_metadata=followup_retry_metadata,
+                            original_parse_error=original_parse_error,
+                            retry_parse_error=followup_parse_error,
+                            retried_raw=followup_raw,
+                            retry_parse_failure_kind=followup_parse_failure_kind,
+                            prose_followup_attempted=True,
+                            prose_followup_prompt_mode=followup_prompt_package.retry_prompt_mode,
+                            prose_followup_reason="prose_contaminated_retry_response",
+                            prose_followup_succeeded=False,
+                            prose_followup_failure_reason=(followup_failure_reason or followup_parse_failure_kind),
+                            retry_text_source="retry_text_followup",
+                        )
+                        raise RuntimeError(
+                            "Browser retry response was not machine-parseable. "
+                            "Aster retried without reusing any preserved retry seed, and the prose corrective "
+                            "follow-up still could not be parsed "
+                            f"({self._prose_followup_failure_label(followup_failure_reason, followup_parse_failure_kind)})."
+                        ) from followup_parse_error
+                    self.logger.log(
+                        "retry_prose_followup_result",
+                        {
+                            "mode": mode,
+                            "retry_prose_followup_attempted": True,
+                            "retry_prose_followup_prompt_mode": followup_prompt_package.retry_prompt_mode,
+                            "retry_prose_followup_reason": "prose_contaminated_retry_response",
+                            "retry_prose_followup_succeeded": True,
+                            "retry_prose_followup_failure_reason": "",
                         },
                     )
                     return plan
@@ -545,6 +617,34 @@ class AsterOrchestrator:
                 "retry_attempt_discarded_wrapper_only_block_index",
                 None,
             ),
+            "retry_attempt_json_cleanup_attempted": self._last_generation_metadata.get(
+                "retry_attempt_json_cleanup_attempted",
+                False,
+            ),
+            "retry_attempt_json_cleanup_succeeded": self._last_generation_metadata.get(
+                "retry_attempt_json_cleanup_succeeded",
+                False,
+            ),
+            "retry_attempt_json_cleanup_reason": self._last_generation_metadata.get(
+                "retry_attempt_json_cleanup_reason",
+                "",
+            ),
+            "retry_attempt_json_cleanup_changed": self._last_generation_metadata.get(
+                "retry_attempt_json_cleanup_changed",
+                False,
+            ),
+            "retry_attempt_prose_recovery_attempted": self._last_generation_metadata.get(
+                "retry_attempt_prose_recovery_attempted",
+                False,
+            ),
+            "retry_attempt_prose_recovery_succeeded": self._last_generation_metadata.get(
+                "retry_attempt_prose_recovery_succeeded",
+                False,
+            ),
+            "retry_attempt_prose_recovery_reason": self._last_generation_metadata.get(
+                "retry_attempt_prose_recovery_reason",
+                "",
+            ),
         }
 
     def _log_prompt_retry_event(
@@ -559,6 +659,10 @@ class AsterOrchestrator:
         wrapper_followup_reason: str = "",
         wrapper_followup_succeeded: bool = False,
         wrapper_followup_failure_reason: str = "",
+        prose_followup_attempted: bool = False,
+        prose_followup_reason: str = "",
+        prose_followup_succeeded: bool = False,
+        prose_followup_failure_reason: str = "",
     ) -> None:
         self.logger.log(
             "prompt_retry",
@@ -583,6 +687,13 @@ class AsterOrchestrator:
                 "retry_wrapper_followup_reason": wrapper_followup_reason,
                 "retry_wrapper_followup_succeeded": wrapper_followup_succeeded,
                 "retry_wrapper_followup_failure_reason": wrapper_followup_failure_reason,
+                "retry_prose_followup_attempted": prose_followup_attempted,
+                "retry_prose_followup_prompt_mode": (
+                    prompt_package.retry_prompt_mode if prose_followup_attempted else ""
+                ),
+                "retry_prose_followup_reason": prose_followup_reason,
+                "retry_prose_followup_succeeded": prose_followup_succeeded,
+                "retry_prose_followup_failure_reason": prose_followup_failure_reason,
                 **self._summarize_prompt_package(prompt_package),
             },
         )
@@ -602,6 +713,11 @@ class AsterOrchestrator:
         wrapper_followup_reason: str = "",
         wrapper_followup_succeeded: bool = False,
         wrapper_followup_failure_reason: str = "",
+        prose_followup_attempted: bool = False,
+        prose_followup_prompt_mode: str = "",
+        prose_followup_reason: str = "",
+        prose_followup_succeeded: bool = False,
+        prose_followup_failure_reason: str = "",
         retry_text_source: str = "retry_text",
     ) -> None:
         self.logger.log(
@@ -624,6 +740,11 @@ class AsterOrchestrator:
                 "retry_wrapper_followup_reason": wrapper_followup_reason,
                 "retry_wrapper_followup_succeeded": wrapper_followup_succeeded,
                 "retry_wrapper_followup_failure_reason": wrapper_followup_failure_reason,
+                "retry_prose_followup_attempted": prose_followup_attempted,
+                "retry_prose_followup_prompt_mode": prose_followup_prompt_mode,
+                "retry_prose_followup_reason": prose_followup_reason,
+                "retry_prose_followup_succeeded": prose_followup_succeeded,
+                "retry_prose_followup_failure_reason": prose_followup_failure_reason,
                 **self._retry_attempt_metadata_fields(),
             },
         )
@@ -643,6 +764,22 @@ class AsterOrchestrator:
         if retry_attempt_failure_reason:
             return "wrapper_only_followup_failed"
         return "wrapper_only_followup_failed" if retry_parse_failure_kind else "wrapper_only_followup_failed"
+
+    @staticmethod
+    def _should_try_prose_followup(mode: str, prior_text: str | None, retry_attempt_failure_reason: str) -> bool:
+        return (
+            mode == "browser"
+            and prior_text is None
+            and retry_attempt_failure_reason == "prose_contaminated_retry_response"
+        )
+
+    @staticmethod
+    def _prose_followup_failure_label(retry_attempt_failure_reason: str, retry_parse_failure_kind: str) -> str:
+        if retry_attempt_failure_reason == "prose_contaminated_retry_response":
+            return "persistent_prose_contaminated_retry_response"
+        if retry_attempt_failure_reason:
+            return "prose_followup_failed"
+        return "prose_followup_failed" if retry_parse_failure_kind else "prose_followup_failed"
 
     def _build_commit_message(self, plan: ParsedPlan) -> str:
         summary = " ".join(plan.summary.split()).strip()
@@ -674,6 +811,7 @@ class AsterOrchestrator:
         retry_reason: str = "",
         retry_seed_used: bool = False,
         wrapper_followup: bool = False,
+        prose_followup: bool = False,
     ):
         budgets = self._prompt_budgets(mode)
         for attempt_index, budget in enumerate(budgets, start=1):
@@ -687,6 +825,7 @@ class AsterOrchestrator:
                 retry_reason=retry_reason,
                 retry_seed_used=retry_seed_used,
                 wrapper_followup=wrapper_followup,
+                prose_followup=prose_followup,
             )
             if mode == "browser":
                 self._activity(
@@ -765,6 +904,7 @@ class AsterOrchestrator:
         retry_reason: str = "",
         retry_seed_used: bool = False,
         wrapper_followup: bool = False,
+        prose_followup: bool = False,
     ):
         if prior_text is None and not retry_reason:
             return self.prompt_builder.build(
@@ -784,6 +924,7 @@ class AsterOrchestrator:
             retry_reason=retry_reason,
             retry_seed_used=retry_seed_used,
             wrapper_followup=wrapper_followup,
+            prose_followup=prose_followup,
         )
 
     def _prompt_budgets(self, mode: str) -> list[int]:

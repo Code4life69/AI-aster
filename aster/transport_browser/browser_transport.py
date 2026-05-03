@@ -1286,6 +1286,34 @@ class BrowserChatGPTTransport:
                         "retry_attempt_discarded_wrapper_only_block_index",
                         None,
                     ),
+                    "retry_attempt_json_cleanup_attempted": final_capture_diagnostics.get(
+                        "retry_attempt_json_cleanup_attempted",
+                        False,
+                    ),
+                    "retry_attempt_json_cleanup_succeeded": final_capture_diagnostics.get(
+                        "retry_attempt_json_cleanup_succeeded",
+                        False,
+                    ),
+                    "retry_attempt_json_cleanup_reason": final_capture_diagnostics.get(
+                        "retry_attempt_json_cleanup_reason",
+                        "",
+                    ),
+                    "retry_attempt_json_cleanup_changed": final_capture_diagnostics.get(
+                        "retry_attempt_json_cleanup_changed",
+                        False,
+                    ),
+                    "retry_attempt_prose_recovery_attempted": final_capture_diagnostics.get(
+                        "retry_attempt_prose_recovery_attempted",
+                        False,
+                    ),
+                    "retry_attempt_prose_recovery_succeeded": final_capture_diagnostics.get(
+                        "retry_attempt_prose_recovery_succeeded",
+                        False,
+                    ),
+                    "retry_attempt_prose_recovery_reason": final_capture_diagnostics.get(
+                        "retry_attempt_prose_recovery_reason",
+                        "",
+                    ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
                         "salvage_preserved_for_diagnostics_only",
@@ -3753,6 +3781,13 @@ class BrowserChatGPTTransport:
             "wrapper_recheck_attempted": False,
             "wrapper_recheck_found_payload": False,
             "wrapper_recheck_reason": "",
+            "json_cleanup_attempted": False,
+            "json_cleanup_succeeded": False,
+            "json_cleanup_reason": "",
+            "json_cleanup_changed": False,
+            "prose_recovery_attempted": False,
+            "prose_recovery_succeeded": False,
+            "prose_recovery_reason": "",
         }
 
     @staticmethod
@@ -3773,6 +3808,149 @@ class BrowserChatGPTTransport:
             flags=re.IGNORECASE,
         )
         return text
+
+    @staticmethod
+    def _sanitize_retry_json_candidate(candidate_text: str) -> tuple[str, list[str]]:
+        cleaned = candidate_text.strip()
+        changes: list[str] = []
+        stripped_wrappers = re.sub(
+            r"ASTER[_ ]PATCH[_ ](?:BEGIN|END)\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        if stripped_wrappers != cleaned:
+            cleaned = stripped_wrappers
+            changes.append("removed_inner_wrapper_markers")
+        normalized_quotes = (
+            cleaned.replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2018", "'")
+            .replace("\u2019", "'")
+        )
+        if normalized_quotes != cleaned:
+            cleaned = normalized_quotes
+            changes.append("normalized_smart_quotes")
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            trimmed = cleaned[start : end + 1].strip()
+            if trimmed != cleaned:
+                cleaned = trimmed
+                changes.append("trimmed_text_around_json_object")
+        without_trailing_commas = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+        if without_trailing_commas != cleaned:
+            cleaned = without_trailing_commas
+            changes.append("removed_trailing_commas")
+        return cleaned.strip(), changes
+
+    @classmethod
+    def _attempt_retry_json_cleanup(
+        cls,
+        raw_text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        extracted: str,
+    ) -> dict[str, Any]:
+        result = cls._default_retry_block_selection()
+        candidate_text = ""
+        selected_block_index: int | None = None
+        if len(blocks) == 1:
+            block = blocks[0]
+            selected_block_index = int(block["index"])
+            candidate_text = str(block["extracted"]).strip() or cls._retry_attempt_inner_payload(str(block["raw_block"])).strip()
+        elif extracted.strip():
+            candidate_text = extracted.strip()
+        if not candidate_text:
+            result["json_cleanup_reason"] = "no_extractable_json_candidate"
+            return result
+
+        result["json_cleanup_attempted"] = True
+        cleaned_candidate, changes = cls._sanitize_retry_json_candidate(candidate_text)
+        result["json_cleanup_changed"] = cleaned_candidate != candidate_text
+        if "{" not in cleaned_candidate or (
+            '"summary"' not in cleaned_candidate
+            and '"operations"' not in cleaned_candidate
+            and '"notes"' not in cleaned_candidate
+        ):
+            result["json_cleanup_reason"] = "insufficient_json_structure"
+            result["failure_reason"] = "retry_json_not_safely_repairable"
+            return result
+        if not changes:
+            result["json_cleanup_reason"] = "no_safe_cleanup_transform"
+            result["failure_reason"] = "retry_json_not_safely_repairable"
+            return result
+        try:
+            parsed_candidate = json.loads(cleaned_candidate)
+        except Exception:
+            result["json_cleanup_reason"] = "cleanup_candidate_not_parseable"
+            result["failure_reason"] = "retry_json_cleanup_failed"
+            return result
+        canonical_candidate = json.dumps(parsed_candidate, separators=(",", ":"))
+        if not looks_like_patch_plan_json(canonical_candidate):
+            result["json_cleanup_reason"] = "cleanup_candidate_missing_required_schema"
+            result["failure_reason"] = "retry_json_not_safely_repairable"
+            return result
+        result.update(
+            {
+                "recovered": True,
+                "selected_block_index": selected_block_index,
+                "selection_reason": "retry_json_cleanup_recovered_block",
+                "failure_reason": "",
+                "selected_text": canonical_candidate,
+                "relationship": "single_block_json_cleanup",
+                "json_cleanup_succeeded": True,
+                "json_cleanup_reason": ",".join(changes),
+            }
+        )
+        return result
+
+    @classmethod
+    def _attempt_retry_prose_embedded_block_recovery(
+        cls,
+        raw_text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        extracted: str,
+        outside_text: str,
+    ) -> dict[str, Any]:
+        result = cls._default_retry_block_selection()
+        if not outside_text.strip():
+            if not blocks and raw_text.strip():
+                result["prose_recovery_attempted"] = True
+                result["prose_recovery_reason"] = "no_single_parseable_embedded_block"
+                return result
+            result["prose_recovery_reason"] = "no_outside_text"
+            return result
+        result["prose_recovery_attempted"] = True
+        if len(blocks) == 1 and bool(blocks[0]["parseable"]):
+            result.update(
+                {
+                    "recovered": True,
+                    "selected_block_index": int(blocks[0]["index"]),
+                    "selection_reason": "single_parseable_embedded_retry_block",
+                    "selected_text": str(blocks[0]["extracted"]),
+                    "relationship": "prose_wrapped_retry_block",
+                    "prose_recovery_succeeded": True,
+                    "prose_recovery_reason": "single_parseable_embedded_block",
+                }
+            )
+            return result
+        if not blocks and extracted.strip() and looks_like_patch_plan_json(extracted):
+            result.update(
+                {
+                    "recovered": True,
+                    "selected_block_index": None,
+                    "selection_reason": "single_parseable_embedded_json_object",
+                    "selected_text": extracted.strip(),
+                    "relationship": "prose_wrapped_json_object",
+                    "prose_recovery_succeeded": True,
+                    "prose_recovery_reason": "single_parseable_embedded_json_object",
+                }
+            )
+            return result
+        result["prose_recovery_reason"] = "no_single_parseable_embedded_block"
+        return result
 
     @classmethod
     def _analyze_wrapper_only_retry_blocks(
@@ -4073,6 +4251,16 @@ class BrowserChatGPTTransport:
             if blocks
             else self._default_retry_block_selection()
         )
+        prose_recovery = (
+            self._attempt_retry_prose_embedded_block_recovery(
+                cleaned,
+                blocks,
+                extracted=extracted,
+                outside_text=outside_text,
+            )
+            if cleaned
+            else self._default_retry_block_selection()
+        )
         block_selection = (
             self._select_single_retry_attempt_block(cleaned, blocks, outside_text=outside_text)
             if blocks
@@ -4092,7 +4280,27 @@ class BrowserChatGPTTransport:
             and wrapper_recheck["selected_text"]
             and block_count <= 1
         )
-        effective_parseable = parseable or recovered_single_block or recovered_wrapper_payload
+        json_cleanup = (
+            self._attempt_retry_json_cleanup(cleaned, blocks, extracted=extracted)
+            if cleaned and block_count <= 1 and not parseable and bool(extracted) and "{" in extracted
+            else self._default_retry_block_selection()
+        )
+        recovered_json_cleanup = bool(
+            not recovered_single_block
+            and not recovered_wrapper_payload
+            and json_cleanup["recovered"]
+            and json_cleanup["selected_text"]
+        )
+        recovered_prose_block = bool(
+            not recovered_single_block
+            and not recovered_wrapper_payload
+            and not recovered_json_cleanup
+            and prose_recovery["recovered"]
+            and prose_recovery["selected_text"]
+        )
+        effective_parseable = (
+            parseable or recovered_single_block or recovered_wrapper_payload or recovered_json_cleanup or recovered_prose_block
+        )
         json_object_count = 1 if effective_parseable else 0
         prose_contamination = bool(outside_text) or self._retry_seed_contaminated(cleaned) or "retry mode for browser output" in lowered
         marker_present = bool(
@@ -4103,16 +4311,25 @@ class BrowserChatGPTTransport:
             and not parseable
             and not any(token in cleaned for token in ("{", '"summary"', '"operations"'))
         )
+        json_like_extracted = bool(extracted) and any(
+            token in extracted for token in ("{", '"summary"', '"operations"', '"notes"')
+        )
         code_only = (
             not bool(extracted)
             and any(marker in lowered for marker in ("def ", "class ", "import ", "self.", "tkinter", "assert "))
         )
+        prose_like_text = bool(cleaned) and not block_count and not marker_present and not json_like_extracted and not code_only
+        prose_contamination = prose_contamination or prose_like_text
         structured_block_found = bool(extracted) or any(bool(block.get("extracted", "").strip()) for block in blocks)
         if not cleaned:
             failure_reason = "empty_retry_response"
         elif block_count > 1 and block_selection["recovered"]:
             failure_reason = ""
         elif recovered_wrapper_payload:
+            failure_reason = ""
+        elif recovered_prose_block:
+            failure_reason = ""
+        elif recovered_json_cleanup:
             failure_reason = ""
         elif block_count > 1:
             failure_reason = str(block_selection["failure_reason"] or "multiple_retry_blocks")
@@ -4122,8 +4339,8 @@ class BrowserChatGPTTransport:
             failure_reason = "prose_contaminated_retry_response"
         elif wrapper_only:
             failure_reason = "wrapper_without_valid_json"
-        elif extracted:
-            failure_reason = "malformed_json_inside_retry_block"
+        elif json_like_extracted:
+            failure_reason = str(json_cleanup["failure_reason"] or "malformed_json_inside_retry_block")
         elif code_only:
             failure_reason = "code_only_retry_response"
         elif prose_contamination:
@@ -4146,11 +4363,21 @@ class BrowserChatGPTTransport:
                 if recovered_single_block
                 else str(wrapper_recheck["selected_text"])
                 if recovered_wrapper_payload
+                else str(prose_recovery["selected_text"])
+                if recovered_prose_block
+                else str(json_cleanup["selected_text"])
+                if recovered_json_cleanup
                 else extracted if parseable and exact_block_only and json_object_count == 1 else ""
             ),
             "acceptance_tier": (
                 "retry_structured_wrapper_recheck"
                 if recovered_wrapper_payload
+                else
+                "retry_structured_embedded_block"
+                if recovered_prose_block
+                else
+                "retry_structured_json_cleanup"
+                if recovered_json_cleanup
                 else
                 "retry_structured_repaired_fragment"
                 if recovered_single_block and bool(block_selection["fragment_repair_succeeded"])
@@ -4162,19 +4389,31 @@ class BrowserChatGPTTransport:
                 else "blocked_or_ambiguous"
             ),
             "selected_block_index": (
-                wrapper_recheck["selected_block_index"]
+                prose_recovery["selected_block_index"]
+                if recovered_prose_block
+                else json_cleanup["selected_block_index"]
+                if recovered_json_cleanup
+                else wrapper_recheck["selected_block_index"]
                 if recovered_wrapper_payload
                 else block_selection["selected_block_index"]
             ),
             "block_selection_reason": (
-                str(wrapper_recheck["selection_reason"])
+                str(prose_recovery["selection_reason"])
+                if recovered_prose_block
+                else str(json_cleanup["selection_reason"])
+                if recovered_json_cleanup
+                else str(wrapper_recheck["selection_reason"])
                 if recovered_wrapper_payload
                 else str(block_selection["selection_reason"])
             ),
             "multiple_blocks_ambiguous": bool(block_count > 1 and block_selection["ambiguous"]),
             "multiple_blocks_recovered": recovered_single_block,
             "block_relationship": (
-                str(wrapper_recheck["relationship"])
+                str(prose_recovery["relationship"])
+                if recovered_prose_block
+                else str(json_cleanup["relationship"])
+                if recovered_json_cleanup
+                else str(wrapper_recheck["relationship"])
                 if recovered_wrapper_payload
                 else str(block_selection["relationship"])
             ),
@@ -4193,6 +4432,13 @@ class BrowserChatGPTTransport:
             "fragment_repair_reason": str(block_selection["fragment_repair_reason"]),
             "repaired_from_block_index": block_selection["repaired_from_block_index"],
             "discarded_wrapper_only_block_index": block_selection["discarded_wrapper_only_block_index"],
+            "json_cleanup_attempted": bool(json_cleanup["json_cleanup_attempted"]),
+            "json_cleanup_succeeded": bool(json_cleanup["json_cleanup_succeeded"]),
+            "json_cleanup_reason": str(json_cleanup["json_cleanup_reason"]),
+            "json_cleanup_changed": bool(json_cleanup["json_cleanup_changed"]),
+            "prose_recovery_attempted": bool(prose_recovery["prose_recovery_attempted"]),
+            "prose_recovery_succeeded": bool(prose_recovery["prose_recovery_succeeded"]),
+            "prose_recovery_reason": str(prose_recovery["prose_recovery_reason"]),
         }
 
     @staticmethod
@@ -4227,6 +4473,13 @@ class BrowserChatGPTTransport:
         diagnostics["retry_attempt_fragment_repair_reason"] = str(assessment["fragment_repair_reason"])
         diagnostics["retry_attempt_repaired_from_block_index"] = assessment["repaired_from_block_index"]
         diagnostics["retry_attempt_discarded_wrapper_only_block_index"] = assessment["discarded_wrapper_only_block_index"]
+        diagnostics["retry_attempt_json_cleanup_attempted"] = bool(assessment["json_cleanup_attempted"])
+        diagnostics["retry_attempt_json_cleanup_succeeded"] = bool(assessment["json_cleanup_succeeded"])
+        diagnostics["retry_attempt_json_cleanup_reason"] = str(assessment["json_cleanup_reason"])
+        diagnostics["retry_attempt_json_cleanup_changed"] = bool(assessment["json_cleanup_changed"])
+        diagnostics["retry_attempt_prose_recovery_attempted"] = bool(assessment["prose_recovery_attempted"])
+        diagnostics["retry_attempt_prose_recovery_succeeded"] = bool(assessment["prose_recovery_succeeded"])
+        diagnostics["retry_attempt_prose_recovery_reason"] = str(assessment["prose_recovery_reason"])
 
     def _build_structured_reply_candidate(
         self,
@@ -4457,6 +4710,27 @@ class BrowserChatGPTTransport:
             ),
             "retry_attempt_discarded_wrapper_only_block_index": (
                 retry_assessment["discarded_wrapper_only_block_index"] if retry_assessment is not None else None
+            ),
+            "retry_attempt_json_cleanup_attempted": (
+                bool(retry_assessment["json_cleanup_attempted"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_json_cleanup_succeeded": (
+                bool(retry_assessment["json_cleanup_succeeded"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_json_cleanup_reason": (
+                str(retry_assessment["json_cleanup_reason"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_json_cleanup_changed": (
+                bool(retry_assessment["json_cleanup_changed"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_prose_recovery_attempted": (
+                bool(retry_assessment["prose_recovery_attempted"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_prose_recovery_succeeded": (
+                bool(retry_assessment["prose_recovery_succeeded"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_prose_recovery_reason": (
+                str(retry_assessment["prose_recovery_reason"]) if retry_assessment is not None else ""
             ),
             "final_capture_failure_reason": "",
         }

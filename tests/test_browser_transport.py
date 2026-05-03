@@ -709,7 +709,7 @@ def test_finalize_captured_reply_preserves_partial_structured_candidate_for_diag
     assert diagnostics["final_capture_failure_reason"] == "structured_block_seen_but_not_retry_safe"
 
 
-def test_finalize_captured_reply_retry_attempt_rejects_parseable_block_with_prose() -> None:
+def test_finalize_captured_reply_retry_attempt_recovers_parseable_block_with_prose() -> None:
     transport = BrowserChatGPTTransport()
 
     parsed, diagnostics = transport._finalize_captured_reply(
@@ -723,15 +723,76 @@ def test_finalize_captured_reply_retry_attempt_rejects_parseable_block_with_pros
         retry_attempt=True,
     )
 
-    assert parsed == ""
+    assert parsed == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}'
     assert diagnostics["retry_attempt_capture_mode"] == "structured_block_first"
-    assert diagnostics["retry_attempt_acceptance_tier"] == "blocked_or_ambiguous"
+    assert diagnostics["retry_attempt_acceptance_tier"] == "retry_structured_embedded_block"
     assert diagnostics["retry_attempt_parseable"] is True
     assert diagnostics["retry_attempt_prose_contamination"] is True
     assert diagnostics["retry_attempt_wrapper_only"] is False
     assert diagnostics["retry_attempt_exact_block_only"] is False
     assert diagnostics["retry_attempt_extra_text_detected"] is True
+    assert diagnostics["retry_attempt_failure_reason"] == ""
+    assert diagnostics["retry_attempt_selected_block_index"] == 1
+    assert diagnostics["retry_attempt_block_selection_reason"] == "single_parseable_embedded_retry_block"
+    assert diagnostics["retry_attempt_prose_recovery_attempted"] is True
+    assert diagnostics["retry_attempt_prose_recovery_succeeded"] is True
+    assert diagnostics["retry_attempt_prose_recovery_reason"] == "single_parseable_embedded_block"
+
+
+def test_finalize_captured_reply_retry_attempt_recovers_single_block_with_safe_json_cleanup() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{\u201csummary\u201d:\u201cok\u201d,\u201cnotes\u201d:[],\u201coperations\u201d:[{\u201ctype\u201d:\u201cCREATE FILE\u201d,\u201cpath\u201d:\u201csaved.py\u201d,\u201creason\u201d:\u201cadd\u201d,\u201ccontent\u201d:\u201cprint(1)\u201d}],}\n'
+            "ASTER_PATCH_END"
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}'
+    assert diagnostics["retry_attempt_failure_reason"] == ""
+    assert diagnostics["retry_attempt_acceptance_tier"] == "retry_structured_json_cleanup"
+    assert diagnostics["retry_attempt_json_cleanup_attempted"] is True
+    assert diagnostics["retry_attempt_json_cleanup_succeeded"] is True
+    assert diagnostics["retry_attempt_json_cleanup_changed"] is True
+    assert "normalized_smart_quotes" in diagnostics["retry_attempt_json_cleanup_reason"]
+    assert "removed_trailing_commas" in diagnostics["retry_attempt_json_cleanup_reason"]
+
+
+def test_finalize_captured_reply_retry_attempt_fails_when_json_cleanup_is_not_enough() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)",,}]}\n'
+            "ASTER_PATCH_END"
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
+    assert diagnostics["retry_attempt_failure_reason"] == "retry_json_cleanup_failed"
+    assert diagnostics["retry_attempt_json_cleanup_attempted"] is True
+    assert diagnostics["retry_attempt_json_cleanup_succeeded"] is False
+    assert diagnostics["retry_attempt_json_cleanup_reason"] == "cleanup_candidate_not_parseable"
+
+
+def test_finalize_captured_reply_retry_attempt_keeps_plain_prose_as_prose_contamination() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        "Here is the corrected result. Please return only the ASTER block next time.",
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
     assert diagnostics["retry_attempt_failure_reason"] == "prose_contaminated_retry_response"
+    assert diagnostics["retry_attempt_prose_recovery_attempted"] is True
+    assert diagnostics["retry_attempt_prose_recovery_succeeded"] is False
+    assert diagnostics["retry_attempt_prose_recovery_reason"] == "no_single_parseable_embedded_block"
 
 
 def test_finalize_captured_reply_retry_attempt_classifies_wrapper_only() -> None:

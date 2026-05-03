@@ -677,3 +677,199 @@ def test_parse_with_retry_fails_cleanly_after_persistent_wrapper_only_followup(t
     assert retry_parse_failures[-1]["retry_wrapper_followup_reason"] == "wrapper_only_multi_block_retry_output"
     assert retry_parse_failures[-1]["retry_wrapper_followup_succeeded"] is False
     assert retry_parse_failures[-1]["retry_wrapper_followup_failure_reason"] == "wrapper_only_multi_block_retry_output"
+
+
+def test_parse_with_retry_uses_prose_followup_prompt_after_prose_failure(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sync_with_remote = False
+    orchestrator = AsterOrchestrator(config)
+    logger = _CollectingLogger()
+    orchestrator.logger = logger
+    orchestrator._last_generation_metadata = {
+        "retry_seed_valid": False,
+        "retry_seed_validity_reason": "unbalanced_structure",
+        "retry_seed_validity_reason_source": "best_salvageable_candidate",
+    }
+    calls: list[tuple[str, bool, bool, bool]] = []
+
+    def _parse(raw_text: str):
+        if raw_text == '{"summary":"ok","notes":[],"operations":[{"type":"NEED THESE FILES FIRST","path":"README.md","reason":"need context"}]}':
+            return ParsedPlan(
+                summary="ok",
+                notes=[],
+                operations=[
+                    PatchOperation(
+                        type="NEED THESE FILES FIRST",
+                        path="README.md",
+                        reason="need context",
+                    )
+                ],
+            )
+        raise json.JSONDecodeError("bad json", raw_text or "", 0)
+
+    orchestrator.parser.parse = _parse
+
+    def _retry_generate(*_args, **kwargs):
+        calls.append(
+            (
+                kwargs.get("retry_reason"),
+                kwargs.get("retry_seed_used"),
+                kwargs.get("wrapper_followup"),
+                kwargs.get("prose_followup"),
+            )
+        )
+        if kwargs.get("prose_followup"):
+            orchestrator._last_generation_metadata = {
+                "retry_attempt_failure_reason": "",
+                "retry_attempt_prose_recovery_attempted": False,
+                "retry_attempt_prose_recovery_succeeded": False,
+                "retry_attempt_prose_recovery_reason": "",
+            }
+
+            class _FollowupPromptPackage:
+                messages = [{"role": "user", "content": "retry"}]
+                approx_chars = 5
+                included_files = []
+                omitted_files = []
+                compacted = False
+                retry_prompt_mode = "browser_prose_retry_followup"
+                retry_prompt_strategy = "browser_retry_prose_corrective"
+                retry_prompt_reason = "prose_contaminated_retry_response"
+                retry_prompt_length = 5
+                retry_prompt_compacted_relative_to_original = True
+
+            return (
+                '{"summary":"ok","notes":[],"operations":[{"type":"NEED THESE FILES FIRST","path":"README.md","reason":"need context"}]}',
+                _FollowupPromptPackage(),
+            )
+
+        orchestrator._last_generation_metadata = {
+            "retry_attempt_capture_mode": "structured_block_first",
+            "retry_attempt_acceptance_tier": "blocked_or_ambiguous",
+            "retry_attempt_failure_reason": "prose_contaminated_retry_response",
+            "retry_attempt_structured_block_found": False,
+            "retry_attempt_parseable": False,
+            "retry_attempt_prose_contamination": True,
+            "retry_attempt_wrapper_only": False,
+            "retry_attempt_block_count": 0,
+            "retry_attempt_prose_recovery_attempted": True,
+            "retry_attempt_prose_recovery_succeeded": False,
+            "retry_attempt_prose_recovery_reason": "no_single_parseable_embedded_block",
+        }
+
+        class _PromptPackage:
+            messages = [{"role": "user", "content": "retry"}]
+            approx_chars = 5
+            included_files = []
+            omitted_files = []
+            compacted = False
+            retry_prompt_mode = "browser_structured_output_only_retry"
+            retry_prompt_strategy = "browser_retry_structured_output_only"
+            retry_prompt_reason = "unbalanced_structure"
+            retry_prompt_length = 5
+            retry_prompt_compacted_relative_to_original = True
+
+        return ("Thanks, but here is some commentary instead of a block.", _PromptPackage())
+
+    orchestrator._generate_with_prompt_retries = _retry_generate
+    context = CollectedContext(
+        project_root=tmp_path,
+        project_summary="demo",
+        file_tree="demo/",
+        relevant_files=[],
+        skipped_files=[],
+    )
+
+    plan = orchestrator._parse_with_retry("build app", context, [], "browser", "")
+
+    assert calls == [
+        ("unbalanced_structure", False, False, False),
+        ("prose_contaminated_retry_response", False, False, True),
+    ]
+    assert plan.requires_more_files() is True
+    prompt_retry_payloads = [payload for namespace, payload in logger.entries if namespace == "prompt_retry"]
+    assert prompt_retry_payloads[-1]["retry_prose_followup_attempted"] is True
+    assert prompt_retry_payloads[-1]["retry_prose_followup_prompt_mode"] == "browser_prose_retry_followup"
+    assert prompt_retry_payloads[-1]["retry_prose_followup_reason"] == "prose_contaminated_retry_response"
+    followup_result = next(payload for namespace, payload in logger.entries if namespace == "retry_prose_followup_result")
+    assert followup_result["retry_prose_followup_succeeded"] is True
+
+
+def test_parse_with_retry_fails_cleanly_after_persistent_prose_followup(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sync_with_remote = False
+    orchestrator = AsterOrchestrator(config)
+    logger = _CollectingLogger()
+    orchestrator.logger = logger
+    orchestrator._last_generation_metadata = {
+        "retry_seed_valid": False,
+        "retry_seed_validity_reason": "unbalanced_structure",
+        "retry_seed_validity_reason_source": "best_salvageable_candidate",
+    }
+
+    def _parse(raw_text: str):
+        raise json.JSONDecodeError("bad json", raw_text or "", 0)
+
+    orchestrator.parser.parse = _parse
+
+    def _retry_generate(*_args, **kwargs):
+        orchestrator._last_generation_metadata = {
+            "retry_attempt_capture_mode": "structured_block_first",
+            "retry_attempt_acceptance_tier": "blocked_or_ambiguous",
+            "retry_attempt_failure_reason": "prose_contaminated_retry_response",
+            "retry_attempt_structured_block_found": False,
+            "retry_attempt_parseable": False,
+            "retry_attempt_prose_contamination": True,
+            "retry_attempt_wrapper_only": False,
+            "retry_attempt_block_count": 0,
+            "retry_attempt_prose_recovery_attempted": True,
+            "retry_attempt_prose_recovery_succeeded": False,
+            "retry_attempt_prose_recovery_reason": "no_single_parseable_embedded_block",
+        }
+        if kwargs.get("prose_followup"):
+            class _FollowupPromptPackage:
+                messages = [{"role": "user", "content": "retry"}]
+                approx_chars = 5
+                included_files = []
+                omitted_files = []
+                compacted = False
+                retry_prompt_mode = "browser_prose_retry_followup"
+                retry_prompt_strategy = "browser_retry_prose_corrective"
+                retry_prompt_reason = "prose_contaminated_retry_response"
+                retry_prompt_length = 5
+                retry_prompt_compacted_relative_to_original = True
+
+            return ("Still some commentary before the block.", _FollowupPromptPackage())
+
+        class _PromptPackage:
+            messages = [{"role": "user", "content": "retry"}]
+            approx_chars = 5
+            included_files = []
+            omitted_files = []
+            compacted = False
+            retry_prompt_mode = "browser_structured_output_only_retry"
+            retry_prompt_strategy = "browser_retry_structured_output_only"
+            retry_prompt_reason = "unbalanced_structure"
+            retry_prompt_length = 5
+            retry_prompt_compacted_relative_to_original = True
+
+        return ("Here is a prose answer instead of a block.", _PromptPackage())
+
+    orchestrator._generate_with_prompt_retries = _retry_generate
+    context = CollectedContext(
+        project_root=tmp_path,
+        project_summary="demo",
+        file_tree="demo/",
+        relevant_files=[],
+        skipped_files=[],
+    )
+
+    with pytest.raises(RuntimeError, match="persistent_prose_contaminated_retry_response"):
+        orchestrator._parse_with_retry("build app", context, [], "browser", "")
+
+    retry_parse_failures = [payload for namespace, payload in logger.entries if namespace == "retry_parse_failure"]
+    assert retry_parse_failures[-1]["retry_prose_followup_attempted"] is True
+    assert retry_parse_failures[-1]["retry_prose_followup_prompt_mode"] == "browser_prose_retry_followup"
+    assert retry_parse_failures[-1]["retry_prose_followup_reason"] == "prose_contaminated_retry_response"
+    assert retry_parse_failures[-1]["retry_prose_followup_succeeded"] is False
+    assert retry_parse_failures[-1]["retry_prose_followup_failure_reason"] == "prose_contaminated_retry_response"

@@ -121,6 +121,7 @@ class PromptBuilder:
         retry_reason: str = "",
         retry_seed_used: bool = True,
         wrapper_followup: bool = False,
+        prose_followup: bool = False,
     ) -> PromptPackage:
         if mode == "browser":
             return self._build_browser_retry(
@@ -132,6 +133,7 @@ class PromptBuilder:
                 retry_reason=retry_reason,
                 retry_seed_used=retry_seed_used,
                 wrapper_followup=wrapper_followup,
+                prose_followup=prose_followup,
             )
         retry_item = {
             "role": "user",
@@ -167,6 +169,7 @@ class PromptBuilder:
         retry_reason: str,
         retry_seed_used: bool,
         wrapper_followup: bool,
+        prose_followup: bool,
     ) -> PromptPackage:
         base_limit = max_chars or BROWSER_PROMPT_CHAR_LIMIT
         retry_message = self._build_browser_retry_message(
@@ -174,6 +177,7 @@ class PromptBuilder:
             retry_reason=retry_reason,
             retry_seed_used=retry_seed_used,
             wrapper_followup=wrapper_followup,
+            prose_followup=prose_followup,
             max_chars=min(4_000, max(900, base_limit // 3)),
         )
         retry_item = {"role": "user", "content": retry_message}
@@ -191,6 +195,7 @@ class PromptBuilder:
                 retry_reason=retry_reason,
                 retry_seed_used=retry_seed_used,
                 wrapper_followup=wrapper_followup,
+                prose_followup=prose_followup,
                 max_chars=available_retry_chars,
             ),
         }
@@ -206,6 +211,7 @@ class PromptBuilder:
             retry_reason=retry_reason,
             retry_seed_used=retry_seed_used,
             wrapper_followup=wrapper_followup,
+            prose_followup=prose_followup,
         )
         return PromptPackage(
             messages=messages,
@@ -216,6 +222,8 @@ class PromptBuilder:
             retry_prompt_mode=(
                 "browser_wrapper_only_retry_followup"
                 if wrapper_followup
+                else "browser_prose_retry_followup"
+                if prose_followup
                 else
                 "browser_seeded_retry"
                 if retry_seed_used and prior_text
@@ -224,6 +232,8 @@ class PromptBuilder:
             retry_prompt_strategy=(
                 "browser_retry_wrapper_only_corrective"
                 if wrapper_followup
+                else "browser_retry_prose_corrective"
+                if prose_followup
                 else
                 "browser_retry_with_prior_excerpt"
                 if retry_seed_used and prior_text
@@ -431,6 +441,16 @@ class PromptBuilder:
                 "The previous browser reply returned empty ASTER wrapper blocks without any JSON payload. "
                 "Return exactly one non-empty ASTER block with one complete JSON object inside it."
             )
+        if retry_reason in {"malformed_json_inside_retry_block", "retry_json_cleanup_failed", "retry_json_not_safely_repairable"}:
+            return (
+                "The previous browser reply returned one ASTER block with malformed JSON. "
+                "Return one complete ASTER block with valid JSON syntax only, with no trailing commas, smart quotes, or stray text."
+            )
+        if retry_reason == "prose_contaminated_retry_response":
+            return (
+                "The previous browser reply wrapped the answer in commentary or prose. "
+                "Return only the final ASTER block, with no text before or after it."
+            )
         if retry_reason == "empty_response":
             return "The previous browser reply did not produce usable structured output. Return the final structured response only."
         return "The previous browser reply was not machine-parseable. Return one complete structured response only."
@@ -464,6 +484,7 @@ class PromptBuilder:
         retry_reason: str,
         retry_seed_used: bool,
         wrapper_followup: bool,
+        prose_followup: bool,
         max_chars: int,
     ) -> str:
         if wrapper_followup:
@@ -473,6 +494,18 @@ class PromptBuilder:
                 "- Return exactly one ASTER_PATCH_BEGIN / ASTER_PATCH_END block.",
                 "- The block must contain one complete JSON object and must not be empty.",
                 "- Never output an empty wrapper, a second wrapper, a draft, or an alternative version.",
+                '- Required top-level keys: "summary", "notes", "operations".',
+                "- Do not add commentary, prose, markdown, or code outside the single block.",
+                "- If context is insufficient, return NEED THESE FILES FIRST operations inside the JSON object.",
+            ]
+        elif prose_followup:
+            lines = [
+                "Corrective retry mode for browser output:",
+                "- The previous retry wrapped the answer in extra prose or commentary.",
+                "- Return exactly one ASTER_PATCH_BEGIN / ASTER_PATCH_END block.",
+                "- The block must contain one complete JSON object.",
+                "- No text is allowed before or after the block.",
+                "- Never explain, apologize, repeat instructions, or output a second version.",
                 '- Required top-level keys: "summary", "notes", "operations".',
                 "- Do not add commentary, prose, markdown, or code outside the single block.",
                 "- If context is insufficient, return NEED THESE FILES FIRST operations inside the JSON object.",
@@ -522,6 +555,7 @@ class PromptBuilder:
         retry_reason: str,
         retry_seed_used: bool,
         wrapper_followup: bool,
+        prose_followup: bool,
     ) -> tuple[list[dict[str, str]], int]:
         retry_limit = max(200, base_limit)
         retry_message = self._build_browser_retry_message(
@@ -529,6 +563,7 @@ class PromptBuilder:
             retry_reason=retry_reason,
             retry_seed_used=retry_seed_used,
             wrapper_followup=wrapper_followup,
+            prose_followup=prose_followup,
             max_chars=retry_limit,
         )
         messages = [*base_messages, {"role": "user", "content": retry_message}]
@@ -543,6 +578,7 @@ class PromptBuilder:
                 retry_reason=retry_reason,
                 retry_seed_used=retry_seed_used,
                 wrapper_followup=wrapper_followup,
+                prose_followup=prose_followup,
                 max_chars=retry_limit,
             )
             messages = [

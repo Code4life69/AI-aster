@@ -189,3 +189,33 @@ def test_browser_wrapper_only_followup_prompt_is_more_explicit() -> None:
     assert "empty aster wrapper blocks" in retry_message
     assert "must not be empty" in retry_message
     assert "never output an empty wrapper" in retry_message
+
+
+def test_browser_prose_followup_prompt_is_more_explicit() -> None:
+    builder = PromptBuilder()
+    context = CollectedContext(
+        project_root=Path("C:/demo"),
+        project_summary="Project root: C:/demo.",
+        file_tree="demo/\n- app.py",
+        relevant_files=[ContextFile(path="app.py", reason="source_or_related_file", content="print('ok')")],
+        skipped_files=[],
+    )
+
+    package = builder.build_retry(
+        "make me a calculator app",
+        context,
+        [],
+        None,
+        mode="browser",
+        max_chars=5_000,
+        retry_reason="prose_contaminated_retry_response",
+        retry_seed_used=False,
+        prose_followup=True,
+    )
+
+    retry_message = package.messages[-1]["content"].lower()
+    assert package.retry_prompt_mode == "browser_prose_retry_followup"
+    assert package.retry_prompt_strategy == "browser_retry_prose_corrective"
+    assert "wrapped the answer in extra prose" in retry_message
+    assert "no text is allowed before or after the block" in retry_message
+    assert "never explain" in retry_message
