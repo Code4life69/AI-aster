@@ -3992,26 +3992,32 @@ class BrowserChatGPTTransport:
         }
 
     @staticmethod
-    def _retry_fragment_assessment_metrics(assessment: dict[str, Any]) -> tuple[int, int]:
+    def _retry_fragment_assessment_metrics(assessment: dict[str, Any]) -> tuple[int, int, int]:
         forensics = list(assessment.get("block_forensics", []))
         max_schema_hits = 0
         balance_penalty = 99
+        complete_marked_payloads = 0
         for item in forensics:
             max_schema_hits = max(max_schema_hits, int(item.get("raw_schema_hits", item.get("schema_hits", 0))))
             balance_penalty = min(
                 balance_penalty,
                 abs(int(item.get("brace_balance", 0))) + abs(int(item.get("bracket_balance", 0))),
             )
+            if bool(item.get("has_end_marker")) and str(item.get("payload_state")) != "empty_payload":
+                complete_marked_payloads += 1
         if balance_penalty == 99:
             balance_penalty = 0
-        return max_schema_hits, balance_penalty
+        return max_schema_hits, balance_penalty, complete_marked_payloads
 
     @classmethod
-    def _retry_fragment_assessment_strength(cls, assessment: dict[str, Any], *, source: str) -> tuple[int, int, int, int, int, int]:
-        max_schema_hits, balance_penalty = cls._retry_fragment_assessment_metrics(assessment)
+    def _retry_fragment_assessment_strength(
+        cls, assessment: dict[str, Any], *, source: str
+    ) -> tuple[int, int, int, int, int, int, int]:
+        max_schema_hits, balance_penalty, complete_marked_payloads = cls._retry_fragment_assessment_metrics(assessment)
         return (
             int(bool(assessment.get("selected_text"))),
             int(bool(assessment.get("parseable"))),
+            complete_marked_payloads,
             int(bool(assessment.get("structured_block_found"))),
             max_schema_hits,
             -balance_penalty,
@@ -4065,11 +4071,19 @@ class BrowserChatGPTTransport:
             uia_assessment,
             source="uia",
         ):
-            ocr_schema_hits, ocr_balance_penalty = self._retry_fragment_assessment_metrics(ocr_assessment)
-            uia_schema_hits, uia_balance_penalty = self._retry_fragment_assessment_metrics(uia_assessment)
+            ocr_schema_hits, ocr_balance_penalty, ocr_complete_marked_payloads = self._retry_fragment_assessment_metrics(
+                ocr_assessment
+            )
+            uia_schema_hits, uia_balance_penalty, uia_complete_marked_payloads = self._retry_fragment_assessment_metrics(
+                uia_assessment
+            )
             ocr_clearly_better = (
                 (bool(ocr_assessment.get("selected_text")) and not bool(uia_assessment.get("selected_text")))
                 or (bool(ocr_assessment.get("parseable")) and not bool(uia_assessment.get("parseable")))
+                or (
+                    ocr_complete_marked_payloads > uia_complete_marked_payloads
+                    and not bool(uia_assessment.get("parseable"))
+                )
                 or (
                     ocr_schema_hits >= uia_schema_hits + 2
                     and ocr_balance_penalty <= uia_balance_penalty
@@ -4515,14 +4529,6 @@ class BrowserChatGPTTransport:
         if len(blocks) != 1:
             return result
         block = blocks[0]
-        if not single_block_completion.get("single_block_completion_attempted"):
-            return result
-        if single_block_completion.get("single_block_completion_succeeded"):
-            return result
-        if single_block_completion.get("single_block_semantically_incomplete"):
-            return result
-        if str(single_block_completion.get("single_block_completion_reason")) != "completion_candidate_not_parseable":
-            return result
 
         candidate_text = str(block["extracted"]).strip() or cls._retry_attempt_inner_payload(str(block["raw_block"])).strip()
         if not candidate_text:
@@ -4531,15 +4537,27 @@ class BrowserChatGPTTransport:
             result["failure_reason"] = "retry_internal_json_corruption_not_safely_repairable"
             return result
 
-        analysis = cls._analyze_single_retry_block_completion_candidate(candidate_text)
-        if not analysis["safe_to_complete"]:
-            result["internal_json_repair_attempted"] = True
-            result["internal_json_repair_reason"] = "completion_candidate_not_safely_closable"
-            result["failure_reason"] = "retry_internal_json_corruption_not_safely_repairable"
-            return result
-
         result["internal_json_repair_attempted"] = True
-        repaired_candidate, defect_types = cls._sanitize_internal_retry_json_candidate(str(analysis["completion_candidate"]))
+        if bool(block.get("has_end_marker")):
+            repair_candidate = candidate_text
+        else:
+            if not single_block_completion.get("single_block_completion_attempted"):
+                return result
+            if single_block_completion.get("single_block_completion_succeeded"):
+                return result
+            if single_block_completion.get("single_block_semantically_incomplete"):
+                return result
+            if str(single_block_completion.get("single_block_completion_reason")) != "completion_candidate_not_parseable":
+                return result
+
+            analysis = cls._analyze_single_retry_block_completion_candidate(candidate_text)
+            if not analysis["safe_to_complete"]:
+                result["internal_json_repair_reason"] = "completion_candidate_not_safely_closable"
+                result["failure_reason"] = "retry_internal_json_corruption_not_safely_repairable"
+                return result
+            repair_candidate = str(analysis["completion_candidate"])
+
+        repaired_candidate, defect_types = cls._sanitize_internal_retry_json_candidate(repair_candidate)
         result["internal_json_defect_types"] = list(defect_types)
         result["internal_json_repair_preview_safe"] = cls._retry_attempt_preview(repaired_candidate)
         if not defect_types:
@@ -5030,6 +5048,9 @@ class BrowserChatGPTTransport:
         cleaned = raw_text.strip()
         extracted = extract_structured_block(cleaned).strip() if cleaned else ""
         lowered = _normalize(cleaned)
+        marker_present = bool(
+            "aster_patch_begin" in lowered or "aster patch begin" in lowered or "aster_patch_end" in lowered or "aster patch end" in lowered
+        )
         block_count = self._count_retry_attempt_blocks(cleaned) if cleaned else 0
         blocks = self._extract_retry_attempt_blocks(cleaned) if cleaned else []
         block_forensics = self._summarize_retry_attempt_blocks(blocks) if blocks else []
@@ -5065,9 +5086,21 @@ class BrowserChatGPTTransport:
             else self._default_retry_block_selection()
         )
         parseable = bool(extracted) and looks_like_patch_plan_json(extracted)
+        single_complete_marked_block = bool(
+            block_count == 1
+            and bool(blocks[0].get("has_end_marker"))
+            and str(blocks[0].get("payload_state")) != "empty_payload"
+        )
+        incomplete_marked_capture = bool(
+            marker_present
+            and block_count == 1
+            and not bool(blocks[0].get("has_end_marker"))
+            and str(blocks[0].get("block_kind")) == "fragment_without_end_marker"
+        )
+        repair_eligible = bool(single_complete_marked_block and not parseable)
         single_block_completion = (
             self._attempt_single_incomplete_retry_block_completion(cleaned, blocks, extracted=extracted)
-            if cleaned and len(blocks) == 1 and not parseable
+            if cleaned and len(blocks) == 1 and not parseable and not incomplete_marked_capture and not single_complete_marked_block
             else self._default_retry_block_selection()
         )
         exact_block_match = (
@@ -5076,11 +5109,31 @@ class BrowserChatGPTTransport:
             else None
         )
         exact_block_only = exact_block_match is not None and not outside_text
+        pure_unmarked_json_object = bool(parseable and not marker_present and cleaned == extracted)
         recovered_single_block = bool(block_count > 1 and block_selection["recovered"])
         recovered_single_block_completion = bool(
             not recovered_single_block
             and single_block_completion["recovered"]
             and single_block_completion["selected_text"]
+        )
+        json_cleanup = (
+            self._attempt_retry_json_cleanup(cleaned, blocks, extracted=extracted)
+            if (
+                cleaned
+                and block_count <= 1
+                and not parseable
+                and repair_eligible
+                and not single_block_completion["single_block_completion_attempted"]
+                and bool(extracted)
+                and "{" in extracted
+            )
+            else self._default_retry_block_selection()
+        )
+        recovered_json_cleanup = bool(
+            not recovered_single_block
+            and not recovered_single_block_completion
+            and json_cleanup["recovered"]
+            and json_cleanup["selected_text"]
         )
         internal_json_repair = (
             self._attempt_internal_retry_json_repair(
@@ -5089,12 +5142,13 @@ class BrowserChatGPTTransport:
                 single_block_completion=single_block_completion,
                 extracted=extracted,
             )
-            if cleaned and len(blocks) == 1 and not parseable
+            if cleaned and len(blocks) == 1 and not parseable and repair_eligible and not recovered_json_cleanup
             else self._default_retry_block_selection()
         )
         recovered_internal_json_repair = bool(
             not recovered_single_block
             and not recovered_single_block_completion
+            and not recovered_json_cleanup
             and internal_json_repair["recovered"]
             and internal_json_repair["selected_text"]
         )
@@ -5105,19 +5159,6 @@ class BrowserChatGPTTransport:
             and wrapper_recheck["recovered"]
             and wrapper_recheck["selected_text"]
             and block_count <= 1
-        )
-        json_cleanup = (
-            self._attempt_retry_json_cleanup(cleaned, blocks, extracted=extracted)
-            if (
-                cleaned
-                and block_count <= 1
-                and not parseable
-                and not single_block_completion["single_block_completion_attempted"]
-                and not internal_json_repair["internal_json_repair_attempted"]
-                and bool(extracted)
-                and "{" in extracted
-            )
-            else self._default_retry_block_selection()
         )
         recovered_json_cleanup = bool(
             not recovered_single_block
@@ -5147,9 +5188,6 @@ class BrowserChatGPTTransport:
         )
         json_object_count = 1 if effective_parseable else 0
         prose_contamination = bool(outside_text) or self._retry_seed_contaminated(cleaned) or "retry mode for browser output" in lowered
-        marker_present = bool(
-            "aster_patch_begin" in lowered or "aster patch begin" in lowered or "aster_patch_end" in lowered or "aster patch end" in lowered
-        )
         wrapper_only = bool(
             marker_present
             and not parseable
@@ -5181,13 +5219,15 @@ class BrowserChatGPTTransport:
             failure_reason = ""
         elif block_count > 1:
             failure_reason = str(block_selection["failure_reason"] or "multiple_retry_blocks")
+        elif incomplete_marked_capture:
+            failure_reason = "incomplete_retry_block_capture"
         elif internal_json_repair["internal_json_repair_attempted"]:
             failure_reason = str(
                 internal_json_repair["failure_reason"] or "retry_internal_json_corruption_not_safely_repairable"
             )
         elif single_block_completion["single_block_completion_attempted"]:
             failure_reason = str(single_block_completion["failure_reason"] or "retry_block_not_safely_completable")
-        elif parseable and exact_block_only and json_object_count == 1:
+        elif parseable and (exact_block_only or pure_unmarked_json_object) and json_object_count == 1:
             failure_reason = ""
         elif parseable and not exact_block_only:
             failure_reason = "prose_contaminated_retry_response"
@@ -5225,7 +5265,7 @@ class BrowserChatGPTTransport:
                 if recovered_prose_block
                 else str(json_cleanup["selected_text"])
                 if recovered_json_cleanup
-                else extracted if parseable and exact_block_only and json_object_count == 1 else ""
+                else extracted if parseable and (exact_block_only or pure_unmarked_json_object) and json_object_count == 1 else ""
             ),
             "acceptance_tier": (
                 "retry_structured_wrapper_recheck"
@@ -5249,7 +5289,7 @@ class BrowserChatGPTTransport:
                 "retry_structured_recovered_single_block"
                 if recovered_single_block
                 else "retry_structured_exact"
-                if parseable and exact_block_only and json_object_count == 1
+                if parseable and (exact_block_only or pure_unmarked_json_object) and json_object_count == 1
                 else "blocked_or_ambiguous"
             ),
             "selected_block_index": (
