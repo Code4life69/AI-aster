@@ -815,7 +815,7 @@ def test_finalize_captured_reply_retry_attempt_recovers_single_block_with_safe_j
     assert "removed_trailing_commas" in diagnostics["retry_attempt_json_cleanup_reason"]
 
 
-def test_finalize_captured_reply_retry_attempt_rejects_incomplete_marked_single_block_before_repair() -> None:
+def test_finalize_captured_reply_retry_attempt_hands_off_strong_incomplete_marked_single_block() -> None:
     transport = BrowserChatGPTTransport()
 
     parsed, diagnostics = transport._finalize_captured_reply(
@@ -826,11 +826,16 @@ def test_finalize_captured_reply_retry_attempt_rejects_incomplete_marked_single_
         retry_attempt=True,
     )
 
-    assert parsed == ""
-    assert diagnostics["retry_attempt_failure_reason"] == "incomplete_retry_block_capture"
-    assert diagnostics["retry_attempt_single_block_completion_attempted"] is False
-    assert diagnostics["retry_attempt_internal_json_repair_attempted"] is False
-    assert diagnostics["retry_attempt_json_cleanup_attempted"] is False
+    assert parsed == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}'
+    assert diagnostics["retry_attempt_failure_reason"] == ""
+    assert diagnostics["retry_attempt_incomplete_block_handoff_considered"] is True
+    assert diagnostics["retry_attempt_incomplete_block_handoff_allowed"] is True
+    assert diagnostics["retry_attempt_incomplete_block_handoff_reason"] == "single_strong_incomplete_retry_block"
+    assert diagnostics["retry_attempt_incomplete_block_handoff_source"] == "final_reply"
+    assert diagnostics["retry_attempt_incomplete_block_handoff_schema_hits"] >= 3
+    assert diagnostics["retry_attempt_single_block_completion_attempted"] is True
+    assert diagnostics["retry_attempt_single_block_completion_succeeded"] is True
+    assert diagnostics["retry_attempt_acceptance_tier"] == "retry_structured_single_block_completion"
 
 
 def test_finalize_captured_reply_retry_attempt_accepts_complete_unmarked_json_object() -> None:
@@ -847,22 +852,24 @@ def test_finalize_captured_reply_retry_attempt_accepts_complete_unmarked_json_ob
     assert diagnostics["retry_attempt_block_count"] == 0
 
 
-def test_finalize_captured_reply_retry_attempt_schema_hits_do_not_override_missing_end_marker() -> None:
+def test_retry_attempt_assessment_keeps_ocr_incomplete_fragment_as_capture_failure() -> None:
     transport = BrowserChatGPTTransport()
 
-    parsed, diagnostics = transport._finalize_captured_reply(
+    assessment = transport._assess_retry_attempt_response(
         (
             "ASTER_PATCH_BEGIN\n"
             '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]'
         ),
-        retry_attempt=True,
+        candidate_source="ocr",
     )
 
-    assert parsed == ""
-    assert diagnostics["retry_attempt_failure_reason"] == "incomplete_retry_block_capture"
-    assert diagnostics["retry_attempt_block_forensics"][0]["schema_hits"] >= 3
-    assert diagnostics["retry_attempt_json_cleanup_attempted"] is False
-    assert diagnostics["retry_attempt_internal_json_repair_attempted"] is False
+    assert assessment["failure_reason"] == "incomplete_retry_block_capture"
+    assert assessment["block_forensics"][0]["schema_hits"] >= 3
+    assert assessment["incomplete_block_handoff_considered"] is True
+    assert assessment["incomplete_block_handoff_allowed"] is False
+    assert assessment["incomplete_block_handoff_reason"] == "ocr_fragment_not_allowed"
+    assert assessment["json_cleanup_attempted"] is False
+    assert assessment["internal_json_repair_attempted"] is False
 
 
 def test_finalize_captured_reply_retry_attempt_rejects_semantically_incomplete_single_block() -> None:
@@ -877,11 +884,13 @@ def test_finalize_captured_reply_retry_attempt_rejects_semantically_incomplete_s
     )
 
     assert parsed == ""
-    assert diagnostics["retry_attempt_failure_reason"] == "incomplete_retry_block_capture"
-    assert diagnostics["retry_attempt_single_block_completion_attempted"] is False
+    assert diagnostics["retry_attempt_failure_reason"] == "retry_block_semantically_incomplete"
+    assert diagnostics["retry_attempt_incomplete_block_handoff_considered"] is True
+    assert diagnostics["retry_attempt_incomplete_block_handoff_allowed"] is True
+    assert diagnostics["retry_attempt_single_block_completion_attempted"] is True
     assert diagnostics["retry_attempt_single_block_completion_succeeded"] is False
-    assert diagnostics["retry_attempt_single_block_completion_reason"] == ""
-    assert diagnostics["retry_attempt_single_block_semantically_incomplete"] is False
+    assert diagnostics["retry_attempt_single_block_completion_reason"] == "invalid_bareword_value_tail"
+    assert diagnostics["retry_attempt_single_block_semantically_incomplete"] is True
     assert diagnostics["retry_attempt_single_block_parseable_after_completion"] is False
 
 
@@ -897,11 +906,13 @@ def test_finalize_captured_reply_retry_attempt_rejects_mid_content_single_block_
     )
 
     assert parsed == ""
-    assert diagnostics["retry_attempt_failure_reason"] == "incomplete_retry_block_capture"
-    assert diagnostics["retry_attempt_single_block_completion_attempted"] is False
+    assert diagnostics["retry_attempt_failure_reason"] == "retry_block_semantically_incomplete"
+    assert diagnostics["retry_attempt_incomplete_block_handoff_considered"] is True
+    assert diagnostics["retry_attempt_incomplete_block_handoff_allowed"] is True
+    assert diagnostics["retry_attempt_single_block_completion_attempted"] is True
     assert diagnostics["retry_attempt_single_block_completion_succeeded"] is False
-    assert diagnostics["retry_attempt_single_block_completion_reason"] == ""
-    assert diagnostics["retry_attempt_single_block_semantically_incomplete"] is False
+    assert diagnostics["retry_attempt_single_block_completion_reason"] == "unterminated_string"
+    assert diagnostics["retry_attempt_single_block_semantically_incomplete"] is True
     assert diagnostics["retry_attempt_single_block_parseable_after_completion"] is False
 
 

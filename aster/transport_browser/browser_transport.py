@@ -1380,6 +1380,26 @@ class BrowserChatGPTTransport:
                         "retry_attempt_single_block_parseable_after_completion",
                         False,
                     ),
+                    "retry_attempt_incomplete_block_handoff_considered": final_capture_diagnostics.get(
+                        "retry_attempt_incomplete_block_handoff_considered",
+                        False,
+                    ),
+                    "retry_attempt_incomplete_block_handoff_allowed": final_capture_diagnostics.get(
+                        "retry_attempt_incomplete_block_handoff_allowed",
+                        False,
+                    ),
+                    "retry_attempt_incomplete_block_handoff_reason": final_capture_diagnostics.get(
+                        "retry_attempt_incomplete_block_handoff_reason",
+                        "",
+                    ),
+                    "retry_attempt_incomplete_block_handoff_source": final_capture_diagnostics.get(
+                        "retry_attempt_incomplete_block_handoff_source",
+                        "",
+                    ),
+                    "retry_attempt_incomplete_block_handoff_schema_hits": final_capture_diagnostics.get(
+                        "retry_attempt_incomplete_block_handoff_schema_hits",
+                        0,
+                    ),
                     "retry_attempt_internal_json_repair_attempted": final_capture_diagnostics.get(
                         "retry_attempt_internal_json_repair_attempted",
                         False,
@@ -3955,6 +3975,11 @@ class BrowserChatGPTTransport:
             "single_block_completion_closure_added": "",
             "single_block_semantically_incomplete": False,
             "single_block_parseable_after_completion": False,
+            "incomplete_block_handoff_considered": False,
+            "incomplete_block_handoff_allowed": False,
+            "incomplete_block_handoff_reason": "",
+            "incomplete_block_handoff_source": "",
+            "incomplete_block_handoff_schema_hits": 0,
             "internal_json_repair_attempted": False,
             "internal_json_repair_succeeded": False,
             "internal_json_repair_reason": "",
@@ -3990,6 +4015,61 @@ class BrowserChatGPTTransport:
             "fragment_uia_available": False,
             "fragment_ocr_available": False,
         }
+
+    @classmethod
+    def _evaluate_incomplete_retry_block_handoff(
+        cls,
+        *,
+        blocks: list[dict[str, Any]],
+        candidate_source: str,
+        prose_contamination: bool,
+        wrapper_only: bool,
+        outside_text: str,
+    ) -> dict[str, Any]:
+        result = {
+            "considered": False,
+            "allowed": False,
+            "reason": "",
+            "source": candidate_source,
+            "schema_hits": 0,
+        }
+        if len(blocks) != 1:
+            return result
+        block = blocks[0]
+        if str(block.get("block_kind")) != "fragment_without_end_marker":
+            return result
+
+        result["considered"] = True
+        schema_hits = max(int(block.get("raw_schema_hits", 0)), int(block.get("schema_hits", 0)))
+        result["schema_hits"] = schema_hits
+        if candidate_source == "ocr":
+            result["reason"] = "ocr_fragment_not_allowed"
+            return result
+        normalized_outside = re.sub(
+            r"(?i)ASTER[_ ]PATCH[_ ]BEGIN|ASTER[_ ]PATCH[_ ]END|[\s\[\]\{\}:,]+",
+            "",
+            outside_text,
+        )
+        if prose_contamination and normalized_outside:
+            result["reason"] = "prose_contamination_detected"
+            return result
+        if wrapper_only:
+            result["reason"] = "wrapper_only_dominates"
+            return result
+        if schema_hits < 3:
+            result["reason"] = "insufficient_schema_hits"
+            return result
+        brace_balance = int(block.get("brace_balance", 0))
+        bracket_balance = int(block.get("bracket_balance", 0))
+        if brace_balance < 0 or bracket_balance < 0:
+            result["reason"] = "negative_structure_balance"
+            return result
+        if brace_balance + bracket_balance > 4:
+            result["reason"] = "too_structurally_incomplete"
+            return result
+        result["allowed"] = True
+        result["reason"] = "single_strong_incomplete_retry_block"
+        return result
 
     @staticmethod
     def _retry_fragment_assessment_metrics(assessment: dict[str, Any]) -> tuple[int, int, int]:
@@ -4537,8 +4617,8 @@ class BrowserChatGPTTransport:
             result["failure_reason"] = "retry_internal_json_corruption_not_safely_repairable"
             return result
 
-        result["internal_json_repair_attempted"] = True
         if bool(block.get("has_end_marker")):
+            result["internal_json_repair_attempted"] = True
             repair_candidate = candidate_text
         else:
             if not single_block_completion.get("single_block_completion_attempted"):
@@ -4549,6 +4629,7 @@ class BrowserChatGPTTransport:
                 return result
             if str(single_block_completion.get("single_block_completion_reason")) != "completion_candidate_not_parseable":
                 return result
+            result["internal_json_repair_attempted"] = True
 
             analysis = cls._analyze_single_retry_block_completion_candidate(candidate_text)
             if not analysis["safe_to_complete"]:
@@ -5091,6 +5172,19 @@ class BrowserChatGPTTransport:
             and bool(blocks[0].get("has_end_marker"))
             and str(blocks[0].get("payload_state")) != "empty_payload"
         )
+        wrapper_only = bool(
+            marker_present
+            and not parseable
+            and not any(token in cleaned for token in ("{", '"summary"', '"operations"'))
+        )
+        prose_contamination = bool(outside_text) or self._retry_seed_contaminated(cleaned) or "retry mode for browser output" in lowered
+        incomplete_handoff = self._evaluate_incomplete_retry_block_handoff(
+            blocks=blocks,
+            candidate_source=candidate_source,
+            prose_contamination=prose_contamination,
+            wrapper_only=wrapper_only,
+            outside_text=outside_text,
+        )
         incomplete_marked_capture = bool(
             marker_present
             and block_count == 1
@@ -5100,7 +5194,13 @@ class BrowserChatGPTTransport:
         repair_eligible = bool(single_complete_marked_block and not parseable)
         single_block_completion = (
             self._attempt_single_incomplete_retry_block_completion(cleaned, blocks, extracted=extracted)
-            if cleaned and len(blocks) == 1 and not parseable and not incomplete_marked_capture and not single_complete_marked_block
+            if (
+                cleaned
+                and len(blocks) == 1
+                and not parseable
+                and (not incomplete_marked_capture or bool(incomplete_handoff["allowed"]))
+                and not single_complete_marked_block
+            )
             else self._default_retry_block_selection()
         )
         exact_block_match = (
@@ -5142,7 +5242,13 @@ class BrowserChatGPTTransport:
                 single_block_completion=single_block_completion,
                 extracted=extracted,
             )
-            if cleaned and len(blocks) == 1 and not parseable and repair_eligible and not recovered_json_cleanup
+            if (
+                cleaned
+                and len(blocks) == 1
+                and not parseable
+                and (repair_eligible or bool(incomplete_handoff["allowed"]))
+                and not recovered_json_cleanup
+            )
             else self._default_retry_block_selection()
         )
         recovered_internal_json_repair = bool(
@@ -5187,12 +5293,6 @@ class BrowserChatGPTTransport:
             or recovered_prose_block
         )
         json_object_count = 1 if effective_parseable else 0
-        prose_contamination = bool(outside_text) or self._retry_seed_contaminated(cleaned) or "retry mode for browser output" in lowered
-        wrapper_only = bool(
-            marker_present
-            and not parseable
-            and not any(token in cleaned for token in ("{", '"summary"', '"operations"'))
-        )
         json_like_extracted = bool(extracted) and any(
             token in extracted for token in ("{", '"summary"', '"operations"', '"notes"')
         )
@@ -5219,7 +5319,7 @@ class BrowserChatGPTTransport:
             failure_reason = ""
         elif block_count > 1:
             failure_reason = str(block_selection["failure_reason"] or "multiple_retry_blocks")
-        elif incomplete_marked_capture:
+        elif incomplete_marked_capture and not bool(incomplete_handoff["allowed"]):
             failure_reason = "incomplete_retry_block_capture"
         elif internal_json_repair["internal_json_repair_attempted"]:
             failure_reason = str(
@@ -5363,6 +5463,11 @@ class BrowserChatGPTTransport:
             "single_block_completion_closure_added": str(single_block_completion["single_block_completion_closure_added"]),
             "single_block_semantically_incomplete": bool(single_block_completion["single_block_semantically_incomplete"]),
             "single_block_parseable_after_completion": bool(single_block_completion["single_block_parseable_after_completion"]),
+            "incomplete_block_handoff_considered": bool(incomplete_handoff["considered"]),
+            "incomplete_block_handoff_allowed": bool(incomplete_handoff["allowed"]),
+            "incomplete_block_handoff_reason": str(incomplete_handoff["reason"]),
+            "incomplete_block_handoff_source": str(incomplete_handoff["source"]),
+            "incomplete_block_handoff_schema_hits": int(incomplete_handoff["schema_hits"]),
             "internal_json_repair_attempted": bool(internal_json_repair["internal_json_repair_attempted"]),
             "internal_json_repair_succeeded": bool(internal_json_repair["internal_json_repair_succeeded"]),
             "internal_json_repair_reason": str(internal_json_repair["internal_json_repair_reason"]),
@@ -5437,6 +5542,21 @@ class BrowserChatGPTTransport:
         )
         diagnostics["retry_attempt_single_block_parseable_after_completion"] = bool(
             assessment["single_block_parseable_after_completion"]
+        )
+        diagnostics["retry_attempt_incomplete_block_handoff_considered"] = bool(
+            assessment["incomplete_block_handoff_considered"]
+        )
+        diagnostics["retry_attempt_incomplete_block_handoff_allowed"] = bool(
+            assessment["incomplete_block_handoff_allowed"]
+        )
+        diagnostics["retry_attempt_incomplete_block_handoff_reason"] = str(
+            assessment["incomplete_block_handoff_reason"]
+        )
+        diagnostics["retry_attempt_incomplete_block_handoff_source"] = str(
+            assessment["incomplete_block_handoff_source"]
+        )
+        diagnostics["retry_attempt_incomplete_block_handoff_schema_hits"] = int(
+            assessment["incomplete_block_handoff_schema_hits"]
         )
         diagnostics["retry_attempt_internal_json_repair_attempted"] = bool(
             assessment["internal_json_repair_attempted"]
@@ -5733,6 +5853,21 @@ class BrowserChatGPTTransport:
             ),
             "retry_attempt_single_block_parseable_after_completion": (
                 bool(retry_assessment["single_block_parseable_after_completion"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_incomplete_block_handoff_considered": (
+                bool(retry_assessment["incomplete_block_handoff_considered"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_incomplete_block_handoff_allowed": (
+                bool(retry_assessment["incomplete_block_handoff_allowed"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_incomplete_block_handoff_reason": (
+                str(retry_assessment["incomplete_block_handoff_reason"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_incomplete_block_handoff_source": (
+                str(retry_assessment["incomplete_block_handoff_source"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_incomplete_block_handoff_schema_hits": (
+                int(retry_assessment["incomplete_block_handoff_schema_hits"]) if retry_assessment is not None else 0
             ),
             "retry_attempt_internal_json_repair_attempted": (
                 bool(retry_assessment["internal_json_repair_attempted"]) if retry_assessment is not None else False
