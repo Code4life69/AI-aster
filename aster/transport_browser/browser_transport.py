@@ -1424,6 +1424,38 @@ class BrowserChatGPTTransport:
                         "retry_attempt_internal_json_repair_preview_safe",
                         "",
                     ),
+                    "retry_attempt_internal_json_repair_stage": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_repair_stage",
+                        "",
+                    ),
+                    "retry_attempt_internal_json_parse_error_position": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_parse_error_position",
+                        None,
+                    ),
+                    "retry_attempt_internal_json_parse_error_context_before": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_parse_error_context_before",
+                        "",
+                    ),
+                    "retry_attempt_internal_json_parse_error_context_at": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_parse_error_context_at",
+                        "",
+                    ),
+                    "retry_attempt_internal_json_parse_error_context_after": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_parse_error_context_after",
+                        "",
+                    ),
+                    "retry_attempt_internal_json_residual_corruption_type": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_residual_corruption_type",
+                        "",
+                    ),
+                    "retry_attempt_internal_json_residual_likely_syntactic": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_residual_likely_syntactic",
+                        False,
+                    ),
+                    "retry_attempt_internal_json_residual_likely_semantic": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_residual_likely_semantic",
+                        False,
+                    ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
                         "salvage_preserved_for_diagnostics_only",
@@ -3986,6 +4018,14 @@ class BrowserChatGPTTransport:
             "internal_json_defect_types": [],
             "internal_json_parseable_after_repair": False,
             "internal_json_repair_preview_safe": "",
+            "internal_json_repair_stage": "",
+            "internal_json_parse_error_position": None,
+            "internal_json_parse_error_context_before": "",
+            "internal_json_parse_error_context_at": "",
+            "internal_json_parse_error_context_after": "",
+            "internal_json_residual_corruption_type": "",
+            "internal_json_residual_likely_syntactic": False,
+            "internal_json_residual_likely_semantic": False,
         }
 
     @staticmethod
@@ -4610,6 +4650,50 @@ class BrowserChatGPTTransport:
         cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
         return cleaned.strip(), list(dict.fromkeys(defects))
 
+    @staticmethod
+    def _extract_json_parse_error_context(candidate_text: str, position: int | None, *, window: int = 24) -> dict[str, Any]:
+        if position is None or position < 0:
+            return {
+                "position": None,
+                "before": "",
+                "at": "",
+                "after": "",
+            }
+        start = max(0, position - window)
+        end = min(len(candidate_text), position + window)
+        at_char = candidate_text[position : position + 1]
+        return {
+            "position": position,
+            "before": candidate_text[start:position],
+            "at": at_char,
+            "after": candidate_text[position + (1 if at_char else 0) : end],
+        }
+
+    @staticmethod
+    def _classify_residual_retry_json_corruption(candidate_text: str, position: int | None) -> tuple[str, bool, bool]:
+        if position is None or position < 0:
+            return "unknown_residual_json_corruption", False, False
+        start = max(0, position - 32)
+        end = min(len(candidate_text), position + 32)
+        snippet = candidate_text[start:end]
+        before = candidate_text[max(0, position - 8) : position]
+        after = candidate_text[position : min(len(candidate_text), position + 8)]
+        if re.search(r'}\s*"[A-Za-z_][^"]*"\s*:', snippet):
+            return "object_entry_boundary_corruption", True, False
+        if re.search(r'\{\s*"[^"]*"\s+"[^"]*"', snippet):
+            return "key_value_separator_corruption", True, False
+        if re.search(r'"[^"]*"\s+"[A-Za-z_][^"]*"\s*:', snippet):
+            return "key_value_separator_corruption", True, False
+        if re.search(r'"[^"]*"\s+"[^"]*"\s*[,\]}]', snippet):
+            return "array_item_separator_corruption", True, False
+        if re.search(r'"\s*"\s*[A-Za-z_]', snippet) or re.search(r'"[^"]*""[A-Za-z_]', snippet):
+            return "quote_driven_separator_confusion", True, False
+        if before.rstrip().endswith(("}", "]", '"')) and after.lstrip() and not after.lstrip().startswith((",", "}", "]")):
+            return "trailing_garbage_after_value", True, False
+        if any(token in snippet.lower() for token in ("stop answering", "enter", "system:", "user:")):
+            return "unknown_residual_json_corruption", False, True
+        return "unknown_residual_json_corruption", False, False
+
     @classmethod
     def _attempt_internal_retry_json_repair(
         cls,
@@ -4662,7 +4746,20 @@ class BrowserChatGPTTransport:
 
         try:
             parsed_candidate = json.loads(repaired_candidate)
-        except Exception:
+        except json.JSONDecodeError as exc:
+            error_context = cls._extract_json_parse_error_context(repaired_candidate, getattr(exc, "pos", None))
+            residual_type, likely_syntactic, likely_semantic = cls._classify_residual_retry_json_corruption(
+                repaired_candidate,
+                error_context["position"],
+            )
+            result["internal_json_repair_stage"] = "post_internal_repair"
+            result["internal_json_parse_error_position"] = error_context["position"]
+            result["internal_json_parse_error_context_before"] = cls._retry_attempt_preview(error_context["before"], limit=80)
+            result["internal_json_parse_error_context_at"] = cls._retry_attempt_preview(error_context["at"], limit=16)
+            result["internal_json_parse_error_context_after"] = cls._retry_attempt_preview(error_context["after"], limit=80)
+            result["internal_json_residual_corruption_type"] = residual_type
+            result["internal_json_residual_likely_syntactic"] = likely_syntactic
+            result["internal_json_residual_likely_semantic"] = likely_semantic
             result["internal_json_repair_reason"] = (
                 "retry_internal_json_separator_corruption"
                 if any(
@@ -4679,6 +4776,14 @@ class BrowserChatGPTTransport:
                 if any(item in defect_types for item in ("normalized_smart_quotes",))
                 else "retry_internal_json_repair_failed"
             )
+            result["failure_reason"] = "retry_internal_json_repair_failed"
+            return result
+        except Exception:
+            result["internal_json_repair_stage"] = "post_internal_repair"
+            result["internal_json_residual_corruption_type"] = "unknown_residual_json_corruption"
+            result["internal_json_residual_likely_syntactic"] = False
+            result["internal_json_residual_likely_semantic"] = False
+            result["internal_json_repair_reason"] = "retry_internal_json_repair_failed"
             result["failure_reason"] = "retry_internal_json_repair_failed"
             return result
 
@@ -5497,6 +5602,14 @@ class BrowserChatGPTTransport:
             "internal_json_defect_types": list(internal_json_repair["internal_json_defect_types"]),
             "internal_json_parseable_after_repair": bool(internal_json_repair["internal_json_parseable_after_repair"]),
             "internal_json_repair_preview_safe": str(internal_json_repair["internal_json_repair_preview_safe"]),
+            "internal_json_repair_stage": str(internal_json_repair["internal_json_repair_stage"]),
+            "internal_json_parse_error_position": internal_json_repair["internal_json_parse_error_position"],
+            "internal_json_parse_error_context_before": str(internal_json_repair["internal_json_parse_error_context_before"]),
+            "internal_json_parse_error_context_at": str(internal_json_repair["internal_json_parse_error_context_at"]),
+            "internal_json_parse_error_context_after": str(internal_json_repair["internal_json_parse_error_context_after"]),
+            "internal_json_residual_corruption_type": str(internal_json_repair["internal_json_residual_corruption_type"]),
+            "internal_json_residual_likely_syntactic": bool(internal_json_repair["internal_json_residual_likely_syntactic"]),
+            "internal_json_residual_likely_semantic": bool(internal_json_repair["internal_json_residual_likely_semantic"]),
         }
 
     @staticmethod
@@ -5598,6 +5711,30 @@ class BrowserChatGPTTransport:
         )
         diagnostics["retry_attempt_internal_json_repair_preview_safe"] = str(
             assessment["internal_json_repair_preview_safe"]
+        )
+        diagnostics["retry_attempt_internal_json_repair_stage"] = str(
+            assessment["internal_json_repair_stage"]
+        )
+        diagnostics["retry_attempt_internal_json_parse_error_position"] = assessment[
+            "internal_json_parse_error_position"
+        ]
+        diagnostics["retry_attempt_internal_json_parse_error_context_before"] = str(
+            assessment["internal_json_parse_error_context_before"]
+        )
+        diagnostics["retry_attempt_internal_json_parse_error_context_at"] = str(
+            assessment["internal_json_parse_error_context_at"]
+        )
+        diagnostics["retry_attempt_internal_json_parse_error_context_after"] = str(
+            assessment["internal_json_parse_error_context_after"]
+        )
+        diagnostics["retry_attempt_internal_json_residual_corruption_type"] = str(
+            assessment["internal_json_residual_corruption_type"]
+        )
+        diagnostics["retry_attempt_internal_json_residual_likely_syntactic"] = bool(
+            assessment["internal_json_residual_likely_syntactic"]
+        )
+        diagnostics["retry_attempt_internal_json_residual_likely_semantic"] = bool(
+            assessment["internal_json_residual_likely_semantic"]
         )
 
     def _build_structured_reply_candidate(
@@ -5909,6 +6046,30 @@ class BrowserChatGPTTransport:
             ),
             "retry_attempt_internal_json_repair_preview_safe": (
                 str(retry_assessment["internal_json_repair_preview_safe"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_internal_json_repair_stage": (
+                str(retry_assessment["internal_json_repair_stage"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_internal_json_parse_error_position": (
+                retry_assessment["internal_json_parse_error_position"] if retry_assessment is not None else None
+            ),
+            "retry_attempt_internal_json_parse_error_context_before": (
+                str(retry_assessment["internal_json_parse_error_context_before"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_internal_json_parse_error_context_at": (
+                str(retry_assessment["internal_json_parse_error_context_at"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_internal_json_parse_error_context_after": (
+                str(retry_assessment["internal_json_parse_error_context_after"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_internal_json_residual_corruption_type": (
+                str(retry_assessment["internal_json_residual_corruption_type"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_internal_json_residual_likely_syntactic": (
+                bool(retry_assessment["internal_json_residual_likely_syntactic"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_internal_json_residual_likely_semantic": (
+                bool(retry_assessment["internal_json_residual_likely_semantic"]) if retry_assessment is not None else False
             ),
             "final_capture_failure_reason": "",
         }

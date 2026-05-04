@@ -1010,6 +1010,65 @@ def test_finalize_captured_reply_retry_attempt_rejects_deep_internal_json_corrup
     assert diagnostics["retry_attempt_internal_json_repair_succeeded"] is False
     assert diagnostics["retry_attempt_internal_json_parseable_after_repair"] is False
     assert diagnostics["retry_attempt_failure_reason"] == "retry_internal_json_repair_failed"
+    assert diagnostics["retry_attempt_internal_json_repair_stage"] == "post_internal_repair"
+    assert diagnostics["retry_attempt_internal_json_parse_error_position"] is not None
+
+
+def test_retry_internal_json_forensics_classifies_object_entry_boundary_corruption() -> None:
+    corruption_type, likely_syntactic, likely_semantic = BrowserChatGPTTransport._classify_residual_retry_json_corruption(
+        '{"operations":[{"type":"CREATE FILE"} "path":"x"}]}',
+        38,
+    )
+
+    assert corruption_type == "object_entry_boundary_corruption"
+    assert likely_syntactic is True
+    assert likely_semantic is False
+
+
+def test_retry_internal_json_forensics_classifies_key_value_separator_corruption() -> None:
+    corruption_type, likely_syntactic, likely_semantic = BrowserChatGPTTransport._classify_residual_retry_json_corruption(
+        '{"path" "saved.py"}',
+        8,
+    )
+
+    assert corruption_type == "key_value_separator_corruption"
+    assert likely_syntactic is True
+    assert likely_semantic is False
+
+
+def test_retry_internal_json_forensics_classifies_array_item_separator_corruption() -> None:
+    corruption_type, likely_syntactic, likely_semantic = BrowserChatGPTTransport._classify_residual_retry_json_corruption(
+        '{"operations":["one" "two"]}',
+        20,
+    )
+
+    assert corruption_type == "array_item_separator_corruption"
+    assert likely_syntactic is True
+    assert likely_semantic is False
+
+
+def test_retry_internal_json_forensics_classifies_quote_driven_separator_confusion() -> None:
+    corruption_type, likely_syntactic, likely_semantic = BrowserChatGPTTransport._classify_residual_retry_json_corruption(
+        '{"content":"print(1)""reason":"x"}',
+        22,
+    )
+
+    assert corruption_type == "quote_driven_separator_confusion"
+    assert likely_syntactic is True
+    assert likely_semantic is False
+
+
+def test_retry_internal_json_forensics_extracts_parse_error_context() -> None:
+    context = BrowserChatGPTTransport._extract_json_parse_error_context(
+        '{"path" "saved.py"}',
+        8,
+        window=6,
+    )
+
+    assert context["position"] == 8
+    assert context["before"] == 'path" '
+    assert context["at"] == '"'
+    assert context["after"].startswith("saved")
 
 
 def test_finalize_captured_reply_retry_attempt_keeps_plain_prose_as_prose_contamination() -> None:
