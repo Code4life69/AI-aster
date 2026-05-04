@@ -4568,6 +4568,14 @@ class BrowserChatGPTTransport:
         if cleaned_sep_combo != cleaned:
             cleaned = cleaned_sep_combo
             defects.append("separator_cleanup")
+        fixed_missing_key_commas = re.sub(
+            r'("\s*(?:[^"\\]|\\.)*"\s*)(?="(?:type|path|reason|content|summary|notes|operations|old_content|new_content|encoding|mode|cwd|command|message|shell|env|target|line|text|name)"\s*:)',
+            r"\1,",
+            cleaned,
+        )
+        if fixed_missing_key_commas != cleaned:
+            cleaned = fixed_missing_key_commas
+            defects.append("inserted_missing_key_commas")
         cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
         cleaned = re.sub(r"(\[\s*),", r"\1", cleaned)
         cleaned = re.sub(r",(\s*\])", r"\1", cleaned)
@@ -4584,14 +4592,20 @@ class BrowserChatGPTTransport:
                     and "{" not in operations_inner
                     and "}" not in operations_inner
                 ):
-                    cleaned = (
-                        cleaned[:inner_start]
-                        + "{"
-                        + operations_inner.strip()
-                        + "}"
-                        + cleaned[inner_end:]
-                    )
-                    defects.append("wrapped_operations_entry_object")
+                    entry_runs = re.split(r'(?=,\s*"type"\s*:)', operations_inner.strip())
+                    normalized_entries: list[str] = []
+                    for raw_entry in entry_runs:
+                        normalized = raw_entry.strip().lstrip(",").strip()
+                        if not normalized:
+                            continue
+                        normalized_entries.append("{" + normalized + "}")
+                    if normalized_entries:
+                        cleaned = cleaned[:inner_start] + ",".join(normalized_entries) + cleaned[inner_end:]
+                        defects.append(
+                            "wrapped_operations_entry_objects"
+                            if len(normalized_entries) > 1
+                            else "wrapped_operations_entry_object"
+                        )
 
         cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
         return cleaned.strip(), list(dict.fromkeys(defects))
@@ -4651,7 +4665,16 @@ class BrowserChatGPTTransport:
         except Exception:
             result["internal_json_repair_reason"] = (
                 "retry_internal_json_separator_corruption"
-                if any(item in defect_types for item in ("collapsed_duplicated_colons", "separator_cleanup", "wrapped_operations_entry_object"))
+                if any(
+                    item in defect_types
+                    for item in (
+                        "collapsed_duplicated_colons",
+                        "separator_cleanup",
+                        "inserted_missing_key_commas",
+                        "wrapped_operations_entry_object",
+                        "wrapped_operations_entry_objects",
+                    )
+                )
                 else "retry_internal_json_quote_corruption"
                 if any(item in defect_types for item in ("normalized_smart_quotes",))
                 else "retry_internal_json_repair_failed"

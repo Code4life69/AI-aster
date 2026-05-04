@@ -957,6 +957,42 @@ def test_finalize_captured_reply_retry_attempt_repairs_internal_separator_corrup
     assert "wrapped_operations_entry_object" in diagnostics["retry_attempt_internal_json_defect_types"]
 
 
+def test_finalize_captured_reply_retry_attempt_repairs_missing_commas_between_operation_keys() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py" "reason":"add","content":"print(1)"}]}\n'
+            "ASTER_PATCH_END"
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}'
+    assert diagnostics["retry_attempt_internal_json_repair_attempted"] is True
+    assert diagnostics["retry_attempt_internal_json_repair_succeeded"] is True
+    assert "inserted_missing_key_commas" in diagnostics["retry_attempt_internal_json_defect_types"]
+
+
+def test_finalize_captured_reply_retry_attempt_repairs_multiple_flat_operation_entries() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":["type":"CREATE FILE","path":"a.txt","reason":"add","content":"one","type":"CREATE FILE","path":"b.txt","reason":"add","content":"two"]}\n'
+            "ASTER_PATCH_END"
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"a.txt","reason":"add","content":"one"},{"type":"CREATE FILE","path":"b.txt","reason":"add","content":"two"}]}'
+    assert diagnostics["retry_attempt_internal_json_repair_attempted"] is True
+    assert diagnostics["retry_attempt_internal_json_repair_succeeded"] is True
+    assert "wrapped_operations_entry_objects" in diagnostics["retry_attempt_internal_json_defect_types"]
+
+
 def test_finalize_captured_reply_retry_attempt_rejects_deep_internal_json_corruption() -> None:
     transport = BrowserChatGPTTransport()
 
