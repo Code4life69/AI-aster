@@ -709,6 +709,30 @@ class AsterOrchestrator:
                 "retry_attempt_single_block_parseable_after_completion",
                 False,
             ),
+            "retry_attempt_internal_json_repair_attempted": self._last_generation_metadata.get(
+                "retry_attempt_internal_json_repair_attempted",
+                False,
+            ),
+            "retry_attempt_internal_json_repair_succeeded": self._last_generation_metadata.get(
+                "retry_attempt_internal_json_repair_succeeded",
+                False,
+            ),
+            "retry_attempt_internal_json_repair_reason": self._last_generation_metadata.get(
+                "retry_attempt_internal_json_repair_reason",
+                "",
+            ),
+            "retry_attempt_internal_json_defect_types": self._last_generation_metadata.get(
+                "retry_attempt_internal_json_defect_types",
+                [],
+            ),
+            "retry_attempt_internal_json_parseable_after_repair": self._last_generation_metadata.get(
+                "retry_attempt_internal_json_parseable_after_repair",
+                False,
+            ),
+            "retry_attempt_internal_json_repair_preview_safe": self._last_generation_metadata.get(
+                "retry_attempt_internal_json_repair_preview_safe",
+                "",
+            ),
         }
 
     def _log_prompt_retry_event(

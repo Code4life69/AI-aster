@@ -899,6 +899,63 @@ def test_finalize_captured_reply_retry_attempt_rejects_mid_content_single_block_
     assert diagnostics["retry_attempt_single_block_parseable_after_completion"] is False
 
 
+def test_finalize_captured_reply_retry_attempt_repairs_internal_json_quote_and_comma_damage() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{\u201csummary\u201d:\u201cok\u201d,\u201cnotes\u201d:[],\u201coperations\u201d:[\u201ctype\u201d:\u201cCREATE FILE\u201d,\u201cpath\u201d:\u201csaved.py\u201d,\u201creason\u201d:\u201cadd\u201d,\u201ccontent\u201d:\u201cprint(1)\u201d,]'
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}'
+    assert diagnostics["retry_attempt_failure_reason"] == ""
+    assert diagnostics["retry_attempt_acceptance_tier"] == "retry_structured_internal_json_repair"
+    assert diagnostics["retry_attempt_internal_json_repair_attempted"] is True
+    assert diagnostics["retry_attempt_internal_json_repair_succeeded"] is True
+    assert diagnostics["retry_attempt_internal_json_parseable_after_repair"] is True
+    assert diagnostics["retry_attempt_single_block_completion_attempted"] is True
+    assert "wrapped_operations_entry_object" in diagnostics["retry_attempt_internal_json_defect_types"]
+
+
+def test_finalize_captured_reply_retry_attempt_repairs_internal_separator_corruption() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":["type"::"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)",]'
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == '{"summary":"ok","notes":[],"operations":[{"type":"CREATE FILE","path":"saved.py","reason":"add","content":"print(1)"}]}'
+    assert diagnostics["retry_attempt_internal_json_repair_attempted"] is True
+    assert diagnostics["retry_attempt_internal_json_repair_succeeded"] is True
+    assert "collapsed_duplicated_colons" in diagnostics["retry_attempt_internal_json_defect_types"]
+    assert "wrapped_operations_entry_object" in diagnostics["retry_attempt_internal_json_defect_types"]
+
+
+def test_finalize_captured_reply_retry_attempt_rejects_deep_internal_json_corruption() -> None:
+    transport = BrowserChatGPTTransport()
+
+    parsed, diagnostics = transport._finalize_captured_reply(
+        (
+            "ASTER_PATCH_BEGIN\n"
+            '{"summary":"ok","notes":[],"operations":["type":"CREATE FILE","path" "saved.py","reason":"add","content":"print(1)"]'
+        ),
+        retry_attempt=True,
+    )
+
+    assert parsed == ""
+    assert diagnostics["retry_attempt_internal_json_repair_attempted"] is True
+    assert diagnostics["retry_attempt_internal_json_repair_succeeded"] is False
+    assert diagnostics["retry_attempt_internal_json_parseable_after_repair"] is False
+    assert diagnostics["retry_attempt_failure_reason"] == "retry_internal_json_repair_failed"
+
+
 def test_finalize_captured_reply_retry_attempt_keeps_plain_prose_as_prose_contamination() -> None:
     transport = BrowserChatGPTTransport()
 

@@ -1380,6 +1380,30 @@ class BrowserChatGPTTransport:
                         "retry_attempt_single_block_parseable_after_completion",
                         False,
                     ),
+                    "retry_attempt_internal_json_repair_attempted": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_repair_attempted",
+                        False,
+                    ),
+                    "retry_attempt_internal_json_repair_succeeded": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_repair_succeeded",
+                        False,
+                    ),
+                    "retry_attempt_internal_json_repair_reason": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_repair_reason",
+                        "",
+                    ),
+                    "retry_attempt_internal_json_defect_types": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_defect_types",
+                        [],
+                    ),
+                    "retry_attempt_internal_json_parseable_after_repair": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_parseable_after_repair",
+                        False,
+                    ),
+                    "retry_attempt_internal_json_repair_preview_safe": final_capture_diagnostics.get(
+                        "retry_attempt_internal_json_repair_preview_safe",
+                        "",
+                    ),
                     "final_capture_failure_reason": final_capture_diagnostics.get("final_capture_failure_reason", ""),
                     "salvage_preserved_for_diagnostics_only": final_capture_diagnostics.get(
                         "salvage_preserved_for_diagnostics_only",
@@ -3931,6 +3955,12 @@ class BrowserChatGPTTransport:
             "single_block_completion_closure_added": "",
             "single_block_semantically_incomplete": False,
             "single_block_parseable_after_completion": False,
+            "internal_json_repair_attempted": False,
+            "internal_json_repair_succeeded": False,
+            "internal_json_repair_reason": "",
+            "internal_json_defect_types": [],
+            "internal_json_parseable_after_repair": False,
+            "internal_json_repair_preview_safe": "",
         }
 
     @staticmethod
@@ -4371,12 +4401,13 @@ class BrowserChatGPTTransport:
             return result
 
         result["single_block_completion_attempted"] = True
+        normalized_candidate_text, _ = cls._sanitize_retry_json_candidate(candidate_text)
         schema_hits = max(
             int(block.get("raw_schema_hits", 0)),
             int(block.get("schema_hits", 0)),
-            sum(1 for token in ('"summary"', '"notes"', '"operations"') if token in candidate_text),
+            sum(1 for token in ('"summary"', '"notes"', '"operations"') if token in normalized_candidate_text),
         )
-        if schema_hits < 2 or '"operations"' not in candidate_text:
+        if schema_hits < 2 or '"operations"' not in normalized_candidate_text:
             result["single_block_completion_reason"] = "insufficient_structure"
             result["failure_reason"] = "retry_block_not_safely_completable"
             return result
@@ -4418,6 +4449,134 @@ class BrowserChatGPTTransport:
                 "single_block_completion_succeeded": True,
                 "single_block_completion_reason": str(analysis["reason"]),
                 "single_block_parseable_after_completion": True,
+            }
+        )
+        return result
+
+    @classmethod
+    def _sanitize_internal_retry_json_candidate(cls, candidate_text: str) -> tuple[str, list[str]]:
+        cleaned, changes = cls._sanitize_retry_json_candidate(candidate_text)
+        defects = list(changes)
+        without_control_noise = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", cleaned)
+        if without_control_noise != cleaned:
+            cleaned = without_control_noise
+            defects.append("removed_control_noise")
+        deduped_commas = re.sub(r",\s*,+", ",", cleaned)
+        if deduped_commas != cleaned:
+            cleaned = deduped_commas
+            defects.append("collapsed_duplicated_commas")
+        deduped_colons = re.sub(r":\s*:+", ":", cleaned)
+        if deduped_colons != cleaned:
+            cleaned = deduped_colons
+            defects.append("collapsed_duplicated_colons")
+        cleaned_sep_combo = re.sub(r",\s*:", ":", cleaned)
+        cleaned_sep_combo = re.sub(r":\s*,", ":", cleaned_sep_combo)
+        if cleaned_sep_combo != cleaned:
+            cleaned = cleaned_sep_combo
+            defects.append("separator_cleanup")
+        cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+        cleaned = re.sub(r"(\[\s*),", r"\1", cleaned)
+        cleaned = re.sub(r",(\s*\])", r"\1", cleaned)
+
+        operations_marker = re.search(r'"operations"\s*:\s*\[', cleaned)
+        if operations_marker is not None:
+            inner_start = operations_marker.end()
+            inner_end = cleaned.rfind("]")
+            if inner_end > inner_start:
+                operations_inner = cleaned[inner_start:inner_end]
+                if (
+                    '"type"' in operations_inner
+                    and ":" in operations_inner
+                    and "{" not in operations_inner
+                    and "}" not in operations_inner
+                ):
+                    cleaned = (
+                        cleaned[:inner_start]
+                        + "{"
+                        + operations_inner.strip()
+                        + "}"
+                        + cleaned[inner_end:]
+                    )
+                    defects.append("wrapped_operations_entry_object")
+
+        cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+        return cleaned.strip(), list(dict.fromkeys(defects))
+
+    @classmethod
+    def _attempt_internal_retry_json_repair(
+        cls,
+        raw_text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        single_block_completion: dict[str, Any],
+        extracted: str,
+    ) -> dict[str, Any]:
+        result = cls._default_retry_block_selection()
+        if len(blocks) != 1:
+            return result
+        block = blocks[0]
+        if not single_block_completion.get("single_block_completion_attempted"):
+            return result
+        if single_block_completion.get("single_block_completion_succeeded"):
+            return result
+        if single_block_completion.get("single_block_semantically_incomplete"):
+            return result
+        if str(single_block_completion.get("single_block_completion_reason")) != "completion_candidate_not_parseable":
+            return result
+
+        candidate_text = str(block["extracted"]).strip() or cls._retry_attempt_inner_payload(str(block["raw_block"])).strip()
+        if not candidate_text:
+            result["internal_json_repair_attempted"] = True
+            result["internal_json_repair_reason"] = "no_internal_json_candidate"
+            result["failure_reason"] = "retry_internal_json_corruption_not_safely_repairable"
+            return result
+
+        analysis = cls._analyze_single_retry_block_completion_candidate(candidate_text)
+        if not analysis["safe_to_complete"]:
+            result["internal_json_repair_attempted"] = True
+            result["internal_json_repair_reason"] = "completion_candidate_not_safely_closable"
+            result["failure_reason"] = "retry_internal_json_corruption_not_safely_repairable"
+            return result
+
+        result["internal_json_repair_attempted"] = True
+        repaired_candidate, defect_types = cls._sanitize_internal_retry_json_candidate(str(analysis["completion_candidate"]))
+        result["internal_json_defect_types"] = list(defect_types)
+        result["internal_json_repair_preview_safe"] = cls._retry_attempt_preview(repaired_candidate)
+        if not defect_types:
+            result["internal_json_repair_reason"] = "no_safe_internal_json_transform"
+            result["failure_reason"] = "retry_internal_json_corruption_not_safely_repairable"
+            return result
+
+        try:
+            parsed_candidate = json.loads(repaired_candidate)
+        except Exception:
+            result["internal_json_repair_reason"] = (
+                "retry_internal_json_separator_corruption"
+                if any(item in defect_types for item in ("collapsed_duplicated_colons", "separator_cleanup", "wrapped_operations_entry_object"))
+                else "retry_internal_json_quote_corruption"
+                if any(item in defect_types for item in ("normalized_smart_quotes",))
+                else "retry_internal_json_repair_failed"
+            )
+            result["failure_reason"] = "retry_internal_json_repair_failed"
+            return result
+
+        canonical_candidate = json.dumps(parsed_candidate, separators=(",", ":"))
+        if not looks_like_patch_plan_json(canonical_candidate):
+            result["internal_json_repair_reason"] = "repair_candidate_missing_required_schema"
+            result["failure_reason"] = "retry_internal_json_corruption_not_safely_repairable"
+            return result
+
+        result.update(
+            {
+                "recovered": True,
+                "selected_block_index": int(block["index"]),
+                "selection_reason": "retry_internal_json_repair_recovered_block",
+                "failure_reason": "",
+                "selected_text": canonical_candidate,
+                "relationship": "single_block_internal_json_repair",
+                "internal_json_repair_succeeded": True,
+                "internal_json_repair_reason": ",".join(defect_types),
+                "internal_json_parseable_after_repair": True,
             }
         )
         return result
@@ -4923,9 +5082,26 @@ class BrowserChatGPTTransport:
             and single_block_completion["recovered"]
             and single_block_completion["selected_text"]
         )
+        internal_json_repair = (
+            self._attempt_internal_retry_json_repair(
+                cleaned,
+                blocks,
+                single_block_completion=single_block_completion,
+                extracted=extracted,
+            )
+            if cleaned and len(blocks) == 1 and not parseable
+            else self._default_retry_block_selection()
+        )
+        recovered_internal_json_repair = bool(
+            not recovered_single_block
+            and not recovered_single_block_completion
+            and internal_json_repair["recovered"]
+            and internal_json_repair["selected_text"]
+        )
         recovered_wrapper_payload = bool(
             not recovered_single_block
             and not recovered_single_block_completion
+            and not recovered_internal_json_repair
             and wrapper_recheck["recovered"]
             and wrapper_recheck["selected_text"]
             and block_count <= 1
@@ -4937,6 +5113,7 @@ class BrowserChatGPTTransport:
                 and block_count <= 1
                 and not parseable
                 and not single_block_completion["single_block_completion_attempted"]
+                and not internal_json_repair["internal_json_repair_attempted"]
                 and bool(extracted)
                 and "{" in extracted
             )
@@ -4945,6 +5122,7 @@ class BrowserChatGPTTransport:
         recovered_json_cleanup = bool(
             not recovered_single_block
             and not recovered_single_block_completion
+            and not recovered_internal_json_repair
             and not recovered_wrapper_payload
             and json_cleanup["recovered"]
             and json_cleanup["selected_text"]
@@ -4952,6 +5130,7 @@ class BrowserChatGPTTransport:
         recovered_prose_block = bool(
             not recovered_single_block
             and not recovered_single_block_completion
+            and not recovered_internal_json_repair
             and not recovered_wrapper_payload
             and not recovered_json_cleanup
             and prose_recovery["recovered"]
@@ -4961,6 +5140,7 @@ class BrowserChatGPTTransport:
             parseable
             or recovered_single_block
             or recovered_single_block_completion
+            or recovered_internal_json_repair
             or recovered_wrapper_payload
             or recovered_json_cleanup
             or recovered_prose_block
@@ -4997,8 +5177,14 @@ class BrowserChatGPTTransport:
             failure_reason = ""
         elif recovered_single_block_completion:
             failure_reason = ""
+        elif recovered_internal_json_repair:
+            failure_reason = ""
         elif block_count > 1:
             failure_reason = str(block_selection["failure_reason"] or "multiple_retry_blocks")
+        elif internal_json_repair["internal_json_repair_attempted"]:
+            failure_reason = str(
+                internal_json_repair["failure_reason"] or "retry_internal_json_corruption_not_safely_repairable"
+            )
         elif single_block_completion["single_block_completion_attempted"]:
             failure_reason = str(single_block_completion["failure_reason"] or "retry_block_not_safely_completable")
         elif parseable and exact_block_only and json_object_count == 1:
@@ -5031,6 +5217,8 @@ class BrowserChatGPTTransport:
                 if recovered_single_block
                 else str(single_block_completion["selected_text"])
                 if recovered_single_block_completion
+                else str(internal_json_repair["selected_text"])
+                if recovered_internal_json_repair
                 else str(wrapper_recheck["selected_text"])
                 if recovered_wrapper_payload
                 else str(prose_recovery["selected_text"])
@@ -5051,6 +5239,9 @@ class BrowserChatGPTTransport:
                 else
                 "retry_structured_single_block_completion"
                 if recovered_single_block_completion
+                else
+                "retry_structured_internal_json_repair"
+                if recovered_internal_json_repair
                 else
                 "retry_structured_repaired_fragment"
                 if recovered_single_block and bool(block_selection["fragment_repair_succeeded"])
@@ -5075,6 +5266,8 @@ class BrowserChatGPTTransport:
                 if recovered_prose_block
                 else str(json_cleanup["selection_reason"])
                 if recovered_json_cleanup
+                else str(internal_json_repair["selection_reason"])
+                if recovered_internal_json_repair
                 else str(single_block_completion["selection_reason"])
                 if recovered_single_block_completion
                 else str(wrapper_recheck["selection_reason"])
@@ -5088,6 +5281,8 @@ class BrowserChatGPTTransport:
                 if recovered_prose_block
                 else str(json_cleanup["relationship"])
                 if recovered_json_cleanup
+                else str(internal_json_repair["relationship"])
+                if recovered_internal_json_repair
                 else str(single_block_completion["relationship"])
                 if recovered_single_block_completion
                 else str(wrapper_recheck["relationship"])
@@ -5128,6 +5323,12 @@ class BrowserChatGPTTransport:
             "single_block_completion_closure_added": str(single_block_completion["single_block_completion_closure_added"]),
             "single_block_semantically_incomplete": bool(single_block_completion["single_block_semantically_incomplete"]),
             "single_block_parseable_after_completion": bool(single_block_completion["single_block_parseable_after_completion"]),
+            "internal_json_repair_attempted": bool(internal_json_repair["internal_json_repair_attempted"]),
+            "internal_json_repair_succeeded": bool(internal_json_repair["internal_json_repair_succeeded"]),
+            "internal_json_repair_reason": str(internal_json_repair["internal_json_repair_reason"]),
+            "internal_json_defect_types": list(internal_json_repair["internal_json_defect_types"]),
+            "internal_json_parseable_after_repair": bool(internal_json_repair["internal_json_parseable_after_repair"]),
+            "internal_json_repair_preview_safe": str(internal_json_repair["internal_json_repair_preview_safe"]),
         }
 
     @staticmethod
@@ -5196,6 +5397,24 @@ class BrowserChatGPTTransport:
         )
         diagnostics["retry_attempt_single_block_parseable_after_completion"] = bool(
             assessment["single_block_parseable_after_completion"]
+        )
+        diagnostics["retry_attempt_internal_json_repair_attempted"] = bool(
+            assessment["internal_json_repair_attempted"]
+        )
+        diagnostics["retry_attempt_internal_json_repair_succeeded"] = bool(
+            assessment["internal_json_repair_succeeded"]
+        )
+        diagnostics["retry_attempt_internal_json_repair_reason"] = str(
+            assessment["internal_json_repair_reason"]
+        )
+        diagnostics["retry_attempt_internal_json_defect_types"] = list(
+            assessment["internal_json_defect_types"]
+        )
+        diagnostics["retry_attempt_internal_json_parseable_after_repair"] = bool(
+            assessment["internal_json_parseable_after_repair"]
+        )
+        diagnostics["retry_attempt_internal_json_repair_preview_safe"] = str(
+            assessment["internal_json_repair_preview_safe"]
         )
 
     def _build_structured_reply_candidate(
@@ -5474,6 +5693,24 @@ class BrowserChatGPTTransport:
             ),
             "retry_attempt_single_block_parseable_after_completion": (
                 bool(retry_assessment["single_block_parseable_after_completion"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_internal_json_repair_attempted": (
+                bool(retry_assessment["internal_json_repair_attempted"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_internal_json_repair_succeeded": (
+                bool(retry_assessment["internal_json_repair_succeeded"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_internal_json_repair_reason": (
+                str(retry_assessment["internal_json_repair_reason"]) if retry_assessment is not None else ""
+            ),
+            "retry_attempt_internal_json_defect_types": (
+                list(retry_assessment["internal_json_defect_types"]) if retry_assessment is not None else []
+            ),
+            "retry_attempt_internal_json_parseable_after_repair": (
+                bool(retry_assessment["internal_json_parseable_after_repair"]) if retry_assessment is not None else False
+            ),
+            "retry_attempt_internal_json_repair_preview_safe": (
+                str(retry_assessment["internal_json_repair_preview_safe"]) if retry_assessment is not None else ""
             ),
             "final_capture_failure_reason": "",
         }
