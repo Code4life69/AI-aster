@@ -8,6 +8,7 @@ __pycache__/
 !.aster/audit.log.jsonl
 !.aster/last_launch_stdout.log
 !.aster/last_launch_stderr.log
+aster.config.json
 *.egg-info/
 assistant_app/
 data/

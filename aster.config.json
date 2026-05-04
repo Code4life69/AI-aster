@@ -1,8 +1,0 @@
-{
-  "runtime_log_heartbeat_push_enabled": true,
-  "runtime_log_heartbeat_interval_seconds": 30,
-  "runtime_log_heartbeat_branch_only": true,
-  "thread_reuse_enabled": false,
-  "visual_action_trace_enabled": true,
-  "visual_action_memory_enabled": true
-}
